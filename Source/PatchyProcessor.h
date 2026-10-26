@@ -1489,27 +1489,13 @@ public:
             if (node.nodeType != 29 || node.paxName.isNotEmpty()) continue;
             const auto found = audioMonitorBuffers.find (node.id);
             if (found == audioMonitorBuffers.end() || ! found->second) continue;
-            const auto settings = juce::JSON::parse (node.settingsJson);
-            WelchSnapshot snap;
-            snap.nodeId = node.id;
-            snap.fftSize = AudioSim::WelchSpectrum::sanitiseFftSize ((int) settings["fftSize"]);
-            snap.window = AudioSim::WelchSpectrum::sanitiseWindow (settings["window"].toString());
-            snap.channel = juce::jlimit (0, AudioSim::maxAudioChannels - 1, (int) settings["channel"]);
-            const int savedAverages = (int) settings["averages"];
-            const int requestedAverages = savedAverages == 2 || savedAverages == 4 || savedAverages == 8 || savedAverages == 16 ? savedAverages : 8;
-            snap.requestedAverages = requestedAverages;
-            auto& cache = welchAnalysers[node.id];
-            uint64_t version = 0;
-            const int count = snap.fftSize + (requestedAverages - 1) * (snap.fftSize / 2);
-            if (! found->second->snapshotChannel (snap.channel, count, cache.samples, snap.inputChannels, snap.sampleRate, version)) continue;
-            if (snap.sampleRate <= 0) snap.sampleRate = lastSampleRate > 0 ? lastSampleRate : 48000.0;
-            if (cache.version == version && cache.fftSize == snap.fftSize && cache.window == snap.window
-                && cache.channel == snap.channel && cache.averages == requestedAverages) continue;
-            cache.analyser.configure (snap.fftSize, snap.window);
-            snap.averages = cache.analyser.calculate (cache.samples, snap.sampleRate, requestedAverages, snap.decibels);
-            cache.version = version; cache.fftSize = snap.fftSize; cache.window = snap.window;
-            cache.channel = snap.channel; cache.averages = requestedAverages;
-            result.push_back (std::move (snap));
+            for (auto& channel : welchAnalysers[node.id].snapshot (*found->second, node.settingsJson, lastSampleRate))
+            {
+                WelchSnapshot snap;
+                static_cast<AudioSim::WelchChannelSpectrum&> (snap) = std::move (channel);
+                snap.nodeId = node.id;
+                result.push_back (std::move (snap));
+            }
         }
         for (auto it = welchAnalysers.begin(); it != welchAnalysers.end();)
         {
@@ -1721,15 +1707,7 @@ private:
     std::unordered_map<juce::String, std::unique_ptr<MidiMonitorBuffer>>  monitorBuffers;
     std::unordered_map<juce::String, std::unique_ptr<MidiMonitorBuffer>>  keyboardMonitorBuffers;
     std::unordered_map<juce::String, std::unique_ptr<AudioMonitorBuffer>> audioMonitorBuffers;
-    struct WelchCache
-    {
-        AudioSim::WelchSpectrum analyser;
-        std::vector<float> samples;
-        uint64_t version = ~uint64_t (0);
-        int fftSize = 0, channel = -1, averages = 0;
-        juce::String window;
-    };
-    std::unordered_map<juce::String, WelchCache> welchAnalysers;
+    std::unordered_map<juce::String, AudioSim::WelchChannelAnalysis> welchAnalysers;
     std::unordered_map<juce::String, std::unique_ptr<AudioPlayerState>>   audioPlayerStates;
     std::unordered_map<juce::String, std::unique_ptr<DmxMonitorBuffer>>      dmxMonitorBuffers;
     std::unordered_map<juce::String, std::unique_ptr<DmxMonitorBuffer>>      dmxConsoleBuffers;

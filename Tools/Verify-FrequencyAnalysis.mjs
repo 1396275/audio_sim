@@ -129,9 +129,56 @@ try {
   await click('Clear held');
   captured = await evaluate(`JSON.parse(window.testMessages.filter(m => m.type === 'commitSettingsChange').at(-1).settings)`);
   assert.equal(captured.held, null);
+  await click('Subplots');
+  captured = await evaluate(`JSON.parse(window.testMessages.filter(m => m.type === 'commitSettingsChange').at(-1).settings)`);
+  assert.equal(captured.layout, 'stacked');
+  const sendChannels = async (channels, inputChannels = 8, sr = 48000) => {
+    const frames = channels.map(channel => ({ ...snapshot, layout: 'stacked', channel, inputChannels, sr,
+      decibels: Array.from({ length: 1025 }, (_, i) => i === 20 + channel * 60 ? -22 - channel : -115).join(',') }));
+    await evaluate(`window.__bridge.onWelchSnapshot(${JSON.stringify(JSON.stringify(frames))})`);
+    await evaluate('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+  };
+  await sendChannels([0, 1, 2, 3, 4, 5, 6, 7]);
+  await waitFor('document.querySelectorAll("[data-spectrum-channel]").length === 8');
+  assert.notEqual(await evaluate('document.querySelectorAll("canvas")[0].toDataURL()'),
+    await evaluate('document.querySelectorAll("canvas")[1].toDataURL()'), 'Subplots must draw different spectra for different channels');
+  const clickChannel = (channel, label) => evaluate(`(() => {
+    const plot = document.querySelector('[data-spectrum-channel="${channel}"]');
+    const button = [...plot.querySelectorAll('button')].find(e => e.textContent.trim() === ${JSON.stringify(label)});
+    if (!button || button.disabled) throw new Error('Missing enabled per-channel button'); button.click();
+  })()`);
+  await clickChannel(0, 'Hold spectrum'); await clickChannel(1, 'Hold spectrum');
+  captured = await evaluate(`JSON.parse(window.testMessages.filter(m => m.type === 'commitSettingsChange').at(-1).settings)`);
+  assert.equal(captured.heldChannels.find(h => h.channel === 0).decibels[20], -22);
+  assert.equal(captured.heldChannels.find(h => h.channel === 1).decibels[80], -23);
+  const savedSubplots = structuredClone(captured);
+  await clickChannel(0, 'Clear held');
+  captured = await evaluate(`JSON.parse(window.testMessages.filter(m => m.type === 'commitSettingsChange').at(-1).settings)`);
+  assert.deepEqual(captured.heldChannels.map(h => h.channel), [1], 'Clearing one subplot must retain other channel references');
+  await evaluate(`document.querySelector('[data-spectrum-channel="1"] canvas').dispatchEvent(new MouseEvent('mousemove', {clientX: 650, bubbles: true}))`);
+  await waitFor(`document.querySelector('[data-spectrum-channel="1"]').textContent.includes('Live ')`);
+  // Channel checkboxes, empty selection, and restoration through native graph updates.
+  await evaluate(`[...document.querySelectorAll('label')].find(e => e.textContent.trim() === 'Ch 2').querySelector('div').click()`);
+  await waitFor('document.querySelectorAll("[data-spectrum-channel]").length === 7');
+  captured = await evaluate(`JSON.parse(window.testMessages.filter(m => m.type === 'commitSettingsChange').at(-1).settings)`);
+  assert.ok(!captured.selectedChannels.includes(1));
+  await click('None'); await waitFor('document.querySelectorAll("canvas").length === 0');
+  await click('All channels'); await waitFor('document.querySelectorAll("canvas").length === 8');
+  graph.nodes[0].settingsJson = JSON.stringify({ ...savedSubplots, selectedChannels: [0, 1] });
+  await evaluate(`window.__bridge.onGraphUpdate(${JSON.stringify(JSON.stringify(graph))})`);
+  await sendChannels([0, 1]);
+  await waitFor('document.querySelectorAll("canvas").length === 2');
+  await waitFor(`document.querySelector('[data-spectrum-channel="1"]').textContent.includes('Held: Ch 2')`);
+  await screenshot('welch-subplots-light.png');
+  // A shrinking input layout must remove the disconnected channel's old live plot.
+  await sendChannels([0], 1, 1500);
+  await waitFor('document.querySelectorAll("canvas").length === 1');
+  await evaluate(`window.__bridge.onWelchSnapshot(${JSON.stringify(JSON.stringify([{ ...snapshot, layout: 'stacked', sr: 1500, channel: -1, inputChannels: 0, averages: 0, decibels: '' }]))})`);
+  await waitFor('document.querySelectorAll("canvas").length === 0');
+  await click('Single channel');
   await sendSpectrum({ ...snapshot, sr: 1500, inputChannels: 0, averages: 0, decibels: '' });
   assert.deepEqual(errors, [], 'UI must have no runtime exceptions');
-  console.log('PASS: live PSD, hold/replace/clear, saved reference, low-rate range, dark/light rendering');
+  console.log('PASS: live PSD, hold/replace/clear, subplots, per-channel hold and cursor, channel selection, save/reload, input shrink/disconnect, low-rate range, dark/light rendering');
   console.log(`Screenshots: ${output}`);
 } finally {
   if (socket) socket.close();

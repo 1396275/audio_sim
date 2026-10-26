@@ -493,6 +493,7 @@ void WebBridge::pushWelchSnapshots()
         obj->setProperty ("inputChannels", snap.inputChannels);
         obj->setProperty ("averages", snap.averages);
         obj->setProperty ("requestedAverages", snap.requestedAverages);
+        obj->setProperty ("layout", snap.layout);
         // dB values retain quiet signals; PCM monitor's 0.001 quantisation
         // must never be used as the input to the PSD calculation.
         juce::String values;

@@ -105,6 +105,7 @@ export interface WelchSnapshot {
   nodeId: string; sr: number; fftSize: number; window: string;
   channel: number; inputChannels: number; averages: number; requestedAverages: number;
   decibels: string;
+  layout?: 'single' | 'stacked';
 }
 type WelchSnapshotCallback = (snapshots: WelchSnapshot[]) => void;
 const _welchSnapshotSubscribers: WelchSnapshotCallback[] = [];

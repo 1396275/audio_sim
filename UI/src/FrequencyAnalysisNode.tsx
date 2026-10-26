@@ -2,12 +2,12 @@ import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import { NodeProps } from '@xyflow/react';
 import { Bridge } from './Bridge';
-import { NodeHandle, NodeHeader, SettingsPanelHeader, useNodeCollapsed, useNodeDelete, useNodeSettings } from './NodeUtils';
+import { Checkbox, NodeHandle, NodeHeader, SettingsPanelHeader, useNodeCollapsed, useNodeDelete, useNodeSettings } from './NodeUtils';
 import { NodeSelect } from './NodeSelect';
 import ValueBox from './ValueBox';
 import { themeColor, useTheme } from './Theme';
 import { FFT_SIZES, WINDOWS, FREQUENCY_DEFAULTS, FrequencyAnalysisSettings, SpectrumTrace,
-  frequencyRange, readFrequencySettings } from './FrequencyAnalysisSettings';
+  frequencyRange, readFrequencySettings, visibleFrequencyChannels } from './FrequencyAnalysisSettings';
 
 const WIDTH = 500, HEIGHT = 240;
 const PLOT = { left: 48, right: WIDTH - 14, top: 22, bottom: HEIGHT - 28 };
@@ -78,16 +78,57 @@ function draw(ctx: CanvasRenderingContext2D, s: FrequencyAnalysisSettings, live:
   }
 }
 
+const SpectrumPlot = memo(function SpectrumPlot({ settings, channel, live, held, sampleRate, inputChannels, onHold, onClear }: {
+  settings: FrequencyAnalysisSettings; channel: number; live: SpectrumTrace | null; held: SpectrumTrace | null;
+  sampleRate: number; inputChannels: number; onHold: (channel: number) => void; onClear: (channel: number) => void;
+}) {
+  const canvas = useRef<HTMLCanvasElement>(null);
+  const [cursor, setCursor] = useState<number | null>(null);
+  const theme = useTheme();
+  const range = frequencyRange(settings, sampleRate);
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => {
+      const ctx = canvas.current?.getContext('2d');
+      if (ctx) draw(ctx, { ...settings, channel, held }, live, sampleRate, inputChannels, cursor);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [settings, channel, live, held, sampleRate, inputChannels, cursor, theme]);
+  const atCursor = (trace: SpectrumTrace | null) => {
+    if (!trace || cursor === null || cursor > trace.sr / 2) return '—';
+    const value = trace.decibels[Math.round(cursor * trace.fftSize / trace.sr)];
+    return value === undefined ? '—' : `${value.toFixed(1)} dBFS/Hz`;
+  };
+  return <section data-spectrum-channel={channel} style={{ border: '1px solid var(--border)', borderRadius: 4, marginBottom: 8 }}>
+    <div style={{ padding: '5px 7px', fontSize: 10, color: 'var(--audio)', background: 'var(--surface2)' }}>Ch {channel + 1}</div>
+    <canvas ref={canvas} width={WIDTH} height={HEIGHT}
+      aria-label={settings.layout === 'single' ? 'Welch power spectral density' : `Welch power spectral density — Ch ${channel + 1}`}
+      onMouseMove={event => {
+        const bounds = event.currentTarget.getBoundingClientRect();
+        const position = Math.max(0, Math.min(1, ((event.clientX - bounds.left) * WIDTH / bounds.width - PLOT.left) / (PLOT.right - PLOT.left)));
+        setCursor(settings.scale === 'log' ? range.minimum * Math.pow(range.maximum / range.minimum, position) : range.minimum + (range.maximum - range.minimum) * position);
+      }} onMouseLeave={() => setCursor(null)} style={{ display: 'block', width: '100%', borderRadius: 3, cursor: 'crosshair' }} />
+    <div style={{ display: 'flex', gap: 10, alignItems: 'center', margin: '7px 5px 0', fontSize: 10 }}>
+      <span style={{ color: 'var(--audio)' }}>━ Live</span>
+      <span style={{ color: 'var(--wave-trigger)' }}>┄ Held{held ? ` · Ch ${held.channel + 1}` : ''}</span>
+      <button style={{ ...button, marginLeft: 'auto', opacity: live?.decibels.length ? 1 : 0.45 }} disabled={!live?.decibels.length}
+        onClick={() => onHold(channel)} title="Capture this channel's Welch spectrum; live analysis continues">{held ? 'Replace held' : 'Hold spectrum'}</button>
+      <button style={button} disabled={!held} onClick={() => onClear(channel)}>Clear held</button>
+    </div>
+    <div style={{ minHeight: 16, fontSize: 9, color: 'var(--text-muted)', margin: '5px' }}>
+      {cursor === null ? `${sampleRate} Hz · Δf ${(sampleRate / settings.fftSize).toFixed(2)} Hz · ${live?.averages ?? 0}/${settings.averages} segments · 50% overlap`
+        : `${cursor.toFixed(1)} Hz · Live ${atCursor(live)} · Held ${atCursor(held)}`}
+    </div>
+    {held && <div style={{ fontSize: 9, color: 'var(--text-muted)', margin: 5 }} title={held.capturedAt}>
+      Held: Ch {held.channel + 1} · {held.fftSize} points · {windowLabel(held.window)} · {held.sr} Hz · {held.averages} segments
+    </div>}
+  </section>;
+});
+
 function FrequencyAnalysisNode({ id, data, selected }: NodeProps) {
   const [settings, setSettings] = useState(() => readFrequencySettings(data.settingsJson as string | undefined));
-  const [live, setLive] = useState<SpectrumTrace | null>(null);
-  const [sampleRate, setSampleRate] = useState(48000);
-  const [inputChannels, setInputChannels] = useState(0);
-  const [cursor, setCursor] = useState<number | null>(null);
+  const [{ sampleRate, inputChannels, traces }, setCapture] = useState({ sampleRate: 48000, inputChannels: 0, traces: {} as Record<number, SpectrumTrace> });
   const settingsRef = useRef(settings); settingsRef.current = settings;
-  const liveRef = useRef(live); liveRef.current = live;
-  const canvas = useRef<HTMLCanvasElement>(null), body = useRef<HTMLDivElement>(null);
-  const theme = useTheme();
+  const body = useRef<HTMLDivElement>(null);
   const { showSettings, toggleSettings, closeSettings } = useNodeSettings(id);
   const { collapsed, toggleCollapsed } = useNodeCollapsed(id, data._forceCollapsed as boolean | undefined);
   const { handleDelete } = useNodeDelete(id);
@@ -97,23 +138,26 @@ function FrequencyAnalysisNode({ id, data, selected }: NodeProps) {
     settingsRef.current = next; setSettings(next); Bridge.commitSettingsChange(id, next);
     if ('customName' in values) Bridge.setNodeLabel(id, values.customName ?? '');
   }, [id]);
-  useEffect(() => { setLive(null); liveRef.current = null; }, [settings.fftSize, settings.window, settings.channel, settings.averages]);
+  const channelSelection = JSON.stringify(settings.selectedChannels);
+  useEffect(() => { setCapture(old => ({ ...old, traces: {} })); },
+    [settings.fftSize, settings.window, settings.channel, settings.averages, settings.layout, channelSelection]);
   useEffect(() => Bridge.onWelchSnapshot(snapshots => {
-    const snap = snapshots.find(item => item.nodeId === id);
-    if (!snap) return;
-    setSampleRate(snap.sr); setInputChannels(snap.inputChannels);
     const s = settingsRef.current;
-    if (snap.fftSize !== s.fftSize || snap.channel !== s.channel || snap.window !== s.window || snap.requestedAverages !== s.averages) return;
-    setLive({ ...snap, decibels: snap.decibels ? snap.decibels.split(',').map(Number) : [], capturedAt: new Date().toISOString() });
-  }), [id]);
-  useEffect(() => {
-    if (collapsed) return;
-    const raf = requestAnimationFrame(() => {
-      const ctx = canvas.current?.getContext('2d');
-      if (ctx) draw(ctx, settings, live, sampleRate, inputChannels, cursor);
+    const matches = snapshots.filter(snap => snap.nodeId === id && snap.fftSize === s.fftSize && snap.window === s.window
+      && snap.requestedAverages === s.averages && (snap.layout ?? 'single') === s.layout
+      && (s.layout === 'stacked' || snap.channel === s.channel));
+    const latest = matches[matches.length - 1];
+    if (!latest) return;
+    setCapture(old => {
+      const next = old.sampleRate === latest.sr && old.inputChannels === latest.inputChannels ? { ...old.traces } : {} as Record<number, SpectrumTrace>;
+      for (const snap of matches) {
+        if (snap.channel < 0 || snap.channel >= latest.inputChannels || snap.sr !== latest.sr || snap.inputChannels !== latest.inputChannels) continue;
+        if (s.layout === 'stacked' && s.selectedChannels !== null && !s.selectedChannels.includes(snap.channel)) continue;
+        next[snap.channel] = { ...snap, decibels: snap.decibels ? snap.decibels.split(',').map(Number) : [], capturedAt: new Date().toISOString() };
+      }
+      return { sampleRate: latest.sr, inputChannels: latest.inputChannels, traces: next };
     });
-    return () => cancelAnimationFrame(raf);
-  }, [collapsed, settings, live, sampleRate, inputChannels, cursor, theme]);
+  }), [id]);
   const range = frequencyRange(settings, sampleRate);
   const nyquist = sampleRate / 2;
   const frequencyStep = Math.min(1, (range.maximum - range.minimum) / 10);
@@ -122,14 +166,16 @@ function FrequencyAnalysisNode({ id, data, selected }: NodeProps) {
   const field = (label: string, control: ReactNode) => <div style={{ flex: 1, minWidth: 0 }}>
     <div style={{ fontSize: 9, color: 'var(--text-muted)', marginBottom: 4 }}>{label}</div>{control}
   </div>;
-  const atCursor = (spectrum: SpectrumTrace | null) => {
-    if (!spectrum || cursor === null || cursor > spectrum.sr / 2) return '—';
-    const value = spectrum.decibels[Math.round(cursor * spectrum.fftSize / spectrum.sr)];
-    return value === undefined ? '—' : `${value.toFixed(1)} dBFS/Hz`;
+  const visible = visibleFrequencyChannels(settings, inputChannels);
+  const hold = (channel: number) => {
+    const live = traces[channel];
+    if (!live?.decibels.length) return;
+    const held = { ...live, decibels: [...live.decibels] };
+    if (settings.layout === 'single') patch({ held });
+    else patch({ heldChannels: [...settings.heldChannels.filter(h => h.channel !== channel), held] });
   };
-  const hold = () => {
-    if (liveRef.current?.decibels.length) patch({ held: { ...liveRef.current, decibels: [...liveRef.current.decibels] } });
-  };
+  const clear = (channel: number) => settings.layout === 'single' ? patch({ held: null })
+    : patch({ heldChannels: settings.heldChannels.filter(h => h.channel !== channel), held: settings.held?.channel === channel ? null : settings.held });
   return <div style={{ width: WIDTH + 16, position: 'relative', background: 'var(--surface)',
     border: `1px solid ${selected ? 'var(--audio)' : 'var(--border)'}`, borderTop: '3px solid var(--audio)',
     borderRadius: 'var(--radius)', boxShadow: 'var(--shadow-node)', zIndex: showSettings ? 9999 : undefined }}>
@@ -143,27 +189,33 @@ function FrequencyAnalysisNode({ id, data, selected }: NodeProps) {
         {field('FFT length', select(String(settings.fftSize), FFT_SIZES.map(n => ({ id: String(n), name: `${n} points` })), v => patch({ fftSize: Number(v) })))}
         {field('Welch averages', select(String(settings.averages), [2, 4, 8, 16].map(n => ({ id: String(n), name: `${n} segments` })), v => patch({ averages: Number(v) })))}
       </div>
-      <div data-port-anchor="spectrum">
-        <canvas ref={canvas} width={WIDTH} height={HEIGHT} aria-label="Welch power spectral density"
-          onMouseMove={event => {
-            const bounds = event.currentTarget.getBoundingClientRect();
-            const position = Math.max(0, Math.min(1, ((event.clientX - bounds.left) * WIDTH / bounds.width - PLOT.left) / (PLOT.right - PLOT.left)));
-            setCursor(settings.scale === 'log' ? range.minimum * Math.pow(range.maximum / range.minimum, position) : range.minimum + (range.maximum - range.minimum) * position);
-          }} onMouseLeave={() => setCursor(null)} style={{ display: 'block', borderRadius: 3, cursor: 'crosshair' }} />
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 7 }}>
+        <button style={{ ...button, color: settings.layout === 'single' ? 'var(--audio)' : undefined }} aria-pressed={settings.layout === 'single'} onClick={() => patch({ layout: 'single' })}>Single channel</button>
+        <button style={{ ...button, color: settings.layout === 'stacked' ? 'var(--audio)' : undefined }} aria-pressed={settings.layout === 'stacked'} onClick={() => patch({ layout: 'stacked' })}>Subplots</button>
+        <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--text-muted)' }}>{inputChannels} input ch</span>
       </div>
-      <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 7, fontSize: 10 }}>
-        <span style={{ color: 'var(--audio)' }}>━ Live</span>
-        <span style={{ color: 'var(--wave-trigger)' }}>┄ Held{settings.held ? ` · Ch ${settings.held.channel + 1}` : ''}</span>
-        <button style={{ ...button, marginLeft: 'auto', opacity: live?.decibels.length ? 1 : 0.45 }} disabled={!live?.decibels.length} onClick={hold}
-          title="Capture the currently displayed Welch spectrum; live analysis continues">{settings.held ? 'Replace held' : 'Hold spectrum'}</button>
-        <button style={button} disabled={!settings.held} onClick={() => patch({ held: null })}>Clear held</button>
-      </div>
-      <div style={{ minHeight: 16, fontSize: 9, color: 'var(--text-muted)', marginTop: 5 }}>
-        {cursor === null ? `${sampleRate} Hz · Δf ${(sampleRate / settings.fftSize).toFixed(2)} Hz · ${live?.averages ?? 0}/${settings.averages} segments · 50% overlap`
-          : `${cursor.toFixed(1)} Hz · Live ${atCursor(live)} · Held ${atCursor(settings.held)}`}
+      {settings.layout === 'stacked' && <div style={{ marginBottom: 8 }}>
+        <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
+          <button style={button} aria-pressed={settings.selectedChannels === null} onClick={() => patch({ selectedChannels: null })}>All channels</button>
+          <button style={button} onClick={() => patch({ selectedChannels: [] })}>None</button>
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px 10px', maxHeight: 90, overflowY: 'auto' }}>
+          {Array.from({ length: inputChannels }, (_, channel) => <div key={channel}>
+            <Checkbox label={`Ch ${channel + 1}`} checked={visible.includes(channel)} accent="var(--audio)" onChange={checked => patch({
+              selectedChannels: checked ? [...visible, channel].sort((a, b) => a - b) : visible.filter(c => c !== channel),
+            })} />
+          </div>)}
+        </div>
+      </div>}
+      <div data-port-anchor="spectrum" style={{ maxHeight: settings.layout === 'stacked' ? 570 : undefined, overflowY: settings.layout === 'stacked' ? 'auto' : undefined }}>
+        {visible.map(channel => <SpectrumPlot key={channel} settings={settings} channel={channel}
+          live={traces[channel] ?? null} sampleRate={sampleRate} inputChannels={inputChannels}
+          held={settings.layout === 'single' ? settings.held : settings.heldChannels.find(h => h.channel === channel) ?? (settings.held?.channel === channel ? settings.held : null)}
+          onHold={hold} onClear={clear} />)}
+        {!visible.length && <div style={{ padding: 25, fontSize: 11, color: 'var(--text-muted)' }}>{inputChannels ? 'Select channels to view their spectra' : 'Connect an audio signal'}</div>}
       </div>
       <div style={{ display: 'flex', gap: 8, alignItems: 'end', marginTop: 6 }}>
-        {field(`Channel (${inputChannels} input)`, select(String(settings.channel), Array.from({ length: Math.max(1, inputChannels, settings.channel + 1) }, (_, i) => ({ id: String(i), name: `Ch ${i + 1}${i >= inputChannels ? ' (unavailable)' : ''}` })), v => patch({ channel: Number(v) })))}
+        {settings.layout === 'single' && field(`Channel (${inputChannels} input)`, select(String(settings.channel), Array.from({ length: Math.max(1, inputChannels, settings.channel + 1) }, (_, i) => ({ id: String(i), name: `Ch ${i + 1}${i >= inputChannels ? ' (unavailable)' : ''}` })), v => patch({ channel: Number(v) })))}
         {field('From (Hz)', <ValueBox value={range.minimum} min={0} max={range.maximum - frequencyStep} step={frequencyStep} width={80}
           onCommit={v => patch({ freqMin: v, freqMax: range.maximum })} accent="var(--audio)" />)}
         {field('To (Hz)', <ValueBox value={range.maximum} min={range.minimum + frequencyStep} max={nyquist} step={frequencyStep} width={80}
@@ -175,9 +227,6 @@ function FrequencyAnalysisNode({ id, data, selected }: NodeProps) {
         <button style={button} onClick={() => patch({ freqMin: 20, freqMax: Math.min(20000, nyquist) })}>20 Hz–20 kHz</button>
         {settings.scale === 'log' && settings.freqMin === 0 && <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>Log starts at {hz(range.minimum)} Hz; DC hidden</span>}
       </div>
-      {settings.held && <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 7 }} title={settings.held.capturedAt}>
-        Held: Ch {settings.held.channel + 1} · {settings.held.fftSize} points · {windowLabel(settings.held.window)} · {settings.held.sr} Hz · {settings.held.averages} segments
-      </div>}
     </div>}
     {showSettings && <div className="nodrag nowheel" onPointerDown={e => e.stopPropagation()} style={{ position: 'absolute', left: '100%', top: 0, marginLeft: 6,
       width: 270, padding: 12, background: 'var(--surface2)', border: '1px solid var(--border-hi)', borderRadius: 'var(--radius)', boxShadow: 'var(--shadow-panel)' }}>
@@ -187,7 +236,8 @@ function FrequencyAnalysisNode({ id, data, selected }: NodeProps) {
         {field('Minimum (dBFS/Hz)', <ValueBox value={settings.dbMin} min={-200} max={settings.dbMax - 1} width={90} onCommit={v => patch({ dbMin: v })} />)}
         {field('Maximum (dBFS/Hz)', <ValueBox value={settings.dbMax} min={settings.dbMin + 1} max={20} width={90} onCommit={v => patch({ dbMax: v })} />)}
       </div>
-      <p style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.6 }}>The history holds 65,536 samples. Large FFTs use as many complete segments as fit; the actual count appears below the plot. A held spectrum preserves its original sample rate and FFT grid, and is saved with the project.</p>
+      <p style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.6 }}>Subplots gives each selected input channel its own axes, cursor and held reference. All channels follows the input layout. FFT, window, frequency and dB ranges apply to every subplot.</p>
+      <p style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.6 }}>The history holds 65,536 samples per channel. At most eight channels refresh per 100 ms cycle; larger selections refresh in rotation. Held spectra preserve their original sample rate and FFT grid and are saved with the project.</p>
     </div>}
   </div>;
 }

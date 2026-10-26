@@ -9,6 +9,7 @@
 
 #include "MidiMonitorNode.h"
 #include "AudioMonitorNode.h"
+#include "WelchChannelAnalysis.h"
 #include "ArtNetConsoleNode.h"
 #include "OscMonitorNode.h"
 #include "UdpMonitorNode.h"
@@ -145,12 +146,9 @@ struct SpectrumSnapshot
     std::vector<float> bandHigh;   // Hz
 };
 
-struct WelchSnapshot
+struct WelchSnapshot : AudioSim::WelchChannelSpectrum
 {
-    juce::String nodeId, window;
-    double sampleRate = 48000.0;
-    int fftSize = 2048, channel = 0, inputChannels = 0, averages = 0, requestedAverages = 8;
-    std::vector<float> decibels;
+    juce::String nodeId;
 };
 
 // Free struct — used by both WebBridge and PatchyProcessor

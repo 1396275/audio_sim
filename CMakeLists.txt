@@ -363,6 +363,7 @@ if (PATCHY_BUILD_TESTS)
         Tests/PatchyTestRunner.cpp
         Tests/AudioRoutingIntegrationTests.cpp
         Tests/WelchSpectrumTests.cpp
+        Tests/WelchChannelAnalysisTests.cpp
         Tests/PaxRoutingTests.cpp)
     target_compile_features (AudioRoutingTests PRIVATE cxx_std_20)
     target_include_directories (AudioRoutingTests PRIVATE
