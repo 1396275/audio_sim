@@ -7,8 +7,8 @@
       "disabled": false, "x": 80, "y": 150
     },
     {
-      "id": "demo_gain", "label": "Level", "nodeType": 102,
-      "paxName": "Level", "selectedDeviceId": "", "customName": "Gain from DLL",
+      "id": "demo_gain", "label": "Amp", "nodeType": 102,
+      "paxName": "Amp", "selectedDeviceId": "", "customName": "Gain from DLL",
       "settingsJson": "[-12]", "disabled": false, "x": 450, "y": 150
     },
     {

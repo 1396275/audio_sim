@@ -271,7 +271,11 @@ export default function Sidebar() {
   const { isStandalone } = useContext(DawContext);
   const { hint, setHint } = useContext(HintContext);
   const [paxItems, setPaxItems] = useState<PaxInfo[]>([]);
-  useEffect(() => { Bridge.onPaxList(list => setPaxItems(list)); }, []);
+  // Old user/plugin folders can still contain the retired bundled DLLs.
+  // Keep their metadata available for saved graphs, but omit them from Add.
+  useEffect(() => { Bridge.onPaxList(list => setPaxItems(
+    list.filter(p => !['Spectrumyser', 'Splitter', 'Level'].includes(p.name))
+  )); }, []);
   // v0.0.938 — the wrap library
   const [wrapLib, setWrapLib] = useState<WrapLibraryItem[]>([]);
   useEffect(() => Bridge.onWrapLibrary(lib => setWrapLib(lib.items)), []);

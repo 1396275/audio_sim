@@ -100,7 +100,7 @@ if ($Clean) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 Write-Host "Building AudioSim (log: $buildLog)"
-& $cmake --build $build --target Patchy_Standalone PatchyTests AudioRoutingTests PaxDllSmoke LevelPax AmpPax SpectrumyserPax StereoSplitterPax --parallel 2 *> $buildLog
+& $cmake --build $build --target Patchy_Standalone PatchyTests AudioRoutingTests PaxDllSmoke AmpPax --parallel 2 *> $buildLog
 if ($LASTEXITCODE -ne 0) {
     Get-Content -LiteralPath $buildLog | Select-String -Pattern 'error [A-Z]+[0-9]+|fatal error' -Context 0,1 | Select-Object -First 20
     Write-Host "Full build log: $buildLog"
@@ -120,10 +120,20 @@ if ($SkipDeploy) {
 $trialRoot = Join-Path $taskRoot 'Run'
 $trialPax = Join-Path $trialRoot 'AudioSimPax'
 $trialLicenses = Join-Path $trialRoot 'Licenses'
+if (Get-Process -Name AudioSim -ErrorAction SilentlyContinue) {
+    throw 'Save your project and exit AudioSim before deploying. Build and tests have completed; Run files were not replaced.'
+}
 New-Item -ItemType Directory -Path $trialRoot, $trialPax, $trialLicenses -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $build 'Patchy_artefacts\Release\Standalone\AudioSim.exe') -Destination (Join-Path $trialRoot 'AudioSim.exe') -Force
-foreach ($name in @('LevelPax', 'AmpPax', 'SpectrumyserPax', 'StereoSplitterPax')) {
+foreach ($name in @('AmpPax')) {
     Copy-Item -LiteralPath (Join-Path $build "pax\$name.dll") -Destination $trialPax -Force
+}
+# Remove only the retired bundled modules; leave other user DLLs in place.
+foreach ($name in @('LevelPax', 'SpectrumyserPax', 'StereoSplitterPax')) {
+    $retiredDll = Join-Path $trialPax "$name.dll"
+    if (Test-Path -LiteralPath $retiredDll -PathType Leaf) {
+        Remove-Item -LiteralPath $retiredDll
+    }
 }
 Copy-Item -LiteralPath (Join-Path $repo 'LICENSE') -Destination (Join-Path $trialLicenses 'Patchy.txt') -Force
 Copy-Item -LiteralPath (Join-Path $dependencyRoot 'JUCE-8.0.12\LICENSE.md') -Destination (Join-Path $trialLicenses 'JUCE.txt') -Force

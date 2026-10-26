@@ -32,12 +32,15 @@ macro(add_pax TARGET_NAME SOURCE_FILE)
     endif()
 endmacro()
 
-# Audio examples included with the framework.
-set(PAX_TARGETS LevelPax AmpPax StereoSplitterPax SpectrumyserPax)
-add_pax(LevelPax LevelPax/LevelPax.cpp)
+# Audio algorithm included with the framework.
+set(PAX_TARGETS AmpPax)
 add_pax(AmpPax AmpPax/AmpPax.cpp)
-add_pax(StereoSplitterPax StereoSplitterPax/StereoSplitterPax.cpp)
-add_pax(SpectrumyserPax SpectrumyserPax/SpectrumyserPax.cpp)
+
+# Retain dynamic-output routing coverage using this upstream test fixture.
+# It is not installed or copied into the AudioSim runtime package.
+if(PATCHY_BUILD_TESTS)
+    add_pax(SpectrumyserPax SpectrumyserPax/SpectrumyserPax.cpp)
+endif()
 
 option(AUDIOSIM_BUILD_EXTRA_PAX "Build upstream MIDI/network/converter examples" OFF)
 if(AUDIOSIM_BUILD_EXTRA_PAX)

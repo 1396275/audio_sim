@@ -44,7 +44,8 @@ int wmain(int argc, wchar_t** argv)
         prepare(instance, 48000.0, 4);
         PAX_ParameterInfo info {};
         parameterInfo(instance, 0, &info);
-        if (parameterCount(instance) != 1 || info.minValue != -60.0f || info.maxValue != 6.0f)
+        if (parameterCount(instance) != 1 || info.minValue != -60.0f || info.maxValue != 24.0f
+            || info.defaultValue != 0.0f || info.step != 0.1f || get(instance, 0) != 0.0f)
             throw std::runtime_error("Unexpected gain parameter metadata");
 
         float left[] = {0.25f, -0.5f, 1.0f, 0.125f};
@@ -57,20 +58,24 @@ int wmain(int argc, wchar_t** argv)
         context.audioOut = outputs;
         context.numChannels = 2;
         context.numSamples = 4;
-        set(instance, 0, -6.020599913f);
-        if (std::abs(get(instance, 0) + 6.020599913f) > 0.00001f)
-            throw std::runtime_error("Parameter did not update");
-        process(instance, &context);
-        for (int channel = 0; channel < 2; ++channel)
-            for (int sample = 0; sample < 4; ++sample)
-                if (std::abs(outputs[channel][sample] - inputs[channel][sample] * 0.5f) > 0.000001f)
-                    throw std::runtime_error("Gain processing result is incorrect");
-        set(instance, 0, -60.0f);
-        process(instance, &context);
-        for (auto* output : outputs)
-            for (int sample = 0; sample < 4; ++sample)
-                if (output[sample] != 0.0f)
-                    throw std::runtime_error("Silence parameter did not take effect");
+        struct GainCase { float requestedDb, expectedDb, expectedGain; };
+        for (const auto& gain : { GainCase{-100.f, -60.f, 0.001f},
+                                 GainCase{-60.f, -60.f, 0.001f},
+                                 GainCase{-20.f, -20.f, 0.1f},
+                                 GainCase{-6.020599913f, -6.020599913f, 0.5f},
+                                 GainCase{0.f, 0.f, 1.f},
+                                 GainCase{6.020599913f, 6.020599913f, 2.f},
+                                 GainCase{24.f, 24.f, 15.848932f},
+                                 GainCase{100.f, 24.f, 15.848932f} }) {
+            set(instance, 0, gain.requestedDb);
+            if (std::abs(get(instance, 0) - gain.expectedDb) > 0.00001f)
+                throw std::runtime_error("Parameter range or clamping is incorrect");
+            process(instance, &context);
+            for (int channel = 0; channel < 2; ++channel)
+                for (int sample = 0; sample < 4; ++sample)
+                    if (std::abs(outputs[channel][sample] - inputs[channel][sample] * gain.expectedGain) > 0.000005f)
+                        throw std::runtime_error("Attenuation, unity or amplification is incorrect");
+        }
         const auto maxChannels = resolve<decltype(&PAX_getMaxAudioChannels)>(library, "PAX_getMaxAudioChannels");
         if (maxChannels() < 64) throw std::runtime_error("Multichannel capability not exported");
         for (double rate : {1500., 2000., 8000., 16000., 44100., 48000.})
@@ -87,13 +92,16 @@ int wmain(int argc, wchar_t** argv)
                     PAX_ProcessContext block {};
                     block.audioIn = ins.data(); block.audioOut = outs.data();
                     block.numChannels = channels; block.numSamples = frames;
-                    set(instance, 0, -6.020599913f); process(instance, &block);
-                    for (size_t n = 0; n < result.size(); ++n)
-                        if (std::abs(result[n] - source[n] * 0.5f) > 0.000001f)
-                            throw std::runtime_error("Multichannel/low-rate/small-frame gain failed");
+                    for (const auto& gain : { GainCase{-6.020599913f, -6.020599913f, 0.5f},
+                                             GainCase{6.020599913f, 6.020599913f, 2.f} }) {
+                        set(instance, 0, gain.requestedDb); process(instance, &block);
+                        for (size_t n = 0; n < result.size(); ++n)
+                            if (std::abs(result[n] - source[n] * gain.expectedGain) > 0.000001f)
+                                throw std::runtime_error("Multichannel/low-rate/small-frame gain failed");
+                    }
                 }
         std::cout << "PASS: " << descriptor->name << " DLL, API " << descriptor->apiVersion
-                  << ", parameters, multichannel gain, low rates, small frames and silence\n";
+                  << ", parameter limits, attenuation, unity, boost, multichannel gain, low rates and small frames\n";
         destroy(instance);
         FreeLibrary(library);
         return 0;

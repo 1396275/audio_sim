@@ -155,7 +155,7 @@ export const NODE_HINTS: Record<string, { title: string; body: string }> = {
   // Pax
   'AudioLevel':  { title: 'Audio Level',    body: 'Controls signal level from -60dB (silence) to +6dB. Use before outputs or between processing nodes.' },
   'Level':       { title: 'Audio Level',    body: 'Controls signal level from -60dB (silence) to +6dB. Use before outputs or between processing nodes.' },
-  'Amp':         { title: 'Amp',            body: 'Boosts the signal from 0dB (unity) to +24dB. Use to drive weak signals or compensate for low levels.' },
+  'Amp':         { title: 'Amp',            body: 'Adjusts gain from -60dB to +24dB; 0dB is unity. Negative values attenuate the signal, positive values amplify it.' },
   'Transpose':   { title: 'Transpose',      body: 'Shifts MIDI pitch by -24 to +24 semitones. Useful for transposing keyboards or creating harmonies.' },
   'Envelope':    { title: 'Envelope',       body: 'Converts audio amplitude or a frequency band level into a MIDI CC stream. Ideal for driving LED controllers or DAW automation.' },
   'Splitter':    { title: 'Stereo Splitter',body: 'Splits a stereo signal into separate Left and Right mono outputs. Balance control adjusts the L/R ratio.' },

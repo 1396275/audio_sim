@@ -42,7 +42,9 @@ git log --oneline --decorate -10
 
 启动窗口始终位于系统主显示器：保留主屏内的上次位置，旧位置在副屏或屏幕外时回到主屏居中，并按当前工作区缩小过大的窗口，避开任务栏和原生标题栏。位置在窗口显示前恢复。
 
-通过 File > Open 打开 `Run/Examples/Gain-DLL.patchy`，播放信号并调节 Level，体验 DLL 调参和波形显示。默认附带 Level、Amp、Splitter、Spectrumyser 四个音频 DLL。齿轮 Preferences > Graph > Appearance 可切换 Light / Dark，选择会保存。
+通过 File > Open 打开 `Run/Examples/Gain-DLL.patchy`，播放信号并调节 Amp，体验 DLL 调参和波形显示。Audio DLL 默认仅附带 Amp，范围为 **−60 dB 至 +24 dB**，默认 0 dB；负数衰减、正数放大，线性增益为 `10^(dB/20)`，−60 dB 为 0.001 倍而非静音。滑块、数值拖动及双击输入均可调节。齿轮 Preferences > Graph > Appearance 可切换 Light / Dark，选择会保存。
+
+Spectrumyser、Splitter、Level 已从添加列表和默认运行包移除；构建部署会清除 `Run/AudioSimPax/` 中这三个旧 DLL，用户插件目录中的同名模块也不会出现在添加列表。旧源码保留作参考，其中 Spectrumyser 仅作为动态输出路由的测试夹具构建。频谱观察使用内置 Frequency Analysis。包含已移除 DLL 的旧工程需要替换相关节点：增益控制改用 Amp，频谱观察改用 Frequency Analysis，并检查原有输出连接。
 
 启动页使用本机字体，不再请求在线字体。声卡能力搜索在后台串行执行，扫描期间可操作画布；结果在当前界面实例内缓存，44.1/48 kHz 切换复用能力数据。接入新设备后，点击 Audio In / Out 选择框旁的 ↻ 刷新。启动不再扫描音频框架未使用的 MIDI 和串口。DLL 扫描结果与参数描述复用，避免重复加载和创建临时实例。
 
@@ -63,7 +65,7 @@ Preferences > Audio 中只设置 Sample rate 和 Buffer size（算法帧长）�
 
 Source 支持最多 64 通道的音频文件，按原通道顺序输出；超过 64 的部分不输出。文件采样率不同于仿真采样率时，在内存中转换，过程不使用声卡。波形发生器在仿真采样率下生成信号，最高频率限制为采样率的 0.49 倍（界面最高 20 kHz）；方波与锯齿波是基础波形，未作带限抗混叠。文件整体载入内存，支持格式取决于 JUCE 编译启用的解码器。
 
-Monitor 根据其输入连接的实际信号通道显示；它只有输入，不再透传。从要观察的算法输出口分一条线接到 Monitor，算法输出也可同时连接后续模块。可勾选任意通道，Single plot 同图叠加，Subplots 每通道一个子图；All 自动跟随全部输入通道。显示选择与布局随工程保存。捕获先按当前时间窗口取原始数据；不超过 512 个样本时逐样本显示，更多样本时显示每桶 min/max 峰值包络，避免稀疏抽点形成假低频，触发对齐也在原始数据上完成。Spectrumyser 的频率范围也随采样率调整，FFT 图当前观察第一输入通道。
+Monitor 根据其输入连接的实际信号通道显示；它只有输入，不再透传。从要观察的算法输出口分一条线接到 Monitor，算法输出也可同时连接后续模块。可勾选任意通道，Single plot 同图叠加，Subplots 每通道一个子图；All 自动跟随全部输入通道。显示选择与布局随工程保存。捕获先按当前时间窗口取原始数据；不超过 512 个样本时逐样本显示，更多样本时显示每桶 min/max 峰值包络，避免稀疏抽点形成假低频，触发对齐也在原始数据上完成。
 
 旧工程中的 Monitor 透传链在加载、片段导入及撤销恢复时自动转换为观察分支，保留到原下游的直接音频连接；相同端点的重汇合路径会合并为单条连接，因此依赖重复路径叠加增益的旧工程需要检查其混音结果。
 
@@ -90,7 +92,7 @@ Monitor 根据其输入连接的实际信号通道显示；它只有输入，不
 pwsh -NoProfile -File .\tools\Build-AudioSim.ps1
 ```
 
-脚本配置 CMake、打包 React UI、构建应用和四个音频 DLL、运行检查，并将运行文件更新到 `Run/`。更新前请保存工程并退出 AudioSim。日志位于 `build/windows-release/`，可用 `-ConfigureOnly` 仅配置、`-SkipDeploy` 编译验证但暂不替换运行文件，或 `-Clean` 清理本目录生成的构建产物并完整重编译。脚本自动探测 MSVC 的实际头文件提示前缀，保证中文环境下的 Ninja 头文件依赖跟踪。
+脚本配置 CMake、打包 React UI、构建应用和 Amp DLL、运行检查，并将运行文件更新到 `Run/`，同时移除已停用的三个旧 DLL。更新前请保存工程并退出 AudioSim；程序仍在运行时脚本会保留已有运行文件并提示退出。日志位于 `build/windows-release/`，可用 `-ConfigureOnly` 仅配置、`-SkipDeploy` 编译验证但暂不替换运行文件，或 `-Clean` 清理本目录生成的构建产物并完整重编译。脚本自动探测 MSVC 的实际头文件提示前缀，保证中文环境下的 Ninja 头文件依赖跟踪。
 
 本目录已复制所需第三方依赖和 npm 缓存，构建不依赖旁边的 `Patchy/`、`PatchyTrial/` 或旧 `dependencies/`。系统工具仍使用本机的 MSVC 14.51、CMake/Ninja、Node.js 和 PowerShell；更换开发机时请调整构建脚本中的工具路径。缺少依赖时可运行 `tools/Get-AudioSimDependencies.ps1`。
 

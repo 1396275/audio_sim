@@ -29,6 +29,7 @@ include(${CMAKE_SOURCE_DIR}/cmake/FyiBackup.cmake)
 
 # ── Options ───────────────────────────────────────────────────────────────────
 option(NODEGRAPH_DEV_MODE "Skip UI build, use Vite dev server on localhost:5173" OFF)
+option(PATCHY_BUILD_TESTS "Build Patchy unit tests" ON)
 
 # ── Find npm ──────────────────────────────────────────────────────────────────
 if(NOT NODEGRAPH_DEV_MODE)
@@ -320,8 +321,6 @@ if(NPM_EXE)
 endif()
 
 # ── Unit Tests ────────────────────────────────────────────────────────────────
-option (PATCHY_BUILD_TESTS "Build Patchy unit tests" ON)
-
 if (PATCHY_BUILD_TESTS)
     add_executable (PatchyTests
         Tests/PatchyTestRunner.cpp
@@ -371,13 +370,13 @@ if (PATCHY_BUILD_TESTS)
     target_compile_definitions (AudioRoutingTests PRIVATE
         $<TARGET_PROPERTY:Patchy,COMPILE_DEFINITIONS>)
     target_link_libraries (AudioRoutingTests PRIVATE Patchy)
-    add_dependencies (AudioRoutingTests LevelPax AmpPax SpectrumyserPax)
+    add_dependencies (AudioRoutingTests AmpPax SpectrumyserPax)
     add_test (NAME AudioRoutingTests COMMAND AudioRoutingTests AudioRouting)
     if(WIN32)
         add_executable(PaxDllSmoke Tests/PaxDllSmoke.cpp)
         target_include_directories(PaxDllSmoke PRIVATE Pax)
         target_compile_definitions(PaxDllSmoke PRIVATE NOMINMAX)
-        add_dependencies(PaxDllSmoke LevelPax)
-        add_test(NAME PaxDllSmoke COMMAND PaxDllSmoke $<TARGET_FILE:LevelPax>)
+        add_dependencies(PaxDllSmoke AmpPax)
+        add_test(NAME PaxDllSmoke COMMAND PaxDllSmoke $<TARGET_FILE:AmpPax>)
     endif()
 endif()

@@ -199,16 +199,15 @@ private:
 
     void testGainDllWidths()
     {
-        for (const auto* name : { "LevelPax", "AmpPax" })
+        for (const double gainDb : { -6.020599913, 6.020599913 })
             for (int width : { 8, 64 })
             {
-                beginTest (juce::String (name) + " preserves " + juce::String (width)
+                beginTest ("Amp " + juce::String (gainDb) + " dB preserves " + juce::String (width)
                            + " channels with a mono host clock and 24-sample frames");
                 PaxRoutingFixture fixture;
-                if (! load (fixture, { name })) continue;
-                const bool level = juce::String (name) == "LevelPax";
+                if (! load (fixture, { "AmpPax" })) continue;
                 const auto monitor = fixture.addMonitor();
-                const auto algorithm = fixture.addPax (name, { juce::var (level ? -6.020599913 : 6.020599913) });
+                const auto algorithm = fixture.addPax ("AmpPax", { juce::var (gainDb) });
                 const auto source = fixture.addFile (width);
                 expect (fixture.connect (source, algorithm));
                 expect (fixture.connect (algorithm, monitor));
@@ -222,21 +221,21 @@ private:
                 for (int block = 0; block < 3; ++block)
                 {
                     fixture.process();
-                    expectSignal (fixture, monitor, width, block, 0.f, level ? 0.5f : 2.f);
+                    expectSignal (fixture, monitor, width, block, 0.f, gainDb < 0 ? 0.5f : 2.f);
                 }
             }
     }
 
     void testIndependentBranches()
     {
-        beginTest ("Independent Level and Amp branches keep two- and eight-channel layouts");
+        beginTest ("Independent attenuating and amplifying Amp branches keep two- and eight-channel layouts");
         PaxRoutingFixture fixture;
-        if (! load (fixture, { "LevelPax", "AmpPax" })) return;
+        if (! load (fixture, { "AmpPax" })) return;
         const auto narrowMonitor = fixture.addMonitor();
         const auto wide = fixture.addFile (8, 0.2f);
         const auto narrow = fixture.addFile (2, 0.4f);
         const auto wideMonitor = fixture.addMonitor();
-        const auto level = fixture.addPax ("LevelPax", { juce::var (-6.020599913) });
+        const auto level = fixture.addPax ("AmpPax", { juce::var (-6.020599913) });
         const auto amp = fixture.addPax ("AmpPax", { juce::var (6.020599913) });
         expect (fixture.connect (narrow, level));
         expect (fixture.connect (level, narrowMonitor));

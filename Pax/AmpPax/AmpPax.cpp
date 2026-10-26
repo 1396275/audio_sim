@@ -1,8 +1,8 @@
 /**
  * AmpPax — Audio Node Pax
  *
- * Amplifier from 0 dB (unity) to +24 dB.
- * Use to boost signals, drive levels up or compensate for weak sources.
+ * Gain control from -60 dB to +24 dB, with 0 dB at unity.
+ * Use to attenuate signals or compensate for weak sources.
  *
  * Build:
  *   macOS:  clang++ -std=c++20 -shared -fPIC AmpPax.cpp -o AmpPax.dylib
@@ -16,7 +16,7 @@
 
 struct AmpPax
 {
-    float gainDb = 0.0f;   // 0 to +24 dB, default 0 dB (unity)
+    float gainDb = 0.0f;   // -60 to +24 dB, default 0 dB (unity)
 
     float linearGain() const
     {
@@ -30,7 +30,7 @@ int PAX_getMaxAudioChannels() { return PAX_MAX_AUDIO_CHANNELS; }
 
 const PAX_Descriptor* PAX_getDescriptor()
 {
-    static PAX_Descriptor d { "Amp", "Patchy Examples", "1.0.0", 2, PAX_API_VERSION };
+    static PAX_Descriptor d { "Amp", "Patchy Examples", "1.1.0", 2, PAX_API_VERSION };
     return &d;
 }
 
@@ -53,7 +53,7 @@ int  PAX_getParameterCount (PAX_Instance*) { return 1; }
 void PAX_getParameterInfo (PAX_Instance*, int index, PAX_ParameterInfo* info)
 {
     if (index == 0) {
-        info->name = "Amp (dB)"; info->minValue = 0.0f;
+        info->name = "Amp (dB)"; info->minValue = -60.0f;
         info->maxValue = 24.0f; info->defaultValue = 0.0f; info->step = 0.1f;
     }
 }
@@ -66,7 +66,7 @@ float PAX_getParameter (PAX_Instance* i, int index)
 void PAX_setParameter (PAX_Instance* i, int index, float value)
 {
     if (index == 0)
-        static_cast<AmpPax*> (i)->gainDb = std::clamp (value, 0.0f, 24.0f);
+        static_cast<AmpPax*> (i)->gainDb = std::clamp (value, -60.0f, 24.0f);
 }
 
 // Disable/Enable feature, 2026-09-11 — same-type audio gain stage, same
