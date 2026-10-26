@@ -1,0 +1,1767 @@
+#pragma once
+#include <set>
+#include <map>
+#include <juce_audio_processors/juce_audio_processors.h>
+#include <chrono>
+#include "GraphModel.h"
+#include "PatchyLog.h"
+#include "ProcessingGraph.h"
+#include "MidiDeviceNodes.h"
+#include "MidiMonitorNode.h"
+#include "DmxConsoleNode.h"
+#include "MidiChMatrixNode.h"
+#include "MidiMorpherNode.h"
+#include "ArtNetConsoleNode.h"
+#include "AudioMonitorNode.h"
+#include "WelchSpectrum.h"
+#include "AudioPlayerNode.h"
+#include "MidiKeyboardNode.h"
+#include <unordered_map>
+#include "AudioDeviceNodes.h"
+#include "UdpDeviceNodes.h"
+#include "OscDeviceNodes.h"
+#include "ArtNetDeviceNodes.h"
+#include "DmxDeviceNodes.h"
+#include "WebBridge.h"
+#include "../Pax/PaxRegistry.h"
+#include "../Pax/PaxScanner.h"
+
+/**
+ * PatchyProcessor
+ *
+ * Owns the GraphModel (UI data) and ProcessingGraph (audio thread).
+ * When the graph changes the UI calls rebuildProcessingGraph() which
+ * snapshots the model and atomically swaps in a new ProcessingGraph.
+ *
+ * Thread safety:
+ *   GraphModel   — message thread only
+ *   ProcessingGraph — rebuilt on message thread, processed on audio thread.
+ *                     A simple flag + swap ensures no concurrent access.
+ */
+// v0.0.919 — PatchyLog::Scope FIRST: the file log is installed before any
+// member is constructed (and can log) and removed after all are destroyed.
+class PatchyProcessor : private PatchyLog::Scope,
+                        public  juce::AudioProcessor
+{
+public:
+    PatchyProcessor();
+    ~PatchyProcessor() override;   // v0.0.919 — stops the host-idle driver first
+
+    //─── AudioProcessor ────────────────────────────────────────────────────
+    void prepareToPlay  (double sampleRate, int samplesPerBlock) override;
+    void releaseResources() override;   // v0.0.919 — out of line, logs (lifecycle visibility)
+    void reset() override;              // v0.0.919 — logs only (lifecycle visibility)
+    void processBlock   (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+    void processBlockBypassed (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;   // v0.0.919
+
+    /** v0.0.919 — true while the host has stopped calling processBlock() and
+     *  the HostIdleDriver runs the graph instead (see PatchyProcessor.cpp). */
+    bool isRunningIndependently() const { return runningIndependently.load(); }
+
+    /** v0.0.919 — when may the HostIdleDriver run? While Patchy's window is
+     *  open, or always if keepRunningWhenHostPaused is on (per project,
+     *  saved in the plugin state). Agreed 2026-10-01: Logic keeps a CLOSED
+     *  project's Patchy alive until quit/reopen (only its window closes), so
+     *  "always" would keep a closed project sending DMX/network — hence
+     *  window-open by default, "always" as an explicit opt-in. */
+    void setEditorOpen (bool open)                 { editorOpen.store (open); }
+    void setKeepRunningWhenHostPaused (bool on)    { keepRunningWhenHostPaused.store (on); }
+    bool getKeepRunningWhenHostPaused() const      { return keepRunningWhenHostPaused.load(); }
+
+    /** v0.0.920 — the plugin window's last size, saved with the project so
+     *  Patchy reopens at the size the user left it (0 = never resized). */
+    void setEditorSize (int w, int h) { editorWidth.store (w); editorHeight.store (h); }
+    int  getEditorWidth()  const      { return editorWidth.load(); }
+    int  getEditorHeight() const      { return editorHeight.load(); }
+
+    juce::AudioProcessorEditor* createEditor() override;
+    bool                        hasEditor()    const override { return true; }
+
+    const juce::String getName()               const override { return "Node Graph"; }
+    bool   acceptsMidi()                       const override { return true; }
+    bool   producesMidi()                      const override { return true; }
+    bool   isMidiEffect()                      const override { return false; }
+    // 0 s. A 24 h tail was tried on 2026-10-01 to stop Logic Pro pausing
+    // Patchy when idle and made no difference — the HostIdleDriver
+    // (PatchyProcessor.cpp) handles that case instead.
+    double getTailLengthSeconds()              const override { return 0.0; }
+
+    int    getNumPrograms()                    override { return 1; }
+    int    getCurrentProgram()                 override { return 0; }
+    void   setCurrentProgram (int)             override {}
+    const juce::String getProgramName (int)    override { return "Default"; }
+    void   changeProgramName (int, const juce::String&) override {}
+
+    void getStateInformation  (juce::MemoryBlock&)        override;
+    void setStateInformation  (const void*, int)           override;
+
+    bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
+
+    //─── Graph API (called from editor / WebBridge on message thread) ──────
+    GraphModel&      getGraphModel()      { return graphModel; }
+
+    /** Call after any structural change to the graph model. */
+    void rebuildProcessingGraph();
+    bool isStandalone = false;
+    bool simulationConfigured = false;
+
+    // Called with the standalone simulation worker stopped.
+    void configureSimulation (double rate, int frames)
+    {
+        processingGraph.closeAllAudioDevices();
+        if (pendingGraph) pendingGraph->closeAllAudioDevices();
+        audioDeviceManager.closeAllHardware();
+        simulationConfigured = true;
+        audioDeviceManager.setTargetAudioConfig (rate, frames);
+        setPlayConfigDetails (1, 1, rate, frames);
+        prepareToPlay (rate, frames);
+    }
+
+    /** Prune ProcessingGraph edges for ports removed from a node. Call after GraphModel update. */
+    void pruneProcessingGraphEdges (const juce::String& nodeId)
+    {
+        const juce::ScopedLock lock (getCallbackLock());
+        std::vector<juce::String> validPorts;
+        for (auto& n : graphModel.getNodes())
+            if (n.id == nodeId)
+                for (auto& p : n.ports) validPorts.push_back (p.id);
+        // The routing cache must not change while the DSP is traversing it.
+        processingGraph.pruneEdgesForNode (nodeId, validPorts);
+    }
+
+    // Returns the current audio output count for a dynamic Pax node (e.g. Spectrumyser)
+    // Also resizes the live node's output buffers to avoid a full graph rebuild
+    int getPaxAudioOutCount (const juce::String& nodeId)
+    {
+        const juce::ScopedLock lock (getCallbackLock());
+        auto& graph = pendingGraph && pendingGraph->findNode (nodeId) ? *pendingGraph : processingGraph;
+        for (auto& node : graph.getNodes())
+        {
+            if (node->id != nodeId) continue;
+            if (auto* dyn = dynamic_cast<DynamicPaxProcessor*> (node.get()))
+            {
+                if (dyn->audioOutputCount > 0)
+                {
+                    int newCount  = dyn->audioOutputCount;
+                    int prevCount = (int) dyn->outputAudioBuffers.size();
+
+                    if (newCount != prevCount)
+                    {
+                        // DSP is excluded while the per-port vectors change.
+                        dyn->allocatePortBuffers (dyn->audioInputCount, newCount, lastBlockSize);
+                    }
+                    return newCount;
+                }
+            }
+        }
+        return 0;
+    }  // true only in standalone app, false in DAW/plugin mode
+
+    /** Access the registry (for UI sidebar population). */
+    PaxRegistry& getRegistry()       { return registry; }
+
+    /** Open a MIDI device for the given node (called from WebBridge via PatchyEditor). */
+    void setMidiDevice (const juce::String& nodeId, const juce::String& deviceId)
+    {
+        // Always store in the manager so applyDeviceSelections() can replay it
+        // after the next graph rebuild.
+        midiDeviceManager.storeSelection (nodeId, deviceId);
+
+        // Try the current audio graph first
+        bool found = midiDeviceManager.applyToGraph (nodeId, deviceId, processingGraph);
+
+        // If not found (node is in the pending graph, not yet swapped in),
+        // try the pending graph directly.
+        if (! found && pendingGraph != nullptr)
+            midiDeviceManager.applyToGraph (nodeId, deviceId, *pendingGraph);
+
+        // Persist in the model for save/restore
+        if (auto* node = graphModel.findNode (nodeId))
+            node->selectedDeviceId = deviceId;
+    }
+
+    void setAudioDevice (const juce::String& nodeId, const juce::String& deviceName)
+    {
+        audioDeviceManager.storeSelection (nodeId, deviceName);
+        if (auto* node = graphModel.findNode (nodeId)) node->selectedDeviceId = deviceName;
+        rebuildProcessingGraph();
+        if (auto* node = graphModel.findNode (nodeId))
+        {
+            node->selectedDeviceId = deviceName;
+            // Store the real channel count in settingsJson so React always has it
+            int chCount = 0;
+            auto& updated = pendingGraph ? *pendingGraph : processingGraph;
+            for (auto& n : updated.getNodes())
+            {
+                if (n->id != nodeId) continue;
+                if (auto* out = dynamic_cast<AudioOutDeviceNode*> (n.get()))
+                    chCount = out->getDeviceChannelCount();
+                else if (auto* in = dynamic_cast<AudioInDeviceNode*> (n.get()))
+                    chCount = in->getDeviceChannelCount();
+                break;
+            }
+            if (chCount > 0)
+            {
+                juce::var existing;
+                try { existing = juce::JSON::parse (node->settingsJson); } catch (...) {}
+                if (existing.getDynamicObject() == nullptr)
+                    existing = new juce::DynamicObject();
+                existing.getDynamicObject()->setProperty ("deviceChannelCount", chCount);
+                node->settingsJson = juce::JSON::toString (existing, true);
+            }
+        }
+    }
+
+    /** Apply a channel selection to a live audio node and persist it. */
+    void setAudioDeviceChannels (const juce::String& nodeId,
+                                  const std::vector<int>& channels)
+    {
+        audioDeviceManager.storeChannelSelection (nodeId, channels);
+        rebuildProcessingGraph();
+    }
+
+    AudioDeviceManager& getAudioDeviceManager() { return audioDeviceManager; }
+
+    /** Apply UDP settings (port, mode, target/multicast) to a live node and persist them. */
+    void setUdpSettings (const juce::String& nodeId,
+                         int port, int mode,
+                         const juce::String& targetHost,
+                         const juce::String& multicastAddr)
+    {
+        UdpDeviceManager::Settings s;
+        s.port          = port;
+        s.mode          = static_cast<UdpMode> (mode);
+        s.targetHost    = targetHost;
+        s.multicastAddr = multicastAddr;
+
+        udpDeviceManager.storeSettings (nodeId, s);
+        udpDeviceManager.applyToGraph (nodeId, processingGraph);
+        if (pendingGraph != nullptr)
+            udpDeviceManager.applyToGraph (nodeId, *pendingGraph);
+
+        // Persist in settingsJson for save/restore
+        if (auto* node = graphModel.findNode (nodeId))
+        {
+            juce::var existing;
+            try { existing = juce::JSON::parse (node->settingsJson); } catch (...) {}
+            if (existing.getDynamicObject() == nullptr)
+                existing = new juce::DynamicObject();
+            auto* obj = existing.getDynamicObject();
+            obj->setProperty ("udpPort",          port);
+            obj->setProperty ("udpMode",           mode);
+            obj->setProperty ("udpTargetHost",     targetHost);
+            obj->setProperty ("udpMulticastAddr",  multicastAddr);
+            node->settingsJson = juce::JSON::toString (existing, true);
+        }
+    }
+
+    /** Apply MQTT Subscribe settings and persist them. */
+    void setMqttSubscribeSettings (const juce::String& nodeId,
+                                   const juce::String& host, int port,
+                                   const juce::String& topic, int qos,
+                                   const juce::String& username, const juce::String& password)
+    {
+        MqttDeviceManager::Settings s;
+        s.host     = host;
+        s.port     = port;
+        s.topic    = topic;
+        s.qos      = qos;
+        s.username = username;
+        s.password = password;
+
+        mqttDeviceManager.storeSettings (nodeId, s);
+        mqttDeviceManager.applyToGraph (nodeId, processingGraph);
+        if (pendingGraph != nullptr)
+            mqttDeviceManager.applyToGraph (nodeId, *pendingGraph);
+
+        // Persist in settingsJson for save/restore. Password is included —
+        // same as usernames/hosts already stored in plain settingsJson
+        // elsewhere in this file; no credential encryption exists yet
+        // anywhere in Patchy's settings storage.
+        if (auto* node = graphModel.findNode (nodeId))
+        {
+            juce::var existing;
+            try { existing = juce::JSON::parse (node->settingsJson); } catch (...) {}
+            if (existing.getDynamicObject() == nullptr)
+                existing = new juce::DynamicObject();
+            auto* obj = existing.getDynamicObject();
+            obj->setProperty ("mqttHost",     host);
+            obj->setProperty ("mqttPort",     port);
+            obj->setProperty ("mqttTopic",    topic);
+            obj->setProperty ("mqttQos",      qos);
+            obj->setProperty ("mqttUsername", username);
+            obj->setProperty ("mqttPassword", password);
+            node->settingsJson = juce::JSON::toString (existing, true);
+        }
+    }
+
+    /** Apply MQTT Publish settings and persist them. */
+    void setMqttPublishSettings (const juce::String& nodeId,
+                                 const juce::String& host, int port,
+                                 const juce::String& topic, int qos, bool retain,
+                                 const juce::String& username, const juce::String& password)
+    {
+        MqttDeviceManager::Settings s;
+        s.host     = host;
+        s.port     = port;
+        s.topic    = topic;
+        s.qos      = qos;
+        s.retain   = retain;
+        s.username = username;
+        s.password = password;
+
+        mqttDeviceManager.storeSettings (nodeId, s);
+        mqttDeviceManager.applyToGraph (nodeId, processingGraph);
+        if (pendingGraph != nullptr)
+            mqttDeviceManager.applyToGraph (nodeId, *pendingGraph);
+
+        if (auto* node = graphModel.findNode (nodeId))
+        {
+            juce::var existing;
+            try { existing = juce::JSON::parse (node->settingsJson); } catch (...) {}
+            if (existing.getDynamicObject() == nullptr)
+                existing = new juce::DynamicObject();
+            auto* obj = existing.getDynamicObject();
+            obj->setProperty ("mqttHost",     host);
+            obj->setProperty ("mqttPort",     port);
+            obj->setProperty ("mqttTopic",    topic);
+            obj->setProperty ("mqttQos",      qos);
+            obj->setProperty ("mqttRetain",   retain);
+            obj->setProperty ("mqttUsername", username);
+            obj->setProperty ("mqttPassword", password);
+            node->settingsJson = juce::JSON::toString (existing, true);
+        }
+    }
+
+    /** Triggers an MqttConsoleNode's Send action — a discrete one-shot event,
+     *  not a persisted setting, so this doesn't touch settingsJson at all
+     *  (unlike setMqttXSettings above). Topic history is tracked entirely on
+     *  the frontend, persisted via the node's ordinary settingsJson round-trip
+     *  same as any other UI-only state.
+     *
+     *  Deliberately only targets the CURRENTLY ACTIVE processingGraph, unlike
+     *  the settings-apply methods above which also apply to a pendingGraph if
+     *  one exists. pendingGraph doesn't get process() calls until it's
+     *  swapped in later — setting the pending-send flag there would fire an
+     *  unexpected, stale send whenever that swap eventually happens, with no
+     *  relation to this actual click. A persisted setting should apply
+     *  consistently to whichever graph ends up active; a one-shot trigger
+     *  should only ever affect what's live right now. */
+    void mqttConsoleSend (const juce::String& nodeId, const juce::String& topic, float payload)
+    {
+        if (auto* node = processingGraph.findMqttConsoleNode (nodeId))
+            node->sendNow (topic, payload);
+    }
+
+    /** Apply OSC settings (port, targetHost, oscAddress) to a live node and persist them. */
+    void setOscSettings (const juce::String& nodeId,
+                         int port,
+                         const juce::String& targetHost,
+                         const juce::String& oscAddress)
+    {
+        OscDeviceManager::Settings s;
+        s.port       = port;
+        s.targetHost = targetHost;
+        s.oscAddress = oscAddress.isNotEmpty() ? oscAddress : "/patchy";
+
+        oscDeviceManager.storeSettings (nodeId, s);
+        oscDeviceManager.applyToGraph (nodeId, processingGraph);
+        if (pendingGraph != nullptr)
+            oscDeviceManager.applyToGraph (nodeId, *pendingGraph);
+
+        // Persist in settingsJson for save/restore
+        if (auto* node = graphModel.findNode (nodeId))
+        {
+            juce::var existing;
+            try { existing = juce::JSON::parse (node->settingsJson); } catch (...) {}
+            if (existing.getDynamicObject() == nullptr)
+                existing = new juce::DynamicObject();
+            auto* obj = existing.getDynamicObject();
+            obj->setProperty ("oscPort",       port);
+            obj->setProperty ("oscTargetHost", targetHost);
+            obj->setProperty ("oscAddress",    oscAddress.isNotEmpty() ? oscAddress : "/patchy");
+            node->settingsJson = juce::JSON::toString (existing, true);
+        }
+    }
+
+    void setArtNetSettings (const juce::String& nodeId,
+                            int universe,
+                            const juce::String& targetHost)
+    {
+        ArtNetDeviceManager::Settings s;
+        s.universe   = universe;
+        s.targetHost = targetHost;
+
+        artNetDeviceManager.storeSettings (nodeId, s);
+        artNetDeviceManager.applyToGraph (nodeId, processingGraph);
+        if (pendingGraph != nullptr)
+            artNetDeviceManager.applyToGraph (nodeId, *pendingGraph);
+
+        // Persist in settingsJson for save/restore
+        if (auto* node = graphModel.findNode (nodeId))
+        {
+            juce::var existing;
+            try { existing = juce::JSON::parse (node->settingsJson); } catch (...) {}
+            if (existing.getDynamicObject() == nullptr)
+                existing = new juce::DynamicObject();
+            auto* obj = existing.getDynamicObject();
+            obj->setProperty ("artNetUniverse",   universe);
+            obj->setProperty ("artNetTargetHost",  targetHost);
+            node->settingsJson = juce::JSON::toString (existing, true);
+        }
+    }
+
+    void setDmxSettings (const juce::String& nodeId,
+                         const juce::String& devicePath,
+                         int universe = 0)
+    {
+        DmxDeviceManager::Settings s;
+        s.devicePath = devicePath;
+        s.universe   = universe;
+
+        dmxDeviceManager.storeSettings (nodeId, s);
+        dmxDeviceManager.applyToGraph (nodeId, processingGraph);
+        if (pendingGraph != nullptr)
+            dmxDeviceManager.applyToGraph (nodeId, *pendingGraph);
+
+        // Persist in settingsJson for save/restore
+        if (auto* node = graphModel.findNode (nodeId))
+        {
+            juce::var existing;
+            try { existing = juce::JSON::parse (node->settingsJson); } catch (...) {}
+            if (existing.getDynamicObject() == nullptr)
+                existing = new juce::DynamicObject();
+            auto* obj = existing.getDynamicObject();
+            obj->setProperty ("dmxDevicePath", devicePath);
+            obj->setProperty ("dmxUniverse",   universe);
+            node->settingsJson = juce::JSON::toString (existing, true);
+        }
+    }
+
+    /** Save all 512 DMX Console channel values into the node's settingsJson.
+     *  Called on every fader change so settingsJson is always current for undo. */
+    void saveDmxConsoleChannels (const juce::String& nodeId)
+    {
+        // Find the node in processingGraph or pendingGraph
+        auto* console = processingGraph.findDmxConsoleNode (nodeId);
+        if (console == nullptr && pendingGraph != nullptr)
+            console = pendingGraph->findDmxConsoleNode (nodeId);
+        if (console == nullptr) return;
+
+        auto channels = console->getAllChannels();
+
+        // Merge dmxChannels (base64) into existing settingsJson
+        if (auto* node = graphModel.findNode (nodeId))
+        {
+            juce::var existing;
+            try { existing = juce::JSON::parse (node->settingsJson); } catch (...) {}
+            if (existing.getDynamicObject() == nullptr)
+                existing = new juce::DynamicObject();
+            auto* obj = existing.getDynamicObject();
+
+            // Standard base64 encode 512 bytes
+            static const char* kB64 =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            juce::String b64;
+            b64.preallocateBytes (688);
+            for (int i = 0; i < 512; i += 3)
+            {
+                uint32_t n  = (uint32_t) channels[static_cast<size_t>(i)] << 16;
+                if (i + 1 < 512) n |= (uint32_t) channels[static_cast<size_t>(i + 1)] << 8;
+                if (i + 2 < 512) n |= (uint32_t) channels[static_cast<size_t>(i + 2)];
+                b64 += kB64[(n >> 18) & 0x3F];
+                b64 += kB64[(n >> 12) & 0x3F];
+                b64 += (i + 1 < 512) ? kB64[(n >> 6) & 0x3F] : '=';
+                b64 += (i + 2 < 512) ? kB64[(n >> 0) & 0x3F] : '=';
+            }
+            obj->setProperty ("dmxChannels", b64);
+            node->settingsJson = juce::JSON::toString (existing, true);
+        }
+    }
+
+    /** Restore DMX Console channel values from a settingsJson string.
+     *  Called from pushSettingsToUI on undo/redo so C++ audio state stays in sync. */
+    void restoreDmxConsoleChannels (const juce::String& nodeId, const juce::String& settingsJson)
+    {
+        restoreDmxConsoleChannels (nodeId, settingsJson, nullptr);
+    }
+
+    void restoreDmxConsoleChannels (const juce::String& nodeId, const juce::String& settingsJson,
+                                    ProcessingGraph* graph)
+    {
+        DmxConsoleNode* console = nullptr;
+        if (graph != nullptr)
+            console = graph->findDmxConsoleNode (nodeId);
+        if (console == nullptr)
+            console = processingGraph.findDmxConsoleNode (nodeId);
+        if (console == nullptr && pendingGraph != nullptr)
+            console = pendingGraph->findDmxConsoleNode (nodeId);
+        if (console == nullptr) return;
+
+        try
+        {
+            auto parsed = juce::JSON::parse (settingsJson);
+            juce::String b64 = parsed["dmxChannels"].toString();
+            // Fix, v0.0.917 (2026-09-29) — a MISSING key means "default", not
+            // "leave as is": undo/redo back to a state saved before the
+            // faders or Blackout were ever touched has no dmxChannels /
+            // blackout keys, and returning early here left the console (and
+            // everything downstream) at the undone values. Empty b64 now
+            // decodes to all zeros below; missing blackout = off.
+
+            static const int8_t kDec[256] = {
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+                52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+                -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+                15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+                -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+                41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+            };
+            std::array<uint8_t, 512> channels {};
+            int out = 0;
+            for (int i = 0; i + 3 < b64.length() && out < 512; i += 4)
+            {
+                int a = kDec[(uint8_t)b64[i]],  b2 = kDec[(uint8_t)b64[i+1]];
+                int c = kDec[(uint8_t)b64[i+2]], d = kDec[(uint8_t)b64[i+3]];
+                if (a < 0 || b2 < 0) break;
+                if (out < 512) channels[static_cast<size_t>(out++)] = (uint8_t)((a << 2) | (b2 >> 4));
+                if (c >= 0 && out < 512) channels[static_cast<size_t>(out++)] = (uint8_t)((b2 << 4) | (c >> 2));
+                if (d >= 0 && out < 512) channels[static_cast<size_t>(out++)] = (uint8_t)((c << 6) | d);
+            }
+            console->restoreChannels (channels);
+            // Also restore blackout (missing = off — see above)
+            auto blackoutVar = parsed["blackout"];
+            console->restoreBlackout (! blackoutVar.isVoid() && ! blackoutVar.isUndefined() && (bool) blackoutVar);
+        }
+        catch (...) {}
+    }
+
+    /** Restores AudioPlayerNode's own small, discrete settings (mode,
+     *  sine frequency, noise type, level, loop, file path) from
+     *  settingsJson into the shared AudioPlayerState — same "survive a
+     *  rebuild" reasoning as restoreDmxConsoleChannels() above, applied
+     *  to a node whose own settings genuinely drive real-time processing
+     *  (see AudioPlayerNode.h's own comment on why this differs from
+     *  AudioMonitorNode, whose settings are display-only and never
+     *  needed any C++-side restoration at all).
+     *
+     *  If this is a fresh session (the shared state has no file loaded
+     *  yet, e.g. right after opening a saved .patchy project) but a
+     *  remembered file path exists, this also triggers a genuine reload
+     *  from disk — the file path alone isn't enough, since the actual
+     *  audio data itself doesn't survive an app restart, only within a
+     *  running session (see AudioPlayerState's own declaration comment). */
+    void restoreAudioPlayerSettings (const juce::String& nodeId, const juce::String& settingsJson,
+                                     ProcessingGraph* graph)
+    {
+        auto* state = getOrCreateAudioPlayerState (nodeId);
+        if (state == nullptr) return;
+
+        try
+        {
+            auto parsed = juce::JSON::parse (settingsJson);
+
+            juce::String modeStr = parsed["mode"].toString();
+            if (parsed.hasProperty ("mode")) state->mode.store (AudioPlayerState::modeFromString (modeStr));
+
+            if (parsed.hasProperty ("sineFrequency"))
+                state->sineFrequency.store ((float) (double) parsed["sineFrequency"], std::memory_order_relaxed);
+
+            juce::String noiseStr = parsed["noiseType"].toString();
+            if (noiseStr == "pink")
+                state->noiseType.store (AudioPlayerState::Noise::Pink, std::memory_order_relaxed);
+            else if (noiseStr == "white")
+                state->noiseType.store (AudioPlayerState::Noise::White, std::memory_order_relaxed);
+
+            if (parsed.hasProperty ("level"))
+                state->level.store ((float) (double) parsed["level"], std::memory_order_relaxed);
+
+            if (parsed.hasProperty ("loop"))
+                state->looping.store ((bool) parsed["loop"], std::memory_order_relaxed);
+
+            state->outputChannels.store (parsed.hasProperty ("outputChannels")
+                ? juce::jlimit (1, AudioSim::maxAudioChannels, (int) parsed["outputChannels"]) : 1,
+                std::memory_order_relaxed);
+
+            juce::String filePath = parsed["filePath"].toString();
+            if (filePath.isNotEmpty() && (state->fileBuffer.getNumSamples() == 0
+                || state->loadedFilePath != filePath || std::abs (state->loadedSampleRate - lastSampleRate) > 0.01))
+            {
+                const juce::ScopedLock sourceLock (getCallbackLock());
+                juce::File f (filePath);
+                if (f.existsAsFile())
+                {
+                    const bool wasPlaying = state->playing.load();
+                    const double seconds = state->loadedSampleRate > 0.0 ? state->playbackPosition.load() / state->loadedSampleRate : 0.0;
+                    if (state->loadFile (f, lastSampleRate))
+                    {
+                        state->seekRequest.store ((int64_t) (seconds * lastSampleRate));
+                        state->playing.store (wasPlaying);
+                    }
+                }
+            }
+        }
+        catch (...) {}
+
+        juce::ignoreUnused (graph);   // node itself holds no restorable state — everything lives in *state
+    }
+
+    // Message-thread settings path. Only a change to the source's actual
+    // signal width needs a new prepared graph; level/frequency stay live.
+    void applyAudioSourceSettings (const juce::String& nodeId, const juce::String& json)
+    {
+        const auto* node = graphModel.findNode (nodeId);
+        if (! node || node->nodeType != 26 || node->paxName.isNotEmpty()) return;
+        auto* state = getOrCreateAudioPlayerState (nodeId);
+        const auto width = [&] {
+            return state->mode.load() == AudioPlayerState::Mode::File
+                ? std::min (AudioSim::maxAudioChannels, state->fileBuffer.getNumChannels())
+                : state->outputChannels.load();
+        };
+        bool changed = false;
+        {
+            const juce::ScopedLock lock (getCallbackLock());
+            const int previous = width();
+            restoreAudioPlayerSettings (nodeId, json, nullptr);
+            changed = state->layoutDirty.exchange (false) || previous != width();
+        }
+        if (changed) rebuildProcessingGraph();
+    }
+
+    /** Reads MidiChMatrixNode's own current live state (grid size,
+     *  drop/pass-through mode, and every lit cell) and merges it into
+     *  the node's own settingsJson — same "survive a rebuild" reasoning
+     *  as saveDmxConsoleChannels() above, but using a sparse [r,c] pair
+     *  list rather than a base64-encoded byte array, since this node's
+     *  own state (a boolean grid, typically mostly unlit) is a genuinely
+     *  different shape of data than DMX's dense 512-channel array. */
+    void saveMidiChMatrixState (const juce::String& nodeId)
+    {
+        auto* node = processingGraph.findMidiChMatrixNode (nodeId);
+        if (node == nullptr && pendingGraph != nullptr)
+            node = pendingGraph->findMidiChMatrixNode (nodeId);
+        if (node == nullptr) return;
+
+        if (auto* nd = graphModel.findNode (nodeId))
+        {
+            juce::var existing;
+            try { existing = juce::JSON::parse (nd->settingsJson); } catch (...) {}
+            if (existing.getDynamicObject() == nullptr)
+                existing = new juce::DynamicObject();
+            auto* obj = existing.getDynamicObject();
+
+            const int  n    = node->getGridSize();
+            const bool drop = node->getDropUnmapped();
+            const auto snapshot = node->getMatrixSnapshot();
+
+            juce::Array<juce::var> cells;
+            for (int r = 0; r < MidiChMatrixNode::kMaxGrid; ++r)
+                for (int c = 0; c < MidiChMatrixNode::kMaxGrid; ++c)
+                    if (snapshot[static_cast<size_t> (r * MidiChMatrixNode::kMaxGrid + c)])
+                    {
+                        juce::Array<juce::var> pair;
+                        pair.add (r);
+                        pair.add (c);
+                        cells.add (pair);
+                    }
+
+            obj->setProperty ("gridSize",     n);
+            obj->setProperty ("dropUnmapped", drop);
+            obj->setProperty ("cells",        cells);
+            nd->settingsJson = juce::JSON::toString (existing, true);
+        }
+    }
+
+    void restoreMidiChMatrixState (const juce::String& nodeId, const juce::String& settingsJson)
+    {
+        restoreMidiChMatrixState (nodeId, settingsJson, nullptr);
+    }
+
+    void restoreMidiChMatrixState (const juce::String& nodeId, const juce::String& settingsJson,
+                                   ProcessingGraph* graph)
+    {
+        MidiChMatrixNode* node = nullptr;
+        if (graph != nullptr)
+            node = graph->findMidiChMatrixNode (nodeId);
+        if (node == nullptr)
+            node = processingGraph.findMidiChMatrixNode (nodeId);
+        if (node == nullptr && pendingGraph != nullptr)
+            node = pendingGraph->findMidiChMatrixNode (nodeId);
+        if (node == nullptr) return;
+
+        try
+        {
+            auto parsed = juce::JSON::parse (settingsJson);
+
+            const int  n    = parsed.hasProperty ("gridSize")     ? (int) parsed["gridSize"] : MidiChMatrixNode::kMinGrid;
+            const bool drop = parsed.hasProperty ("dropUnmapped") ? (bool) parsed["dropUnmapped"] : true;
+
+            std::array<bool, MidiChMatrixNode::kCellCount> cells {};
+            if (auto* arr = parsed["cells"].getArray())
+                for (const auto& pairVar : *arr)
+                    if (auto* pair = pairVar.getArray())
+                        if (pair->size() == 2)
+                        {
+                            const int r = (int) (*pair)[0];
+                            const int c = (int) (*pair)[1];
+                            if (r >= 0 && r < MidiChMatrixNode::kMaxGrid && c >= 0 && c < MidiChMatrixNode::kMaxGrid)
+                                cells[static_cast<size_t> (r * MidiChMatrixNode::kMaxGrid + c)] = true;
+                        }
+
+            node->restoreState (n, cells, drop);
+        }
+        catch (...) {}
+    }
+
+    /** v0.0.925 — MIDI Morpher: settingsJson → the running node's rule.
+     *  Live path (graph == nullptr): applied to the current graph AND to a
+     *  pending one if a rebuild is in flight, so neither misses the change.
+     *  Rebuild path: applied to the freshly built graph. Not a Morpher → no-op. */
+    void applyMidiMorpherSettings (const juce::String& nodeId, const juce::String& settingsJson,
+                                   ProcessingGraph* graph = nullptr)
+    {
+        juce::var parsed;
+        try { parsed = juce::JSON::parse (settingsJson); } catch (...) {}
+        const auto rule = MidiMorpherNode::parseRule (parsed);
+
+        if (graph != nullptr)
+        {
+            if (auto* node = graph->findMidiMorpherNode (nodeId))
+                node->setRule (rule);
+            return;
+        }
+        if (auto* node = processingGraph.findMidiMorpherNode (nodeId))
+            node->setRule (rule);
+        if (pendingGraph != nullptr)
+            if (auto* node = pendingGraph->findMidiMorpherNode (nodeId))
+                node->setRule (rule);
+    }
+
+    void saveMidiOutDeviceChannelFilter (const juce::String& nodeId)
+    {
+        auto* node = processingGraph.findMidiOutDeviceNode (nodeId);
+        if (node == nullptr && pendingGraph != nullptr)
+            node = pendingGraph->findMidiOutDeviceNode (nodeId);
+        if (node == nullptr) return;
+
+        if (auto* nd = graphModel.findNode (nodeId))
+        {
+            juce::var existing;
+            try { existing = juce::JSON::parse (nd->settingsJson); } catch (...) {}
+            if (existing.getDynamicObject() == nullptr)
+                existing = new juce::DynamicObject();
+            auto* obj = existing.getDynamicObject();
+
+            const std::uint16_t mask = node->getChannelFilter();
+            juce::Array<juce::var> channels;
+            for (int ch = 1; ch <= 16; ++ch)
+                if ((mask & static_cast<std::uint16_t> (1u << (ch - 1))) != 0)
+                    channels.add (ch);
+
+            obj->setProperty ("channels", channels);
+            nd->settingsJson = juce::JSON::toString (existing, true);
+        }
+    }
+
+    void restoreMidiOutDeviceChannelFilter (const juce::String& nodeId, const juce::String& settingsJson)
+    {
+        restoreMidiOutDeviceChannelFilter (nodeId, settingsJson, nullptr);
+    }
+
+    void restoreMidiOutDeviceChannelFilter (const juce::String& nodeId, const juce::String& settingsJson,
+                                             ProcessingGraph* graph)
+    {
+        MidiOutDeviceNode* node = nullptr;
+        if (graph != nullptr)
+            node = graph->findMidiOutDeviceNode (nodeId);
+        if (node == nullptr)
+            node = processingGraph.findMidiOutDeviceNode (nodeId);
+        if (node == nullptr && pendingGraph != nullptr)
+            node = pendingGraph->findMidiOutDeviceNode (nodeId);
+        if (node == nullptr) return;
+
+        try
+        {
+            auto parsed = juce::JSON::parse (settingsJson);
+            std::uint16_t mask = 0;
+            if (auto* arr = parsed["channels"].getArray())
+                for (const auto& chVar : *arr)
+                {
+                    const int ch = (int) chVar;
+                    if (ch >= 1 && ch <= 16)
+                        mask |= static_cast<std::uint16_t> (1u << (ch - 1));
+                }
+            node->setChannelFilter (mask);
+        }
+        catch (...) {}
+    }
+
+    /** Live, single-field settings update — writes straight to the shared
+     *  AudioPlayerState's own atomics, with no rebuild involved at all.
+     *  This is the fix for a real gap: committing a settings change
+     *  (setNodeSettings/commitSettingsChange) only ever updates what gets
+     *  SAVED to settingsJson — it was never enough on its own to reach a
+     *  currently-running AudioPlayerState, since restoreAudioPlayerSettings()
+     *  above only runs during a full graph rebuild (undo/redo, or opening
+     *  a project). Every other node type's own settings are purely
+     *  cosmetic, so this need never came up until this node. */
+    void setAudioPlayerLiveParam (const juce::String& nodeId, const juce::String& key, const juce::String& value)
+    {
+        auto* state = getOrCreateAudioPlayerState (nodeId);
+        if (state == nullptr) return;
+
+        if (key == "audioPlayerMode")
+        {
+            const auto mode = AudioPlayerState::modeFromString (value);
+            if (state->mode.exchange (mode) != mode) rebuildProcessingGraph();
+        }
+        else if (key == "audioPlayerSineFrequency")
+        {
+            state->sineFrequency.store (value.getFloatValue(), std::memory_order_relaxed);
+        }
+        else if (key == "audioPlayerNoiseType")
+        {
+            if      (value == "pink")  state->noiseType.store (AudioPlayerState::Noise::Pink,  std::memory_order_relaxed);
+            else if (value == "white") state->noiseType.store (AudioPlayerState::Noise::White, std::memory_order_relaxed);
+        }
+        else if (key == "audioPlayerLevel")
+        {
+            state->level.store (value.getFloatValue(), std::memory_order_relaxed);
+        }
+        else if (key == "audioPlayerLoop")
+        {
+            state->looping.store (value == "1" || value == "true", std::memory_order_relaxed);
+        }
+    }
+
+    void setPaxParameter (const juce::String& nodeId, int index, float value)
+    {
+        const juce::ScopedLock lock (getCallbackLock());
+        DynamicPaxProcessor* changedPorts = nullptr;
+        const auto apply = [&](ProcessingGraph& graph) {
+            if (auto* dyn = dynamic_cast<DynamicPaxProcessor*> (graph.findNode (nodeId)))
+            {
+                const int previous = dyn->audioOutputCount;
+                dyn->setParameter (index, value);
+                if (previous != dyn->audioOutputCount) changedPorts = dyn;
+                if ((int) dyn->outputAudioBuffers.size() != dyn->audioOutputCount)
+                    dyn->allocatePortBuffers (dyn->audioInputCount, dyn->audioOutputCount, lastBlockSize);
+            }
+        };
+        apply (processingGraph);
+        if (pendingGraph) apply (*pendingGraph);
+        // The port update rebuilds from persisted settings immediately. Save
+        // this DLL's live parameter set first, including its new port count.
+        if (changedPorts)
+        {
+            juce::Array<juce::var> values;
+            for (int parameter = 0; parameter < changedPorts->getParameterCount(); ++parameter)
+                values.add (changedPorts->getParameter (parameter));
+            graphModel.setNodeSettings (nodeId, juce::JSON::toString (values));
+        }
+    }
+
+    // ── ArtNet Console channel save/restore (mirrors DMX Console pattern) ────
+
+    void saveArtNetConsoleChannels (const juce::String& nodeId)
+    {
+        auto* console = processingGraph.findArtNetConsoleNode (nodeId);
+        if (console == nullptr && pendingGraph != nullptr)
+            console = pendingGraph->findArtNetConsoleNode (nodeId);
+        if (console == nullptr) return;
+
+        auto channels = console->getAllChannels();
+
+        if (auto* node = graphModel.findNode (nodeId))
+        {
+            juce::var existing;
+            try { existing = juce::JSON::parse (node->settingsJson); } catch (...) {}
+            if (existing.getDynamicObject() == nullptr)
+                existing = new juce::DynamicObject();
+            auto* obj = existing.getDynamicObject();
+
+            static const char* kB64 =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            juce::String b64;
+            b64.preallocateBytes (688);
+            for (int i = 0; i < 512; i += 3)
+            {
+                uint32_t n  = (uint32_t) channels[static_cast<size_t>(i)] << 16;
+                if (i + 1 < 512) n |= (uint32_t) channels[static_cast<size_t>(i + 1)] << 8;
+                if (i + 2 < 512) n |= (uint32_t) channels[static_cast<size_t>(i + 2)];
+                b64 += kB64[(n >> 18) & 0x3F];
+                b64 += kB64[(n >> 12) & 0x3F];
+                b64 += (i + 1 < 512) ? kB64[(n >> 6) & 0x3F] : '=';
+                b64 += (i + 2 < 512) ? kB64[(n >> 0) & 0x3F] : '=';
+            }
+            obj->setProperty ("artNetChannels", b64);
+            node->settingsJson = juce::JSON::toString (existing, true);
+        }
+    }
+
+    void restoreArtNetConsoleChannels (const juce::String& nodeId, const juce::String& settingsJson)
+    {
+        restoreArtNetConsoleChannels (nodeId, settingsJson, nullptr);
+    }
+
+    void restoreArtNetConsoleChannels (const juce::String& nodeId, const juce::String& settingsJson,
+                                       ProcessingGraph* graph)
+    {
+        ArtNetConsoleNode* console = nullptr;
+        if (graph != nullptr)
+            console = graph->findArtNetConsoleNode (nodeId);
+        if (console == nullptr)
+            console = processingGraph.findArtNetConsoleNode (nodeId);
+        if (console == nullptr && pendingGraph != nullptr)
+            console = pendingGraph->findArtNetConsoleNode (nodeId);
+        if (console == nullptr) return;
+
+        try
+        {
+            auto parsed = juce::JSON::parse (settingsJson);
+            juce::String b64 = parsed["artNetChannels"].toString();
+            if (b64.isEmpty()) return;
+
+            static const int8_t kDec[256] = {
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+                52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+                -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+                15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+                -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+                41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+            };
+            std::array<uint8_t, 512> channels {};
+            int out = 0;
+            for (int i = 0; i + 3 < b64.length() && out < 512; i += 4)
+            {
+                int a = kDec[(uint8_t)b64[i]],  b2 = kDec[(uint8_t)b64[i+1]];
+                int c = kDec[(uint8_t)b64[i+2]], d = kDec[(uint8_t)b64[i+3]];
+                if (a < 0 || b2 < 0) break;
+                if (out < 512) channels[static_cast<size_t>(out++)] = (uint8_t)((a << 2) | (b2 >> 4));
+                if (c >= 0 && out < 512) channels[static_cast<size_t>(out++)] = (uint8_t)((b2 << 4) | (c >> 2));
+                if (d >= 0 && out < 512) channels[static_cast<size_t>(out++)] = (uint8_t)((c << 6) | d);
+            }
+            console->restoreChannels (channels);
+
+            // Also restore universe and blackout
+            int uni = (int) parsed["universe"];
+            console->setUniverse (uni);
+            auto blackoutVar = parsed["blackout"];
+            if (! blackoutVar.isVoid() && ! blackoutVar.isUndefined())
+                console->restoreBlackout ((bool) blackoutVar);
+        }
+        catch (...) {}
+    }
+
+    void newGraph()
+    {
+        graphModel.suspendNotifications();
+        graphModel.clear();
+        graphModel.clearHistory();
+        graphModel.resumeNotifications();  // fires onChange → rebuildProcessingGraph
+    }
+
+    void loadGraphFromJson (const juce::String& json)
+    {
+        // setStateInformation already handles suspend/resume and triggers onChange
+        graphModel.clear();
+        juce::MemoryBlock mb (json.toRawUTF8(), static_cast<size_t>(json.getNumBytesAsUTF8()));
+        setStateInformation (mb.getData(), (int) mb.getSize());
+    }
+
+    void setNodeCustomName (const juce::String& nodeId, const juce::String& name)
+    {
+        for (auto& node : processingGraph.getNodes())
+            if (node->id == nodeId)
+            {
+                if (auto* kbd = dynamic_cast<MidiKeyboardNode*> (node.get()))
+                    { kbd->customName = name; break; }
+                if (auto* dyn = dynamic_cast<DynamicPaxProcessor*> (node.get()))
+                    { dyn->customName = name; break; }
+            }
+    }
+
+    void pushMidiKeyEvent (const juce::String& nodeId,
+                           uint8_t status, uint8_t data1, uint8_t data2)
+    {
+        for (auto& node : processingGraph.getNodes())
+        {
+            if (node->id == nodeId)
+            {
+                if (auto* kbd = dynamic_cast<MidiKeyboardNode*> (node.get()))
+                    kbd->pushUIEvent (status, data1, data2);
+                break;
+            }
+        }
+    }
+
+    /** Collect per-node port activity for the 30fps visualisation push. */
+    std::vector<SpectrumSnapshot> getSpectrumSnapshots()
+    {
+        std::vector<SpectrumSnapshot> result;
+        for (auto& node : processingGraph.getNodes())
+        {
+            auto* dyn = dynamic_cast<DynamicPaxProcessor*> (node.get());
+            if (! dyn || dyn->getPaxName() != "Spectrumyser") continue;
+
+            auto sd = dyn->getSpectrumData();
+            if (! sd.valid || sd.fftSize <= 0 || ! sd.mags) continue;
+
+            SpectrumSnapshot snap;
+            snap.nodeId     = node->id;
+            snap.sampleRate = lastSampleRate;
+            snap.magnitudes.assign (sd.mags, sd.mags + sd.fftSize);
+
+            int bands = (int) dyn->getParameter (0);
+            snap.bandCount = bands;
+            for (int b = 0; b < bands; ++b)
+            {
+                snap.bandLow.push_back  (dyn->getParameter (1 + b * 2));
+                snap.bandHigh.push_back (dyn->getParameter (1 + b * 2 + 1));
+            }
+            result.push_back (std::move (snap));
+        }
+        return result;
+    }
+
+    std::vector<PortActivity> getPortActivity()
+    {
+        std::vector<PortActivity> result;
+
+        // Collect MIDI + Audio activity from all nodes in the processing graph
+        // using the lightweight atomic counters on NodeProcessor base class.
+        for (auto& node : processingGraph.getNodes())
+        {
+            if (node == nullptr) continue;
+
+            PortActivity a;
+            a.nodeId        = node->id;
+            a.midiOutEvents = node->drainMidiActivity();
+            a.learned       = node->drainLearned();   // v0.0.929 — generic MIDI Learn
+
+            // Channel-flash feature, 2026-09-20 — per-channel activity,
+            // MidiChMatrixNode only. See MidiChMatrixNode.h's own
+            // drainInputChannelActivity()/drainOutputChannelActivity()
+            // doc comment for the full story.
+            if (auto* matrix = dynamic_cast<MidiChMatrixNode*> (node.get()))
+            {
+                a.inputChannelActivity  = matrix->drainInputChannelActivity();
+                a.outputChannelActivity = matrix->drainOutputChannelActivity();
+            }
+            else if (auto* morpher = dynamic_cast<MidiMorpherNode*> (node.get()))   // v0.0.926
+            {
+                const auto f   = morpher->drainFeedback();
+                a.isMorpher    = true;
+                a.morphMatched = f.matched;
+                a.morphPassed  = f.passed;
+                a.morphBlocked = f.blocked;
+                a.morphLast    = f.last;
+            }
+
+            // Current DMX channel level, for gradual intensity rendering —
+            // works for any node whose lightweight Value mirror is DMX-typed
+            // (built-in DmxIn/DmxConsole, or a Pax like AudioFreqToDmxPax),
+            // not just a hardcoded list of classes. Read unconditionally
+            // (not gated on outputValueCount>0) since built-in nodes only
+            // touch outputValues[0] on an actual change and leave it holding
+            // the last real value otherwise — exactly the "current level"
+            // this is meant to report, not "did it just change".
+            if (node->outputValues[0].type == PAX_TYPE_DMX)
+                a.dmxValue = node->outputValues[0].value;
+
+            // Current value of each declared generic ("Value" edge) output
+            // port — Phase 5's own live-readout-on-hover feature. Reads
+            // from DynamicPaxProcessor's own persistent
+            // lastGenericValueValues mirror (see its declaration comment
+            // in PaxRegistry.h for the full "why not outputValues[]
+            // directly" reasoning — in short, that array gets explicitly
+            // zeroed every single block before the Pax's own code runs,
+            // so it only ever reflects THIS block's own fresh write, if
+            // any, never the genuinely persisted last value this feature
+            // actually needs). lastGenericValueValues is itself indexed to
+            // match ALL declared value ports (not just generic ones), so
+            // filtered here to only the generic-typed entries — preserves
+            // the "one entry per generic port, in order" contract the
+            // frontend's own positional correlation relies on.
+            if (auto* dynVal = dynamic_cast<DynamicPaxProcessor*> (node.get()))
+            {
+                const auto& valueOutTypes = dynVal->getValueOutputTypes();
+                const auto& lastValues    = dynVal->getLastGenericValueValues();
+                for (size_t p = 0; p < valueOutTypes.size(); ++p)
+                    if (valueOutTypes[p] == PAX_VALUETYPE_GENERIC)
+                        a.genericValuePortValues.push_back (lastValues[p]);
+            }
+
+            // Live values for any read-only parameters (see PaxAPI.h's
+            // PAX_isParameterReadOnly) — checked every poll rather than
+            // resolved once, since which indices are read-only doesn't
+            // change per-instance and the check itself is a single cheap
+            // function-pointer call, not worth caching separately.
+            if (auto* dynRO = dynamic_cast<DynamicPaxProcessor*> (node.get()))
+            {
+                int paramCount = dynRO->getParameterCount();
+                static std::unordered_map<juce::String, float> lastReadOnlyValue;
+                for (int p = 0; p < paramCount; ++p)
+                {
+                    if (! dynRO->isParameterReadOnly (p)) continue;
+                    float current = dynRO->getParameter (p);
+                    juce::String key = node->id + "_" + juce::String (p);
+                    auto it = lastReadOnlyValue.find (key);
+                    // Epsilon rather than exact equality (-Wfloat-equal fix,
+                    // 2026-09-08) — current comes from a Pax's own getParameter(),
+                    // a function-pointer call into third-party plugin code with
+                    // no guarantee it always returns a bit-identical, unchanged
+                    // float when the underlying value genuinely hasn't changed.
+                    // A tiny epsilon costs nothing here (this is UI-persistence
+                    // change detection, not audio-critical) and any real,
+                    // perceptible change will always be far larger than 1e-6.
+                    if (it != lastReadOnlyValue.end() && std::abs (it->second - current) < 1e-6f)
+                        continue;   // unchanged since last poll — nothing to persist
+                    lastReadOnlyValue[key] = current;
+
+                    // FIX (2026-08-18): persist the change directly into
+                    // graphModel's own settingsJson, here, unconditionally
+                    // — not gated on any UI state. The original fix for
+                    // this (GenericNode.tsx syncing paramValues into
+                    // settingsJson whenever a live value arrived) only
+                    // ran while that specific node's settings panel
+                    // happened to be open, which real testing showed
+                    // doesn't reliably keep the persisted value current —
+                    // a rebuild (add/delete a node, undo/redo, anywhere
+                    // in the graph) can happen at any moment, almost
+                    // certainly while nobody has this node's panel open
+                    // at all, so the "only sync while watching" approach
+                    // defeated the whole point of the fix. This runs on
+                    // every 30fps poll regardless, on the message thread
+                    // — same thread WebBridge::handleSetNodeSettings
+                    // already safely mutates graphModel from, so no new
+                    // thread-safety concern here.
+                    juce::Array<juce::var> settingsArr;
+                    for (int i = 0; i < paramCount; ++i)
+                        settingsArr.add (dynRO->getParameter (i));
+                    graphModel.setNodeSettings (node->id, juce::JSON::toString (juce::var (settingsArr), true));
+                }
+
+                // Live-synced editable parameters (see PaxAPI.h's
+                // PAX_isParameterLiveSynced) — same change-detection and
+                // persist-to-settingsJson pattern as the read-only loop
+                // above, but for a genuinely different situation: this
+                // parameter stays a normal, editable slider — the point
+                // here is a backend-side change (not a user edit) moving
+                // that slider's on-screen position live, e.g.
+                // UdpValueToMidiCCPax's "MIDI CC" following an incoming
+                // 5-byte packet's own CC-number override. Deliberately a
+                // separate loop from the read-only one above rather than
+                // merged into it, even though the persist logic is
+                // identical — keeps the two situations (display-only vs
+                // still-editable-but-pushed) clearly distinct in the code,
+                // matching how differently WebBridge.h's own two fields
+                // for this (paxReadOnlyValues vs liveSyncedSettingsJson)
+                // are documented and used downstream. Sets
+                // a.liveSyncedSettingsJson (see that field's own comment
+                // for why this is deliberately opt-in and narrowly scoped
+                // rather than watching every parameter generically).
+                static std::unordered_map<juce::String, float> lastLiveSyncedValue;
+                for (int p = 0; p < paramCount; ++p)
+                {
+                    if (! dynRO->isParameterLiveSynced (p)) continue;
+                    float current = dynRO->getParameter (p);
+                    juce::String key = node->id + "_" + juce::String (p);
+                    auto it = lastLiveSyncedValue.find (key);
+                    // Epsilon rather than exact equality — same -Wfloat-equal
+                    // fix and same reasoning as the read-only loop above.
+                    if (it != lastLiveSyncedValue.end() && std::abs (it->second - current) < 1e-6f)
+                        continue;   // unchanged since last poll — nothing to push
+
+                    lastLiveSyncedValue[key] = current;
+
+                    juce::Array<juce::var> liveArr;
+                    for (int i = 0; i < paramCount; ++i)
+                        liveArr.add (dynRO->getParameter (i));
+                    juce::String liveJson = juce::JSON::toString (juce::var (liveArr), true);
+                    graphModel.setNodeSettings (node->id, liveJson);
+                    a.liveSyncedSettingsJson = liveJson;
+                }
+
+                for (int p = 0; p < paramCount; ++p)
+                    if (dynRO->isParameterReadOnly (p))
+                        a.paxReadOnlyValues.emplace_back (p, dynRO->getParameter (p));
+            }
+
+            // Byte-rate for UDP In nodes
+            if (auto* udpIn = dynamic_cast<UdpInDeviceNode*> (node.get()))
+            {
+                a.udpBytes = udpIn->drainByteActivity();
+                udpIn->retryBindIfNeeded();                    // v0.0.916 — see PortBindState.h
+                a.portInUse = udpIn->bindState.portInUseForUi();
+            }
+
+            // Byte-rate for OSC In nodes (reuses udpBytes field — same UI display)
+            if (auto* oscIn = dynamic_cast<OscInDeviceNode*> (node.get()))
+            {
+                a.udpBytes = oscIn->drainByteActivity();
+                oscIn->retryBindIfNeeded();                    // v0.0.916
+                a.portInUse = oscIn->bindState.portInUseForUi();
+            }
+
+            // Byte-rate for ArtNet In nodes (reuses udpBytes field — same UI display)
+            if (auto* artIn = dynamic_cast<ArtNetInDeviceNode*> (node.get()))
+            {
+                a.udpBytes  = artIn->drainByteActivity();
+                a.portInUse = artIn->portInUseForUi();         // v0.0.916 (receiver retries itself)
+            }
+
+            // Byte-rate for DMX In nodes (reuses udpBytes field — same UI display)
+            // v0.0.923 — keep the AudioIn dropout fade in step with the
+            // startup-fade list (the panel's tick box only updates the list).
+            if (auto* audioIn = dynamic_cast<AudioInDeviceNode*> (node.get()))
+                audioIn->refreshStartupFadeListing();
+
+            if (auto* dmxIn = dynamic_cast<DmxInDeviceNode*> (node.get()))
+            {
+                a.udpBytes   = dmxIn->drainByteActivity();
+                a.dmxIsMk2   = dmxIn->isMk2.load (std::memory_order_relaxed);
+                dmxIn->retryOpenIfNeeded();                     // v0.0.916 — see PortBindState.h
+                a.dmxStatus  = dmxIn->statusForUi();
+            }
+            if (auto* dmxOut = dynamic_cast<DmxOutDeviceNode*> (node.get()))
+            {
+                a.dmxIsMk2  = dmxOut->isMk2.load (std::memory_order_relaxed);
+                dmxOut->retryOpenIfNeeded();                    // v0.0.916
+                a.dmxStatus = dmxOut->statusForUi();
+            }
+
+            // Audio RMS from AudioMonitorBuffer (for AudioMonitorNode)
+            auto it = audioMonitorBuffers.find (node->id);
+            if (it != audioMonitorBuffers.end() && it->second != nullptr)
+            {
+                int count = std::min ((int) (lastSampleRate > 0 ? lastSampleRate * 0.02 : 960),
+                                      AudioMonitorBuffer::kRingSize);
+                std::vector<float> lv, rv;
+                it->second->snapshot (count, lv, rv);
+                float sl = 0.f, sr = 0.f;
+                for (size_t i = 0; i < lv.size(); ++i)
+                    { sl += lv[i]*lv[i]; sr += rv[i]*rv[i]; }
+                a.audioRmsL = lv.empty() ? 0.f : std::sqrt (sl / static_cast<float>(lv.size()));
+                a.audioRmsR = rv.empty() ? 0.f : std::sqrt (sr / static_cast<float>(rv.size()));
+            }
+            else
+            {
+                // For AudioIn/Out device nodes — RMS from their audio buffers
+                float sl = 0.f, sr = 0.f;
+                int   count = 0;
+
+                if (! node->outputAudioBuffers.empty())
+                {
+                    // Multi-port Pax node: report per-port RMS
+                    for (auto& portBuf : node->outputAudioBuffers)
+                    {
+                        float ps = 0.f;
+                        int   pc = portBuf.getNumSamples();
+                        if (pc > 0)
+                        {
+                            for (int i = 0; i < pc; ++i) ps += portBuf.getSample(0,i) * portBuf.getSample(0,i);
+                            a.portRms.push_back (std::sqrt (ps / (float) pc));
+                        }
+                        else a.portRms.push_back (0.f);
+                    }
+                    // Also set audioRmsL from port 0 for backwards compat
+                    if (! a.portRms.empty()) { a.audioRmsL = a.portRms[0]; a.audioRmsR = a.portRms[0]; }
+                }
+                else
+                {
+                    const auto& buf = node->outputAudio.getNumChannels() > 0
+                                      ? node->outputAudio : node->inputAudio;
+                    count = buf.getNumSamples();
+                    if (count > 0)
+                    {
+                        for (int i = 0; i < count; ++i) sl += buf.getSample(0,i) * buf.getSample(0,i);
+                        a.audioRmsL = std::sqrt (sl / (float) count);
+                        if (buf.getNumChannels() > 1)
+                        {
+                            for (int i = 0; i < count; ++i) sr += buf.getSample(1,i) * buf.getSample(1,i);
+                            a.audioRmsR = std::sqrt (sr / (float) count);
+                        }
+                        else a.audioRmsR = a.audioRmsL;
+                    }
+                }
+            }
+
+            // For keyboard nodes — drain from dedicated buffer (not monitorBuffers)
+            if (dynamic_cast<MidiKeyboardNode*> (node.get()) != nullptr)
+            {
+                auto kbIt = keyboardMonitorBuffers.find (node->id);
+                if (kbIt != keyboardMonitorBuffers.end() && kbIt->second != nullptr)
+                {
+                    auto events = kbIt->second->drain();
+                    for (auto& ev : events)
+                    {
+                        uint8_t st   = ev.statusByte;
+                        uint8_t type = st & 0xF0;
+                        if (type == 0x90 || type == 0x80)
+                            a.incomingNotes.push_back ({ st, ev.data1 });
+                    }
+                }
+            }
+
+            // FIX (2026-08-18): this gate predates the paxReadOnlyValues
+            // field entirely, and never accounted for it — a node whose
+            // only "activity" in a given poll is a read-only parameter
+            // change (no MIDI/audio/notes at all, which is exactly
+            // ValueToDMXPax/OscToValuePax's situation) was silently never
+            // added to result at all, meaning it never reached
+            // pushPortActivity()/onPortActivity(), ever — regardless of
+            // how many times the value actually changed. The backend's
+            // own detection+persistence (the loop above) was never
+            // affected by this, since it runs before this gate and reads
+            // the Pax's live state directly — which is exactly why the
+            // rebuild-restoration fix worked while this live-display
+            // channel stayed silent the whole time.
+            // Fix, v0.0.916 (2026-09-28) — a node whose port can't be bound
+            // receives nothing, so it never met the activity condition below
+            // and its "port in use" never reached the UI. Pushed while in
+            // use, plus ONE more entry (portInUse 0) when it clears, so the
+            // node's red state goes away again.
+            // Fix, v0.0.919 (2026-09-30) — received bytes on their own
+            // (UDP/OSC/ArtNet/DMX In) were never pushed: the byte rate only
+            // showed when the node ALSO emitted events (UDP In with a
+            // downstream connection); OSC In with unparsable packets, or UDP
+            // In with nothing connected, showed nothing. Now pushed whenever
+            // bytes arrived, plus ONE clearing entry (bytes 0) after ~1 s
+            // (30 pushes) without any, so the label holds between packets
+            // instead of blinking, and still clears when traffic stops.
+            bool bytesChanged = false;
+            if (a.udpBytes > 0)
+            {
+                bytesIdlePushes[node->id] = 0;
+                bytesChanged = true;
+            }
+            else if (auto idleIt = bytesIdlePushes.find (node->id); idleIt != bytesIdlePushes.end() && ++idleIt->second >= 30)
+            {
+                bytesIdlePushes.erase (idleIt);
+                bytesChanged = true;
+            }
+
+            bool portInUseChanged = false;
+            if (a.portInUse != 0 || a.dmxStatus != 0)   // v0.0.916 — DMX status rides the same push
+            {
+                portInUseReported.insert (node->id);
+                portInUseChanged = true;   // keep pushing while in use (30 Hz, like other live state)
+            }
+            else
+                portInUseChanged = portInUseReported.erase (node->id) > 0;
+
+            if (a.midiOutEvents > 0 || a.audioRmsL > 0.f || a.audioRmsR > 0.f
+                || ! a.incomingNotes.empty() || ! a.paxReadOnlyValues.empty()
+                || ! a.genericValuePortValues.empty() || portInUseChanged
+                || bytesChanged
+                // v0.0.926 fix — a Morpher in Block mode outputs nothing for
+                // blocked events, so midiOutEvents alone dropped its entry and
+                // the red "blocked" ring never reached the UI.
+                || (a.isMorpher && (a.morphMatched > 0 || a.morphPassed > 0 || a.morphBlocked > 0))
+                || a.learned != 0)   // v0.0.929 — a learned event must always reach the UI
+                result.push_back (a);
+        }
+
+        return result;
+    }
+
+    // v0.0.916 — ids of nodes last reported as "port in use" (message thread
+    // only, getPortActivity()); lets the clearing entry be sent exactly once.
+    std::set<juce::String> portInUseReported;
+    // v0.0.919 — nodes that recently reported bytes: pushes since the last
+    // byte (message thread only, getPortActivity()).
+    std::map<juce::String, int> bytesIdlePushes;
+
+    bool hostInfoLogged = false;   // v0.0.919 — see prepareToPlay()
+
+    // v0.0.919 — host-idle driver (see PatchyProcessor.cpp). The graph body
+    // is processGraphBlock(); processLock keeps host and driver exclusive.
+    struct HostIdleDriver;
+    void processGraphBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&);
+    void startHostIdleDriver (double sampleRate, int blockSize);
+    void stopHostIdleDriver();
+    std::unique_ptr<HostIdleDriver> hostIdleDriver;
+    juce::SpinLock                  processLock;
+    std::atomic<double>             lastHostCallMs { 0.0 };
+    std::atomic<bool>               runningIndependently { false };
+    std::atomic<bool>               editorOpen { false };                  // v0.0.919 — see setEditorOpen()
+    std::atomic<bool>               keepRunningWhenHostPaused { false };   // v0.0.919 — per project (plugin state)
+    std::atomic<int>                editorWidth  { 0 };                    // v0.0.920 — see setEditorSize()
+    std::atomic<int>                editorHeight { 0 };
+    juce::AudioBuffer<float>        idleBuffer;
+    juce::MidiBuffer                idleMidi;
+    double                          idleSampleRate = 44100.0;
+    int                             idleBlockSize  = 512;
+
+    /** Collects playhead position + playing status for every live
+     *  AudioPlayerNode — the frontend has no other way to track a
+     *  continuously-advancing playhead, or notice a non-looping file
+     *  having reached its own end and auto-stopped. Kept as its own,
+     *  separate method (matching AudioPlayerStatus's own dedicated
+     *  struct) rather than folded into getPortActivity() above, to avoid
+     *  any risk to that larger, already-established mechanism. */
+    std::vector<AudioPlayerStatus> getAudioPlayerStatuses()
+    {
+        std::vector<AudioPlayerStatus> result;
+        for (auto& node : processingGraph.getNodes())
+        {
+            if (auto* player = dynamic_cast<AudioPlayerNode*> (node.get()))
+            {
+                AudioPlayerStatus s;
+                s.nodeId   = player->id;
+                s.fraction = player->getPlaybackFraction();
+                s.playing  = player->isPlaying();
+                result.push_back (s);
+            }
+        }
+        return result;
+    }
+
+    /** Collects (and consumes — needsUIPush is cleared here, so each load
+     *  is reported exactly once) any AudioPlayerState whose own file load
+     *  hasn't yet been reported to the frontend — see needsUIPush's own
+     *  declaration comment for why the restore-on-rebuild path needs this
+     *  at all, unlike the manual browse path. Iterates the state map
+     *  directly rather than going through any live node instance, since
+     *  PatchyProcessor already owns it and the state is what actually
+     *  matters here. */
+    std::vector<AudioPlayerFileLoadedInfo> collectPendingAudioPlayerFileLoads()
+    {
+        std::vector<AudioPlayerFileLoadedInfo> result;
+        for (auto& [nodeId, state] : audioPlayerStates)
+        {
+            if (state->needsUIPush.exchange (false, std::memory_order_relaxed))
+            {
+                AudioPlayerFileLoadedInfo info;
+                info.nodeId           = nodeId;
+                info.fileName         = state->fileName;
+                info.numSamples       = state->fileBuffer.getNumSamples();
+                info.sourceSampleRate = state->fileSampleRate;
+                info.sourceChannels = state->fileBuffer.getNumChannels();
+                info.peaks            = state->waveformPeaks;
+                result.push_back (std::move (info));
+            }
+        }
+        return result;
+    }
+
+    /** Clear the old graph trash bin — call periodically on the message thread. */
+    void clearGraphTrash()
+    {
+        if (graphTrashPending.load())
+        {
+            graphTrashPending.store (false);
+            graphTrash.reset();
+        }
+    }
+
+    // Reopening the WebView must replay even a stopped/disabled capture.
+    void resetWelchSnapshots() { welchAnalysers.clear(); }
+
+    // Called at 10 Hz. Raw capture and FFT stay native; only the finished PSD
+    // crosses the bridge. Keep FFT plans/scratch storage across refreshes.
+    std::vector<WelchSnapshot> getWelchSnapshots()
+    {
+        std::vector<WelchSnapshot> result;
+        for (const auto& node : graphModel.getNodes())
+        {
+            if (node.nodeType != 29 || node.paxName.isNotEmpty()) continue;
+            const auto found = audioMonitorBuffers.find (node.id);
+            if (found == audioMonitorBuffers.end() || ! found->second) continue;
+            const auto settings = juce::JSON::parse (node.settingsJson);
+            WelchSnapshot snap;
+            snap.nodeId = node.id;
+            snap.fftSize = AudioSim::WelchSpectrum::sanitiseFftSize ((int) settings["fftSize"]);
+            snap.window = AudioSim::WelchSpectrum::sanitiseWindow (settings["window"].toString());
+            snap.channel = juce::jlimit (0, AudioSim::maxAudioChannels - 1, (int) settings["channel"]);
+            const int savedAverages = (int) settings["averages"];
+            const int requestedAverages = savedAverages == 2 || savedAverages == 4 || savedAverages == 8 || savedAverages == 16 ? savedAverages : 8;
+            snap.requestedAverages = requestedAverages;
+            auto& cache = welchAnalysers[node.id];
+            uint64_t version = 0;
+            const int count = snap.fftSize + (requestedAverages - 1) * (snap.fftSize / 2);
+            if (! found->second->snapshotChannel (snap.channel, count, cache.samples, snap.inputChannels, snap.sampleRate, version)) continue;
+            if (snap.sampleRate <= 0) snap.sampleRate = lastSampleRate > 0 ? lastSampleRate : 48000.0;
+            if (cache.version == version && cache.fftSize == snap.fftSize && cache.window == snap.window
+                && cache.channel == snap.channel && cache.averages == requestedAverages) continue;
+            cache.analyser.configure (snap.fftSize, snap.window);
+            snap.averages = cache.analyser.calculate (cache.samples, snap.sampleRate, requestedAverages, snap.decibels);
+            cache.version = version; cache.fftSize = snap.fftSize; cache.window = snap.window;
+            cache.channel = snap.channel; cache.averages = requestedAverages;
+            result.push_back (std::move (snap));
+        }
+        for (auto it = welchAnalysers.begin(); it != welchAnalysers.end();)
+        {
+            const auto* node = graphModel.findNode (it->first);
+            if (! node || node->nodeType != 29 || node->paxName.isNotEmpty()) it = welchAnalysers.erase (it);
+            else ++it;
+        }
+        return result;
+    }
+
+    /** Called by WebBridge 30fps timer — snapshot all audio monitor buffers. */
+    std::vector<AudioSnapshot> getAudioSnapshots()
+    {
+        if (audioSnapshotBusy) return {};
+        audioSnapshotBusy = true;
+        struct Guard { bool& b; ~Guard() { b = false; } } g { audioSnapshotBusy };
+
+        std::vector<AudioSnapshot> result;
+        // Snapshot buffer keys first to avoid iterator invalidation
+        std::vector<std::pair<juce::String, AudioMonitorBuffer*>> entries;
+        for (auto& [k, v] : audioMonitorBuffers)
+            if (v) entries.push_back ({ k, v.get() });
+
+        for (auto& [nodeId, buf] : entries)
+        {
+            const auto* modelNode = graphModel.findNode (nodeId);
+            if (! modelNode || modelNode->nodeType != 6 || modelNode->paxName.isNotEmpty()) continue;
+            AudioSnapshot snap;
+            snap.nodeId     = nodeId;
+            snap.sampleRate = lastSampleRate > 0.0 ? lastSampleRate : 48000.0;
+            double windowMs = 50.0;
+            int triggerMode = 0, triggerChannel = 0;
+            float triggerLevel = 0.f;
+            if (auto* node = graphModel.findNode (nodeId))
+            {
+                const auto settings = juce::JSON::parse (node->settingsJson);
+                if (settings.hasProperty ("timeWindowMs"))
+                    windowMs = juce::jlimit (10.0, 200.0, (double) settings["timeWindowMs"]);
+                const auto mode = settings["triggerMode"].toString();
+                triggerMode = mode == "rising" ? 1 : mode == "falling" ? 2 : 0;
+                triggerLevel = (float) (double) settings["triggerLevel"];
+                if (const auto* selected = settings["selectedChannels"].getArray())
+                    if (! selected->isEmpty()) triggerChannel = (int) selected->getFirst();
+            }
+            const int count = juce::jlimit (1, AudioMonitorBuffer::kRingSize, (int) (snap.sampleRate * windowMs / 1000.0));
+            snap.envelope = count > 512;
+            buf->snapshotChannels (count, 512, snap.channels, true, triggerMode, triggerLevel, triggerChannel);
+            snap.windowMs = 1000.0 * count / snap.sampleRate;
+            result.push_back (std::move (snap));
+        }
+        return result;
+    }
+
+    /**
+     * Shared drain-all-buffers-into-batches pattern, used by the four
+     * drainAllXxxMonitorEvents() functions below. Each protocol's map
+     * differs only in its buffer type — the drain logic itself was
+     * identical, copy-pasted four times before this consolidation
+     * (2026-08-12). BatchType is explicit at the call site (can't be
+     * deduced from the map alone); MapType is deduced from whichever
+     * map is passed in.
+     */
+    template <typename BatchType, typename MapType>
+    static std::vector<BatchType> drainMonitorMap (MapType& buffers)
+    {
+        std::vector<BatchType> result;
+        for (auto& [nodeId, buf] : buffers)
+        {
+            auto events = buf->drain();
+            if (! events.empty())
+                result.push_back ({ nodeId, std::move (events) });
+        }
+        return result;
+    }
+
+    /** Called by WebBridge 30fps timer — drains all monitor buffers. */
+    std::vector<MidiMonitorBatch> drainAllMidiMonitorEvents()
+    {
+        return drainMonitorMap<MidiMonitorBatch> (monitorBuffers);
+    }
+
+    /** Called by WebBridge 30fps timer — drains all OSC monitor buffers. */
+    std::vector<OscMonitorBatch> drainAllOscMonitorEvents()
+    {
+        return drainMonitorMap<OscMonitorBatch> (oscMonitorBuffers);
+    }
+
+    /** Called by WebBridge 30fps timer — drains all UDP monitor buffers. */
+    std::vector<UdpMonitorBatch> drainAllUdpMonitorEvents()
+    {
+        return drainMonitorMap<UdpMonitorBatch> (udpMonitorBuffers);
+    }
+
+    /** Called by WebBridge 30fps timer — drains all MQTT monitor buffers. */
+    std::vector<MqttMonitorBatch> drainAllMqttMonitorEvents()
+    {
+        return drainMonitorMap<MqttMonitorBatch> (mqttMonitorBuffers);
+    }
+
+    /** Called by WebBridge 30fps timer — drains DMX monitor + console snapshots. */
+    std::vector<ArtNetSnapshot> drainAllArtNetSnapshots()
+    {
+        std::vector<ArtNetSnapshot> result;
+        for (auto& [nodeId, buf] : artNetMonitorBuffers)
+        {
+            ArtNetSnapshot snap;
+            snap.nodeId = nodeId;
+            if (buf->drain (snap.channels, snap.universe))
+            {
+                snap.hasData = true;
+                result.push_back (std::move (snap));
+            }
+        }
+        for (auto& [nodeId, buf] : artNetConsoleBuffers)
+        {
+            ArtNetSnapshot snap;
+            snap.nodeId = nodeId;
+            if (buf->drain (snap.channels, snap.universe))
+            {
+                snap.hasData = true;
+                result.push_back (std::move (snap));
+            }
+        }
+        return result;
+    }
+
+    std::vector<DmxSnapshot> drainAllDmxSnapshots()
+    {
+        std::vector<DmxSnapshot> result;
+        for (auto& [nodeId, buf] : dmxMonitorBuffers)
+        {
+            DmxSnapshot snap;
+            snap.nodeId = nodeId;
+            if (buf->drain (snap.channels))
+            {
+                snap.hasData = true;
+                result.push_back (std::move (snap));
+            }
+        }
+        for (auto& [nodeId, buf] : dmxConsoleBuffers)
+        {
+            DmxSnapshot snap;
+            snap.nodeId = nodeId;
+            if (buf->drain (snap.channels))
+            {
+                snap.hasData = true;
+                result.push_back (std::move (snap));
+            }
+        }
+        return result;
+    }
+
+    /** Called by ProcessingGraph when creating a MidiMonitorNode — returns shared buffer. */
+    // Template helper — gets or creates a monitor buffer in any of the three maps
+    template <typename BufferType>
+    BufferType* getOrCreateBuffer (
+        std::unordered_map<juce::String, std::unique_ptr<BufferType>>& map,
+        const juce::String& nodeId)
+    {
+        auto it = map.find (nodeId);
+        if (it == map.end())
+        {
+            map[nodeId] = std::make_unique<BufferType>();
+            return map[nodeId].get();
+        }
+        return it->second.get();
+    }
+
+    MidiMonitorBuffer*  getOrCreateMidiMonitorBuffer     (const juce::String& id) { return getOrCreateBuffer (monitorBuffers,          id); }
+    MidiMonitorBuffer*  getOrCreateKeyboardMonitorBuffer (const juce::String& id) { return getOrCreateBuffer (keyboardMonitorBuffers,  id); }
+    AudioMonitorBuffer* getOrCreateAudioMonitorBuffer    (const juce::String& id) { return getOrCreateBuffer (audioMonitorBuffers,     id); }
+    AudioPlayerState*   getOrCreateAudioPlayerState      (const juce::String& id) { return getOrCreateBuffer (audioPlayerStates,       id); }
+    double getLastSampleRate() const { return lastSampleRate; }
+    DmxMonitorBuffer*      getOrCreateDmxMonitorBuffer      (const juce::String& id) { return getOrCreateBuffer (dmxMonitorBuffers,       id); }
+    DmxMonitorBuffer*      getOrCreateDmxConsoleBuffer      (const juce::String& id) { return getOrCreateBuffer (dmxConsoleBuffers,       id); }
+    ArtNetMonitorBuffer*   getOrCreateArtNetMonitorBuffer   (const juce::String& id) { return getOrCreateBuffer (artNetMonitorBuffers,    id); }
+    ArtNetMonitorBuffer*   getOrCreateArtNetConsoleBuffer   (const juce::String& id) { return getOrCreateBuffer (artNetConsoleBuffers,    id); }
+    OscMonitorBuffer*      getOrCreateOscMonitorBuffer      (const juce::String& id) { return getOrCreateBuffer (oscMonitorBuffers,       id); }
+    UdpMonitorBuffer*      getOrCreateUdpMonitorBuffer      (const juce::String& id) { return getOrCreateBuffer (udpMonitorBuffers,       id); }
+    MqttMonitorBuffer*     getOrCreateMqttMonitorBuffer     (const juce::String& id) { return getOrCreateBuffer (mqttMonitorBuffers,      id); }
+
+    void removeMonitorBuffer (const juce::String& nodeId)
+    {
+        monitorBuffers.erase (nodeId);
+    }
+    ProcessingGraph&    getProcessingGraph()     { return processingGraph; }
+    ProcessingGraph*    getPendingGraph()         { return pendingGraph.get(); }
+
+    /** For telemetry: always returns the freshest graph.
+     *  Before audio starts: pendingGraph has the latest rebuild.
+     *  After audio starts: processingGraph holds the swapped-in graph. */
+    ProcessingGraph* getLatestGraph()
+    {
+        if (pendingGraph != nullptr) return pendingGraph.get();
+        return &processingGraph;
+    }
+
+private:
+    GraphModel          graphModel;
+    ProcessingGraph     processingGraph;
+    PaxRegistry  registry;
+    MidiDeviceManager   midiDeviceManager;
+    AudioDeviceManager  audioDeviceManager;
+    UdpDeviceManager    udpDeviceManager;
+    OscDeviceManager    oscDeviceManager;
+    MqttDeviceManager   mqttDeviceManager;
+    ArtNetDeviceManager artNetDeviceManager;
+    DmxDeviceManager    dmxDeviceManager;
+    std::unordered_map<juce::String, std::unique_ptr<MidiMonitorBuffer>>  monitorBuffers;
+    std::unordered_map<juce::String, std::unique_ptr<MidiMonitorBuffer>>  keyboardMonitorBuffers;
+    std::unordered_map<juce::String, std::unique_ptr<AudioMonitorBuffer>> audioMonitorBuffers;
+    struct WelchCache
+    {
+        AudioSim::WelchSpectrum analyser;
+        std::vector<float> samples;
+        uint64_t version = ~uint64_t (0);
+        int fftSize = 0, channel = -1, averages = 0;
+        juce::String window;
+    };
+    std::unordered_map<juce::String, WelchCache> welchAnalysers;
+    std::unordered_map<juce::String, std::unique_ptr<AudioPlayerState>>   audioPlayerStates;
+    std::unordered_map<juce::String, std::unique_ptr<DmxMonitorBuffer>>      dmxMonitorBuffers;
+    std::unordered_map<juce::String, std::unique_ptr<DmxMonitorBuffer>>      dmxConsoleBuffers;
+    std::unordered_map<juce::String, std::unique_ptr<ArtNetMonitorBuffer>>   artNetMonitorBuffers;
+    std::unordered_map<juce::String, std::unique_ptr<ArtNetMonitorBuffer>>   artNetConsoleBuffers;
+    std::unordered_map<juce::String, std::unique_ptr<OscMonitorBuffer>>      oscMonitorBuffers;
+    std::unordered_map<juce::String, std::unique_ptr<UdpMonitorBuffer>>      udpMonitorBuffers;
+    std::unordered_map<juce::String, std::unique_ptr<MqttMonitorBuffer>>     mqttMonitorBuffers;
+    bool audioSnapshotBusy = false;
+
+    // Pending graph to swap in at the start of the next processBlock
+    std::unique_ptr<ProcessingGraph> pendingGraph;
+    std::atomic<bool>                graphPending { false };
+
+    // Holds the old graph after an audio-thread swap until the message thread
+    // can safely destroy it (avoids destructor running on the audio thread).
+    std::unique_ptr<ProcessingGraph> graphTrash;
+    std::atomic<bool>                graphTrashPending { false };
+    // TEMPORARY diagnostic (2026-09-02), remove once resolved — see
+    // processBlock()'s own comment for the full story. Only ever
+    // accessed on the audio thread itself (set at the end of the swap
+    // block, read+reset at the end of the same processBlock() call), so
+    // a plain bool is correct here, no atomic needed.
+    bool                              firstProcessAfterSwap { false };
+    // TEMPORARY diagnostic (2026-09-02), remove once resolved — see
+    // processBlock()'s own comment for the full story. Default-
+    // constructed (time_since_epoch() == 0) is used as the "no previous
+    // call yet" sentinel on the very first block.
+    std::chrono::high_resolution_clock::time_point lastCallbackTime {};
+
+    double lastSampleRate  = 44100.0;
+    int    lastBlockSize   = 512;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PatchyProcessor)
+};

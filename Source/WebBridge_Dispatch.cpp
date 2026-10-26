@@ -1,0 +1,1060 @@
+#include "WebBridge.h"
+#include "AudioSimConfig.h"
+#include "DiagLog.h"   // v0.0.942
+#include "AppSettings.h"
+#include "StartupFadeRegistry.h"
+#include "MidiDeviceNodes.h"
+#include "AudioDeviceNodes.h"
+#include "ProcessingGraph.h"
+#include "MidiMonitorNode.h"
+#include "SerialPort.h"
+#include <unordered_map>
+
+#if HAS_BUNDLED_UI
+  #include "BinaryData.h"
+#endif
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Message handling
+// ─────────────────────────────────────────────────────────────────────────────
+
+void WebBridge::handleMessage (const juce::String& json)
+{
+    auto v = juce::JSON::parse (json);
+    if (! v.isObject()) return;
+
+    auto* obj  = v.getDynamicObject();
+    auto  type = obj->getProperty ("type").toString();
+
+    if (type == "ready")
+        handleReady();
+    else if (type == "addNode")
+        handleAddNode (obj);
+    else if (type == "setPaxParameter")
+        handleSetPaxParameter (obj);
+    else if (type == "setNodeSettings")
+        handleSetNodeSettings (obj);
+    else if (type == "commitNodeSettings")
+        handleCommitNodeSettings();
+    else if (type == "commitSettingsChange")
+        handleCommitSettingsChange (obj);
+    else if (type == "setNodeLabel")
+        handleSetNodeLabel (obj);
+    else if (type == "setNodeCustomName")
+        handleSetNodeCustomName (obj);
+    // ── v0.0.923 — recent files / reopen last project (AppSettings.h) ──
+    else if (type == "openRecentFile" || type == "locateFile")
+    {
+        const juce::File f (obj->getProperty ("path").toString());
+        if (type == "locateFile")
+            showOpenDialog (f.getParentDirectory());   // browse from where it used to be
+        else if (! openFile (f))
+        {
+            AppSettings::removeRecentFile (f.getFullPathName());
+            pushRecentFiles();
+            auto* o = new juce::DynamicObject();
+            o->setProperty ("path", f.getFullPathName());
+            o->setProperty ("context", "recent");
+            pushToUI ("onFileMissing", juce::JSON::toString (juce::var (o), true));
+        }
+    }
+    else if (type == "clearRecentFiles")
+    {
+        AppSettings::clearRecentFiles();
+        pushRecentFiles();
+    }
+    else if (type == "setReopenLastProject")
+    {
+        AppSettings::setReopenLastProject ((bool) obj->getProperty ("enabled"));
+        pushAppSettings();
+    }
+    else if (type == "resizeEditor")   // v0.0.920 — the UI's resize grip (plugin builds)
+    {
+        if (resizeEditor) resizeEditor ((int) obj->getProperty ("w"), (int) obj->getProperty ("h"));
+    }
+    else if (type == "setKeepRunningWhenHostPaused")   // v0.0.919 — per-project option, not graph state (no undo)
+    {
+        if (setKeepRunning) setKeepRunning ((bool) obj->getProperty ("enabled"));
+        if (getKeepRunning) pushToUI ("onKeepRunningWhenHostPaused", getKeepRunning() ? "true" : "false");
+    }
+    else if (type == "setTextEditing")   // Phase 6 rename fix, 2026-09-25 — see WebBridge::isTextEditing()
+        textEditing = (bool) obj->getProperty ("editing");
+    else if (type == "midiKeyEvent")
+        handleMidiKeyEvent (obj);
+    else if (type == "removeNode")
+        handleRemoveNode (obj);
+    else if (type == "wrapSaveToLibrary" || type.startsWith ("wrapLibrary"))   // v0.0.938
+        handleWrapLibrary (type, obj);
+    else if (type.startsWith ("wrap"))   // v0.0.930 — wrapNodes, wrapUnwrap, wrapSetOpen, wrapMove, wrapRename, wrapRemove (+ wrapSetPins v0.0.932)
+        handleWrapMessage (type, obj);
+    else if (type == "addConnection")
+        handleAddConnection (obj);
+    else if (type == "removeConnection")
+        handleRemoveConnection (obj);
+    else if (type == "moveNode")
+        handleMoveNode (obj);
+    else if (type == "setViewport")
+        handleSetViewport (obj);
+    else if (type == "setNodeParam")
+        handleSetNodeParam (obj);
+    else if (type == "fileSave")
+        handleFileSave();
+    else if (type == "fileSaveAs")
+        handleFileSaveAs();
+    else if (type == "fileOpen")
+        handleFileOpen();
+    else if (type == "fileNew")
+        handleFileNew();
+    else if (type == "audioPlayerLoadFile")
+        handleAudioPlayerLoadFile (obj);
+    else if (type == "audioPlayerRequestFileInfo")
+        handleAudioPlayerRequestFileInfo (obj);
+    else if (type == "exportSelection")
+        handleExportSelection (obj);
+    else if (type == "importFragment")
+        showImportDialog();
+    else if (type == "undo")
+        handleUndo();
+    else if (type == "redo")
+        handleRedo();
+    else if (type == "listSerialPorts")
+        pushSerialPorts();
+    else if (type == "importFragmentNodes")
+        handleImportFragmentNodes (obj);
+    else if (type == "setAudioEngineSettings")
+        handleSetAudioEngineSettings (obj);
+    else if (type == "refreshAudioDevices")
+        pushAudioDevices (true);
+}
+
+void WebBridge::handleReady ()
+{
+    ScopedUiTiming timing ("UI ready");
+    // Guard against double-ready (WebView sometimes fires twice on load)
+    const bool wasConnected = connected;
+    connected = true;
+    lastPushedHostPaused = -1;   // v0.0.919 — re-send the host-paused state to a freshly loaded page
+    diagLog ("WebBridge: UI ready.");
+    // Publish the engine mode and canvas before starting device discovery.
+    if (onUIReady) onUIReady();
+    // Node reconstruction consumes these cached parameter/port descriptors.
+    pushPaxList();
+    pushGraphToUI();
+    pushUndoState();
+    pushWrapLibrary();   // v0.0.938
+    pushToUI ("onFileState", buildFileStateJson());
+    pushStartupFadeDevices();
+    if (getKeepRunning)   // v0.0.919
+        pushToUI ("onKeepRunningWhenHostPaused", getKeepRunning() ? "true" : "false");
+    pushRecentFiles();     // v0.0.923
+    pushAppSettings();
+    handleLaunchActions();
+    // AudioSim does not use MIDI or serial devices. Their legacy scans can
+    // block for seconds and must not run on the page-ready path.
+    pushAudioDevices();
+    if (!wasConnected)
+    {
+        startTimerHz (30);
+    }
+}
+
+void WebBridge::handleAddNode (const juce::DynamicObject* obj)
+{
+    ScopedUiTiming timing ("Add node");
+    const auto requestedType = (int) obj->getProperty ("nodeType");
+    const auto requestedPax = obj->getProperty ("paxName").toString();
+    if (requestedPax.isEmpty() && ! AudioSim::isBuiltinNodeType (requestedType))
+    {
+        juce::Logger::writeToLog ("AudioSim: unavailable built-in type " + juce::String (requestedType));
+        return;
+    }
+    pendingSettingsSnapshot = juce::var(); pendingSettingsNodeId.clear();
+    graph.pushSnapshot();
+    juce::String paxName = obj->getProperty ("paxName").toString();
+    PaxPortSpec portSpec;
+
+    // Look up port counts + per-port types from registry for Pax nodes
+    if (registry && paxName.isNotEmpty())
+    {
+        for (const auto& e : registry->getEntries())
+        {
+            if (e.name == paxName)
+            {
+                portSpec.audioIn  = e.audioInputs;
+                portSpec.audioOut = e.audioOutputs;
+                portSpec.midiIn   = e.midiInputs;
+                portSpec.midiOut  = e.midiOutputs;
+                portSpec.valueIn  = e.valueInputs;
+                portSpec.valueOut = e.valueOutputs;
+                for (int tag : e.valueInputTypes)  portSpec.valueInTypes.push_back  (paxValueTypeFromTag (tag));
+                for (int tag : e.valueOutputTypes) portSpec.valueOutTypes.push_back (paxValueTypeFromTag (tag));
+                break;
+            }
+        }
+    }
+
+    // v0.0.937 — dropped while inside a wrap ("Enter" view): it joins it, in
+    // the same undo step and the same graph push
+    const juce::String wrapId = obj->getProperty ("wrapId").toString();
+    graph.suspendNotifications();
+    auto& added = graph.addNode (
+        (int)   obj->getProperty ("nodeType"),
+        (float) obj->getProperty ("x"),
+        (float) obj->getProperty ("y"),
+        paxName, portSpec);
+    if (requestedType == 26 && requestedPax.isEmpty())
+    {
+        auto initial = obj->getProperty ("initialSettings");
+        if (auto* settings = initial.getDynamicObject())
+        {
+            // Only known Source defaults are accepted from drag metadata.
+            auto* safe = new juce::DynamicObject();
+            const auto mode = settings->getProperty ("mode").toString();
+            safe->setProperty ("mode", mode == "file" ? "file" : "sine");
+            added.settingsJson = juce::JSON::toString (juce::var (safe), true);
+        }
+    }
+    if (wrapId.isNotEmpty() && ! graph.getNodes().empty())
+        if (auto* w = graph.findWrap (wrapId))
+            w->nodeIds.add (graph.getNodes().back().id);
+    graph.resumeNotifications();
+
+    // Initialize DMX Monitor/Console with default settingsJson so undo doesn't wipe settings
+    int nodeType = (int) obj->getProperty ("nodeType");
+    if (nodeType == 16 || nodeType == 17)
+    {
+        const auto& nodes = graph.getNodes();
+        if (! nodes.empty())
+        {
+            auto& newNode = const_cast<NodeData&> (nodes.back());
+            newNode.settingsJson = "{\"visibleCount\":8,\"startChannel\":0,\"valueFormat\":\"dec\",\"customName\":\"\",\"blackout\":false}";
+        }
+    }
+    else if (nodeType == 18 || nodeType == 19)
+    {
+        const auto& nodes = graph.getNodes();
+        if (! nodes.empty())
+        {
+            auto& newNode = const_cast<NodeData&> (nodes.back());
+            newNode.settingsJson = "{\"visibleCount\":8,\"startChannel\":0,\"valueFormat\":\"dec\",\"customName\":\"\",\"blackout\":false,\"universe\":0,\"filterUniverse\":false,\"filterUniverseValue\":0}";
+        }
+    }
+}
+
+void WebBridge::handleSetPaxParameter (const juce::DynamicObject* obj)
+{
+    juce::String nodeId = obj->getProperty ("nodeId").toString();
+    int   index = (int)   obj->getProperty ("index");
+    float value = (float) obj->getProperty ("value");
+    const auto* previousNode = graph.findNode (nodeId);
+    const auto previousSettings = previousNode ? previousNode->settingsJson : juce::String();
+    if (onSetPaxParameter)
+        onSetPaxParameter (nodeId, index, value);
+
+    // A DLL may change its declared output count from any parameter.
+    // Fixed-port modules do not rebuild when their count stays the same.
+    if (onGetPaxAudioOutCount)
+    {
+        int newCount = onGetPaxAudioOutCount (nodeId);
+        if (newCount > 0)
+        {
+            // Check current port count — only update if it actually changed
+            // (avoids pushGraphToUI on every slider tick for fixed-port nodes like Amp)
+            int currentCount = 0;
+            for (auto& n : graph.getNodes())
+                if (n.id == nodeId) { for (auto& p : n.ports) if (p.type == PortType::Audio && p.direction == PortDirection::Output) currentCount++; break; }
+
+            if (newCount != currentCount)
+            {
+                if (pendingSettingsNodeId != nodeId)
+                {
+                    pendingSettingsNodeId = nodeId;
+                    pendingSettingsSnapshot = graph.toVar();
+                    if (auto* snapshotNodes = pendingSettingsSnapshot["nodes"].getArray())
+                        for (auto& snapshotNode : *snapshotNodes)
+                            if (snapshotNode["id"].toString() == nodeId)
+                                snapshotNode.getDynamicObject()->setProperty ("settingsJson", previousSettings);
+                }
+                graph.suspendNotifications();
+                graph.updateNodeAudioOutputCount (nodeId, newCount);
+                graph.resumeNotifications();
+                pushGraphToUI();
+            }
+        }
+    }
+}
+
+void WebBridge::handleSetNodeSettings (const juce::DynamicObject* obj)
+{
+    juce::String nodeId       = obj->getProperty ("nodeId").toString();
+    juce::String settingsJson = obj->getProperty ("settings").toString();
+    if (nodeId.isNotEmpty())
+    {
+        if (pendingSettingsNodeId != nodeId)
+        {
+            pendingSettingsNodeId   = nodeId;
+            pendingSettingsSnapshot = graph.toVar();
+        }
+        graph.setNodeSettings (nodeId, settingsJson);
+        pushSettingsToUI (nodeId, settingsJson);
+    }
+}
+
+// v0.0.942 — one log line per committed settings change: the keys that
+// changed (short values), or the whole settings when they aren't an object
+// (generic Pax: one value per parameter). Long values (DMX channel blobs)
+// are cut; anything named like a password is masked.
+static juce::String settingsChangeText (const juce::String& before, const juce::String& after)
+{
+    auto cut = [] (juce::String t) { return t.length() > 60 ? t.substring (0, 57) + "..." : t; };
+    auto a = juce::JSON::parse (before), b = juce::JSON::parse (after);
+    auto* bo = b.getDynamicObject();
+    if (bo == nullptr) return "settings = " + cut (after);
+    auto* ao = a.getDynamicObject();
+    juce::StringArray parts;
+    for (auto& p : bo->getProperties())
+    {
+        const auto key = p.name.toString();
+        const auto now = juce::JSON::toString (p.value, true);
+        const auto was = ao != nullptr && ao->hasProperty (p.name) ? juce::JSON::toString (ao->getProperty (p.name), true) : juce::String();
+        if (now == was) continue;
+        parts.add (key + " = " + (key.containsIgnoreCase ("password") ? juce::String ("***") : cut (now)));
+    }
+    return parts.isEmpty() ? juce::String() : parts.joinIntoString (", ");
+}
+
+static juce::String nodeLogName (GraphModel& graph, const juce::String& nodeId)
+{
+    if (auto* nd = graph.findNode (nodeId))
+        return (nd->customName.isNotEmpty() ? nd->customName : nd->label) + " (" + nodeId.substring (0, 8) + ")";
+    return nodeId;
+}
+
+void WebBridge::handleCommitNodeSettings ()
+{
+    if (pendingSettingsSnapshot.isObject())
+    {
+        auto* node = graph.findNode (pendingSettingsNodeId);
+        juce::String snapSettings;
+        if (auto* snapObj = pendingSettingsSnapshot.getDynamicObject())
+            if (auto* arr = snapObj->getProperty ("nodes").getArray())
+                for (auto& nv : *arr)
+                    if (auto* nobj = nv.getDynamicObject())
+                        if (nobj->getProperty ("id").toString() == pendingSettingsNodeId)
+                            snapSettings = nobj->getProperty ("settingsJson").toString();
+
+        if (node && node->settingsJson != snapSettings)
+        {
+            if (auto t = settingsChangeText (snapSettings, node->settingsJson); t.isNotEmpty())
+                diagLog ("Settings: " + nodeLogName (graph, pendingSettingsNodeId) + " " + t);   // v0.0.942
+            pushSettingsToUI (pendingSettingsNodeId, node->settingsJson);
+            graph.pushExistingSnapshot (std::move (pendingSettingsSnapshot));
+            pushUndoState();
+        }
+        pendingSettingsSnapshot = juce::var();
+        pendingSettingsNodeId.clear();
+    }
+}
+
+void WebBridge::handleCommitSettingsChange (const juce::DynamicObject* obj)
+{
+    // Atomic set+commit for discrete controls (checkbox, combo, etc.)
+    // Captures pre-change snapshot, applies change, pushes snapshot — all in one message.
+    juce::String nodeId       = obj->getProperty ("nodeId").toString();
+    juce::String settingsJson = obj->getProperty ("settings").toString();
+    if (nodeId.isNotEmpty())
+    {
+        // Clear any pending slider interaction first
+        pendingSettingsSnapshot = juce::var();
+        pendingSettingsNodeId.clear();
+
+        auto preSnapshot = graph.toVar();
+        graph.setNodeSettings (nodeId, settingsJson);
+
+        // Only push if actually changed
+        juce::String snapSettings;
+        if (auto* snapObj = preSnapshot.getDynamicObject())
+            if (auto* arr = snapObj->getProperty ("nodes").getArray())
+                for (auto& nv : *arr)
+                    if (auto* nobj = nv.getDynamicObject())
+                        if (nobj->getProperty ("id").toString() == nodeId)
+                            snapSettings = nobj->getProperty ("settingsJson").toString();
+
+        if (snapSettings != settingsJson)
+        {
+            if (auto t = settingsChangeText (snapSettings, settingsJson); t.isNotEmpty())
+                diagLog ("Settings: " + nodeLogName (graph, nodeId) + " " + t);   // v0.0.942
+            pushSettingsToUI (nodeId, settingsJson);
+            graph.pushExistingSnapshot (std::move (preSnapshot));
+            pushUndoState();
+        }
+    }
+}
+
+void WebBridge::handleSetNodeLabel (const juce::DynamicObject* obj)
+{
+    juce::String nodeId   = obj->getProperty ("nodeId").toString();
+    juce::String newLabel = obj->getProperty ("label").toString();
+    if (nodeId.isNotEmpty() && onSetNodeLabel)
+        onSetNodeLabel (nodeId, newLabel);
+    // Note: we do NOT call graph.renameNode() — the node label in the
+    // NODE column always shows the original type name. The custom name
+    // only appears in the NAME column of MidiMonitor.
+}
+
+// Phase 6 "universal, persistent node rename", 2026-09-25. The frontend
+// sends this once per committed edit (blur/Enter), not per keystroke. One
+// undoable step, same shape as handleCommitSettingsChange(): pre-change
+// snapshot, apply, push the snapshot + undo state. Writes the model field
+// directly (no notifyChange), so a rename never rebuilds the audio graph.
+void WebBridge::handleSetNodeCustomName (const juce::DynamicObject* obj)
+{
+    const juce::String nodeId = obj->getProperty ("nodeId").toString();
+    const juce::String name   = obj->getProperty ("name").toString().trim();
+    auto* nd = graph.findNode (nodeId);
+    if (nd == nullptr || nd->customName == name)
+        return;
+
+    pendingSettingsSnapshot = juce::var(); pendingSettingsNodeId.clear();
+    auto preSnapshot = graph.toVar();
+    nd->customName = name;
+    graph.pushExistingSnapshot (std::move (preSnapshot));
+    pushUndoState();
+    pushGraphToUI();
+}
+
+void WebBridge::handleMidiKeyEvent (const juce::DynamicObject* obj)
+{
+    juce::String nid = obj->getProperty ("nodeId").toString();
+    uint8_t status = (uint8_t) (int) obj->getProperty ("status");
+    uint8_t data1  = (uint8_t) (int) obj->getProperty ("data1");
+    uint8_t data2  = (uint8_t) (int) obj->getProperty ("data2");
+    if (onMidiKeyEvent) onMidiKeyEvent (nid, status, data1, data2);
+}
+
+void WebBridge::handleRemoveNode (const juce::DynamicObject* obj)
+{
+    pendingSettingsSnapshot = juce::var(); pendingSettingsNodeId.clear();
+    graph.pushSnapshot();
+    graph.removeNode (obj->getProperty ("nodeId").toString());
+}
+
+void WebBridge::handleAddConnection (const juce::DynamicObject* obj)
+{
+    pendingSettingsSnapshot = juce::var(); pendingSettingsNodeId.clear();
+    graph.pushSnapshot();
+    graph.addConnection (
+        obj->getProperty ("sourceNodeId").toString(),
+        obj->getProperty ("sourcePortId").toString(),
+        obj->getProperty ("targetNodeId").toString(),
+        obj->getProperty ("targetPortId").toString());
+}
+
+void WebBridge::handleRemoveConnection (const juce::DynamicObject* obj)
+{
+    juce::String connId = obj->getProperty ("connectionId").toString();
+    // Only snapshot if the connection exists — ReactFlow fires removeConnection
+    // for each edge when a node is deleted, but C++ already removed them
+    // as part of removeNode. Avoid phantom snapshots.
+    if (graph.hasConnection (connId))
+    {
+        graph.pushSnapshot();
+    }
+    graph.removeConnection (connId);
+}
+
+void WebBridge::handleMoveNode (const juce::DynamicObject* obj)
+{
+    juce::String nodeId = obj->getProperty ("nodeId").toString();
+    if (auto* node = graph.findNode (nodeId))
+    {
+        node->x = (float) obj->getProperty ("x");
+        node->y = (float) obj->getProperty ("y");
+    }
+}
+
+void WebBridge::handleSetViewport (const juce::DynamicObject* obj)
+{
+    graph.viewportX    = (float) obj->getProperty ("x");
+    graph.viewportY    = (float) obj->getProperty ("y");
+    graph.viewportZoom = (float) obj->getProperty ("zoom");
+}
+
+void WebBridge::handleSetNodeParam (const juce::DynamicObject* obj)
+{
+    juce::String nodeId = obj->getProperty ("nodeId").toString();
+    juce::String key    = obj->getProperty ("key").toString();
+    juce::String value  = obj->getProperty ("value").toString();
+
+    // v0.0.942 — device settings committed from a panel (ports, universe,
+    // host, topic, startup fade…): one log line each, so a change can be
+    // confirmed. Panels only send these on commit, never per drag step.
+    if (key == "udpSettings" || key == "oscSettings" || key == "artNetSettings"
+        || key == "mqttSubscribeSettings" || key == "mqttPublishSettings" || key == "audioInStartupFade"
+        || key == "mqttConsoleSend")
+    {
+        auto shown = value;
+        auto parsed = juce::JSON::parse (value);
+        if (auto* o = parsed.getDynamicObject())
+            if (o->hasProperty ("password"))
+            {
+                if (o->getProperty ("password").toString().isNotEmpty()) o->setProperty ("password", "***");   // never log a password
+                shown = juce::JSON::toString (parsed, true);
+            }
+        diagLog ((key == "mqttConsoleSend" ? "MQTT Console: " : "Settings: ") + nodeLogName (graph, nodeId) + " " + key + " = " + shown);
+    }
+
+    // v0.0.929 — generic MIDI Learn arm/disarm: live only, never undoable.
+    if (key == "learnArm")
+    {
+        if (onSetLearnArm) onSetLearnArm (nodeId, value == "1" || value == "true");
+        return;
+    }
+
+    // dmxConsoleChannel / artNetConsoleChannel are real-time audio updates during drag —
+    // preserve the pending snapshot captured by the preceding setNodeSettings.
+    // dmxBlackout / artNetBlackout undo is handled by commitSettingsChange — skip pushSnapshot here.
+    // audioPlayer* keys are either real-time playback controls (play/pause/seek/
+    // return-to-start — same reasoning as dmxConsoleChannel exactly) or a live
+    // mirror of a settings change already committed and snapshotted separately
+    // via commitSettingsChange (see AudioPlayerNode.tsx's own dispatchLiveParams) —
+    // pushing another snapshot here was a real, confirmed bug: since it happened
+    // right after the very same change, pressing undo once reverted to a state
+    // indistinguishable from the current one, making undo appear to do nothing.
+    if (key != "dmxConsoleChannel" && key != "artNetConsoleChannel"
+        && key != "dmxBlackout"    && key != "artNetBlackout"
+        && key != "audioInStartupFade"   // app-wide device list, not graph state — never undoable
+        && ! key.startsWith ("audioPlayer"))
+    {
+        // Clear any pending settings snapshot — device change is a new action
+        pendingSettingsSnapshot = juce::var();
+        pendingSettingsNodeId.clear();
+        graph.pushSnapshot();
+    }
+
+    // Targeted AudioIn startup fade, 2026-09-24. value = { enabled, muteMs }.
+    // Applies to the node's currently selected DEVICE, app-wide (see
+    // StartupFadeRegistry.h) — not to the node or the graph, so no graph
+    // push, no undo snapshot (excluded above), and an early return. Takes
+    // effect from that device's next fresh open.
+    if (key == "audioInStartupFade")
+    {
+        if (auto* nd = graph.findNode (nodeId))
+        {
+            auto parsed = juce::JSON::parse (value);
+            StartupFadeRegistry::setDevice (nd->selectedDeviceId,
+                                            (bool) parsed["enabled"],
+                                            (int)  parsed["muteMs"]);
+            pushStartupFadeDevices();
+        }
+        return;
+    }
+
+    if (key == "midiDeviceId" && onSetMidiDevice)
+        handleSetNodeParam_MidiDeviceId (nodeId, value);
+    else if (key == "audioDeviceId" && onSetAudioDevice)
+        handleSetNodeParam_AudioDeviceId (nodeId, value);
+    else if (key == "audioDeviceChannels" && onSetAudioDeviceChannels)
+        handleSetNodeParam_AudioDeviceChannels (nodeId, value);
+    else if (key == "udpSettings" && onSetUdpSettings)
+        handleSetNodeParam_UdpSettings (nodeId, value);
+    else if (key == "oscSettings" && onSetOscSettings)
+        handleSetNodeParam_OscSettings (nodeId, value);
+    else if (key == "mqttSubscribeSettings" && onSetMqttSubscribeSettings)
+        handleSetNodeParam_MqttSubscribeSettings (nodeId, value);
+    else if (key == "mqttPublishSettings" && onSetMqttPublishSettings)
+        handleSetNodeParam_MqttPublishSettings (nodeId, value);
+    else if (key == "mqttConsoleSend" && onMqttConsoleSend)
+        handleSetNodeParam_MqttConsoleSend (nodeId, value);
+    else if (key == "artNetSettings" && onSetArtNetSettings)
+        handleSetNodeParam_ArtNetSettings (nodeId, value);
+    else if (key == "dmxSettings" && onSetDmxSettings)
+        handleSetNodeParam_DmxSettings (nodeId, value);
+    else if (key == "dmxConsoleChannel" && onSetDmxConsoleChannel)
+    {
+        handleSetNodeParam_DmxConsoleChannel (nodeId, value);
+        return;
+    }
+    else if (key == "midiChMatrixCell" && onSetMidiChMatrixCell)
+    {
+        handleSetNodeParam_MidiChMatrixCell (nodeId, value);
+        return;
+    }
+    else if (key == "midiChMatrixGridSize" && onSetMidiChMatrixGridSize)
+    {
+        onSetMidiChMatrixGridSize (nodeId, value.getIntValue());
+        return;
+    }
+    else if (key == "midiChMatrixDropUnmapped" && onSetMidiChMatrixDropUnmapped)
+    {
+        onSetMidiChMatrixDropUnmapped (nodeId, value == "1" || value == "true");
+        return;
+    }
+    else if (key == "midiChMatrixReset" && onMidiChMatrixReset)
+    {
+        onMidiChMatrixReset (nodeId);
+        return;
+    }
+    else if (key == "midiOutChannelFilter" && onSetMidiOutDeviceChannelFilter)
+    {
+        handleSetNodeParam_MidiOutDeviceChannelFilter (nodeId, value);
+        return;
+    }
+    else if (key == "dmxBlackout" && onSetDmxBlackout)
+    {
+        handleSetNodeParam_DmxBlackout (nodeId, value);
+        return;
+    }
+    else if (key == "artNetConsoleChannel" && onSetArtNetConsoleChannel)
+    {
+        handleSetNodeParam_ArtNetConsoleChannel (nodeId, value);
+        return;
+    }
+    else if (key == "artNetBlackout" && onSetArtNetBlackout)
+    {
+        handleSetNodeParam_ArtNetBlackout (nodeId, value);
+        return;
+    }
+    else if (key == "artNetUniverseFilter")
+    {
+        handleSetNodeParam_ArtNetUniverseFilter (nodeId, value);
+        return;
+    }
+    else if (key == "audioPlayerPlaying" && onAudioPlayerSetPlaying)
+    {
+        onAudioPlayerSetPlaying (nodeId, value == "1" || value == "true");
+        return;
+    }
+    else if (key == "audioPlayerSeek" && onAudioPlayerSeek)
+    {
+        onAudioPlayerSeek (nodeId, value.getDoubleValue());
+        return;
+    }
+    else if (key == "audioPlayerReturnToStart" && onAudioPlayerReturnToStart)
+    {
+        onAudioPlayerReturnToStart (nodeId);
+        return;
+    }
+    else if ((key == "audioPlayerMode" || key == "audioPlayerSineFrequency" ||
+              key == "audioPlayerNoiseType" || key == "audioPlayerLevel" ||
+              key == "audioPlayerLoop") && onAudioPlayerSetLiveParam)
+    {
+        // Live update, bypassing the settingsJson/rebuild-only restoration
+        // path entirely — see restoreAudioPlayerSettings()'s own comment.
+        // A settings commit alone (setNodeSettings/commitSettingsChange)
+        // only ever updates what gets SAVED; it was never enough on its
+        // own to reach a currently-running AudioPlayerState, since that
+        // only happens during a full graph rebuild (undo/redo, or
+        // opening a project) — every other node type's own settings are
+        // purely cosmetic, so this need never came up before.
+        onAudioPlayerSetLiveParam (nodeId, key, value);
+        return;
+    }
+    else if (key == "disabled" && onSetNodeDisabled)
+    {
+        // Disable/Enable feature, 2026-09-12. Two halves: persist the
+        // choice in GraphModel::NodeData (survives save/reload, fragment
+        // export/import — see NodeData's own disabled field), and apply
+        // it live to whichever node instance is actually running right
+        // now, via onSetNodeDisabled — bypassing the rebuild requirement
+        // entirely, same reasoning as onAudioPlayerSetLiveParam above.
+        // Deliberately falls through to this function's own existing
+        // pushGraphToUI()/pushUndoState() at the bottom rather than
+        // returning early — that's exactly what's needed here, so the
+        // frontend's own node immediately reflects the new state (e.g.
+        // its greyed-out appearance).
+        bool isDisabled = (value == "1" || value == "true");
+        if (auto* nd = graph.findNode (nodeId))
+            nd->disabled = isDisabled;
+        onSetNodeDisabled (nodeId, isDisabled);
+    }
+
+    // Push updated graph so React reflects the new selectedDeviceId / settings
+    pushGraphToUI();
+    pushUndoState();
+}
+
+void WebBridge::handleSetNodeParam_MidiDeviceId (const juce::String& nodeId, const juce::String& value)
+{
+    onSetMidiDevice (nodeId, value);
+}
+
+void WebBridge::handleSetNodeParam_AudioDeviceId (const juce::String& nodeId, const juce::String& value)
+{
+    onSetAudioDevice (nodeId, value);
+
+    // After a device change, validate stored selectedChannels.
+    // We can't know the new channel count synchronously here (the device
+    // opens on the audio thread), so we push a special message to React
+    // that tells it to re-check once the new device info arrives via
+    // onAudioDevices. The UI will warn and reset if channels are invalid.
+    auto* nd = graph.findNode (nodeId);
+    if (nd != nullptr && nd->settingsJson.isNotEmpty())
+    {
+        auto* msgObj = new juce::DynamicObject();
+        msgObj->setProperty ("nodeId",      nodeId);
+        msgObj->setProperty ("settingsJson", nd->settingsJson);
+        pushToUI ("onAudioDeviceChanged",
+                  juce::JSON::toString (juce::var (msgObj), true));
+    }
+}
+
+void WebBridge::handleSetNodeParam_AudioDeviceChannels (const juce::String& nodeId, const juce::String& value)
+{
+    // Parse the JSON array of channel indices sent from React
+    std::vector<int> channels;
+    auto parsed = juce::JSON::parse (value);
+    if (auto* arr = parsed.getArray())
+        for (auto& elem : *arr) channels.push_back ((int) elem);
+
+    // Persist into settingsJson — merge with existing settings
+    juce::var existing;
+    if (auto* nd = graph.findNode (nodeId))
+    {
+        try { existing = juce::JSON::parse (nd->settingsJson); } catch (...) {}
+        if (existing.getDynamicObject() == nullptr)
+            existing = new juce::DynamicObject();
+
+        juce::Array<juce::var> arr;
+        for (int ch : channels) arr.add (ch);
+        existing.getDynamicObject()->setProperty ("selectedChannels", arr);
+
+        juce::String newJson = juce::JSON::toString (existing, true);
+        graph.setNodeSettings (nodeId, newJson);
+        pushSettingsToUI (nodeId, newJson);
+    }
+    // The model must contain the new selection before preparing its layout.
+    onSetAudioDeviceChannels (nodeId, channels);
+}
+
+void WebBridge::handleSetNodeParam_UdpSettings (const juce::String& nodeId, const juce::String& value)
+{
+    // value is a JSON object: { port, mode, targetHost, multicastAddr }
+    auto parsed = juce::JSON::parse (value);
+    int port                   = (int) parsed["port"];
+    int mode                   = (int) parsed["mode"];
+    juce::String targetHost    = parsed["targetHost"].toString();
+    juce::String multicastAddr = parsed["multicastAddr"].toString();
+
+    onSetUdpSettings (nodeId, port, mode, targetHost, multicastAddr);
+
+    // PatchyProcessor::setUdpSettings already persists to settingsJson on
+    // the GraphModel node directly — push the updated value to the UI.
+    if (auto* nd = graph.findNode (nodeId))
+        pushSettingsToUI (nodeId, nd->settingsJson);
+}
+
+void WebBridge::handleSetNodeParam_OscSettings (const juce::String& nodeId, const juce::String& value)
+{
+    // value is a JSON object: { port, targetHost, oscAddress }
+    auto parsed = juce::JSON::parse (value);
+    int port                  = (int) parsed["port"];
+    juce::String targetHost   = parsed["targetHost"].toString();
+    juce::String oscAddress   = parsed["oscAddress"].toString();
+
+    onSetOscSettings (nodeId, port, targetHost, oscAddress);
+
+    if (auto* nd = graph.findNode (nodeId))
+        pushSettingsToUI (nodeId, nd->settingsJson);
+}
+
+void WebBridge::handleSetNodeParam_MqttSubscribeSettings (const juce::String& nodeId, const juce::String& value)
+{
+    // value is a JSON object: { host, port, topic, qos, username, password }
+    auto parsed = juce::JSON::parse (value);
+    juce::String host      = parsed["host"].toString();
+    int port               = (int) parsed["port"];
+    juce::String topic     = parsed["topic"].toString();
+    int qos                = (int) parsed["qos"];
+    juce::String username  = parsed["username"].toString();
+    juce::String password  = parsed["password"].toString();
+
+    onSetMqttSubscribeSettings (nodeId, host, port, topic, qos, username, password);
+
+    if (auto* nd = graph.findNode (nodeId))
+        pushSettingsToUI (nodeId, nd->settingsJson);
+}
+
+void WebBridge::handleSetNodeParam_MqttPublishSettings (const juce::String& nodeId, const juce::String& value)
+{
+    // value is a JSON object: { host, port, topic, qos, retain, username, password }
+    auto parsed = juce::JSON::parse (value);
+    juce::String host      = parsed["host"].toString();
+    int port               = (int) parsed["port"];
+    juce::String topic     = parsed["topic"].toString();
+    int qos                = (int) parsed["qos"];
+    bool retain            = (bool) parsed["retain"];
+    juce::String username  = parsed["username"].toString();
+    juce::String password  = parsed["password"].toString();
+
+    onSetMqttPublishSettings (nodeId, host, port, topic, qos, retain, username, password);
+
+    if (auto* nd = graph.findNode (nodeId))
+        pushSettingsToUI (nodeId, nd->settingsJson);
+}
+
+void WebBridge::handleSetNodeParam_MqttConsoleSend (const juce::String& nodeId, const juce::String& value)
+{
+    // value is a JSON object: { topic, payload } — a one-shot trigger,
+    // not a persisted setting, so no settingsJson push-back here (the
+    // frontend already updated its own topic-history state locally
+    // before sending, same as any other UI-only state).
+    auto parsed = juce::JSON::parse (value);
+    juce::String topic = parsed["topic"].toString();
+    float payload       = (float) parsed["payload"];
+
+    onMqttConsoleSend (nodeId, topic, payload);
+}
+
+void WebBridge::handleSetNodeParam_ArtNetSettings (const juce::String& nodeId, const juce::String& value)
+{
+    // value is a JSON object: { universe, targetHost }
+    auto parsed = juce::JSON::parse (value);
+    int          universe   = (int) parsed["universe"];
+    juce::String targetHost = parsed["targetHost"].toString();
+
+    onSetArtNetSettings (nodeId, universe, targetHost);
+
+    if (auto* nd = graph.findNode (nodeId))
+        pushSettingsToUI (nodeId, nd->settingsJson);
+}
+
+void WebBridge::handleSetNodeParam_DmxSettings (const juce::String& nodeId, const juce::String& value)
+{
+    // value is a JSON object: { devicePath, universe }
+    auto parsed = juce::JSON::parse (value);
+    juce::String devicePath = parsed["devicePath"].toString();
+    int          universe   = (int) parsed["universe"];
+
+    onSetDmxSettings (nodeId, devicePath, universe);
+
+    if (auto* nd = graph.findNode (nodeId))
+        pushSettingsToUI (nodeId, nd->settingsJson);
+}
+
+void WebBridge::handleSetNodeParam_DmxConsoleChannel (const juce::String& nodeId, const juce::String& value)
+{
+    auto parsed  = juce::JSON::parse (value);
+    int channel  = (int) parsed["channel"];
+    int val      = (int) parsed["value"];
+    onSetDmxConsoleChannel (nodeId, channel, (uint8_t) juce::jlimit (0, 255, val));
+}
+
+void WebBridge::handleSetNodeParam_MidiChMatrixCell (const juce::String& nodeId, const juce::String& value)
+{
+    auto parsed = juce::JSON::parse (value);
+    int r = (int) parsed["r"];
+    int c = (int) parsed["c"];
+    onSetMidiChMatrixCell (nodeId, r, c);
+}
+
+void WebBridge::handleSetNodeParam_MidiOutDeviceChannelFilter (const juce::String& nodeId, const juce::String& value)
+{
+    auto parsed = juce::JSON::parse (value);
+    std::uint16_t mask = 0;
+    if (auto* arr = parsed.getArray())
+        for (const auto& chVar : *arr)
+        {
+            const int ch = (int) chVar;
+            if (ch >= 1 && ch <= 16)
+                mask |= static_cast<std::uint16_t> (1u << (ch - 1));
+        }
+    onSetMidiOutDeviceChannelFilter (nodeId, mask);
+}
+
+void WebBridge::handleSetNodeParam_DmxBlackout (const juce::String& nodeId, const juce::String& value)
+{
+    bool active = value.trim() == "true";
+    onSetDmxBlackout (nodeId, active);
+    pushGraphToUI();
+}
+
+void WebBridge::handleSetNodeParam_ArtNetConsoleChannel (const juce::String& nodeId, const juce::String& value)
+{
+    auto parsed  = juce::JSON::parse (value);
+    int channel  = (int) parsed["channel"];
+    int val      = (int) parsed["value"];
+    onSetArtNetConsoleChannel (nodeId, channel, (uint8_t) juce::jlimit (0, 255, val));
+}
+
+void WebBridge::handleSetNodeParam_ArtNetBlackout (const juce::String& nodeId, const juce::String& value)
+{
+    bool active = value.trim() == "true";
+    onSetArtNetBlackout (nodeId, active);
+    pushGraphToUI();
+}
+
+void WebBridge::handleSetNodeParam_ArtNetUniverseFilter (const juce::String& nodeId, const juce::String& value)
+{
+    // Set universe filter on ArtNetMonitorNode (-1 = show all)
+    int filter = value.trim().getIntValue();
+    if (onSetArtNetUniverseFilter)
+        onSetArtNetUniverseFilter (nodeId, filter);
+}
+
+
+void WebBridge::handleExportSelection (const juce::DynamicObject* obj)
+{
+    auto nodeIdsVar = obj->getProperty ("selectedNodeIds");
+    auto suggestedName = obj->getProperty ("suggestedName").toString();
+    juce::StringArray selectedNodeIds;
+    if (auto* arr = nodeIdsVar.getArray())
+        for (auto& elem : *arr)
+            selectedNodeIds.add (elem.toString());
+    if (selectedNodeIds.isEmpty()) return;
+    showExportDialog (selectedNodeIds, suggestedName);
+}
+
+void WebBridge::handleImportFragmentNodes (const juce::DynamicObject* obj)
+{
+    // React has placed the ghost (positions already absolute): commit the
+    // nodes, their wires and (v0.0.938) their wraps — see commitFragment()
+    if (obj != nullptr) commitFragment (*obj, 0.f, 0.f);
+}
+
+void WebBridge::handleSetAudioEngineSettings (const juce::DynamicObject* obj)
+{
+    double sr   = (double) obj->getProperty ("sampleRate");
+    int    buf  = (int)    obj->getProperty ("bufferSize");
+    bool   mute = (bool)   obj->getProperty ("muteFeedback");
+    if (onSetAudioEngineSettings)
+        onSetAudioEngineSettings (sr, buf, mute);
+}
+
+// ── Wraps (v0.0.930) ──────────────────────────────────────────────────────────
+// A wrap is UI / project state only (GraphModel::WrapData): none of these
+// touch the processing graph. Undoable ones push a snapshot first; moving a
+// folded wrap and opening/closing it are not undoable (like moving a node).
+void WebBridge::handleWrapMessage (const juce::String& type, const juce::DynamicObject* obj)
+{
+    const juce::String wrapId = obj->getProperty ("wrapId").toString();
+    auto strings = [] (const juce::var& v)
+    {
+        juce::StringArray out;
+        if (auto* a = v.getArray()) for (const auto& s : *a) out.add (s.toString());
+        return out;
+    };
+
+    if (type == "wrapNodes")
+    {
+        auto ids = strings (obj->getProperty ("nodeIds"));
+        juce::StringArray existing;
+        for (const auto& id : ids) if (graph.findNode (id) != nullptr) existing.add (id);
+        if (existing.isEmpty()) return;
+        pendingSettingsSnapshot = juce::var(); pendingSettingsNodeId.clear();
+        graph.pushSnapshot();
+        graph.addWrap (obj->getProperty ("name").toString(), existing,
+                       strings (obj->getProperty ("ports")),
+                       (float) (double) obj->getProperty ("x"), (float) (double) obj->getProperty ("y"));
+    }
+    else if (type == "wrapUnwrap")
+    {
+        if (graph.findWrap (wrapId) == nullptr) return;
+        pendingSettingsSnapshot = juce::var(); pendingSettingsNodeId.clear();
+        graph.pushSnapshot();
+        graph.removeWrap (wrapId);
+    }
+    else if (type == "wrapRename")
+    {
+        auto* p = graph.findWrap (wrapId);
+        const auto name = obj->getProperty ("name").toString();
+        if (p == nullptr || p->name == name) return;
+        pendingSettingsSnapshot = juce::var(); pendingSettingsNodeId.clear();
+        graph.pushSnapshot();
+        p->name = name;
+    }
+    else if (type == "wrapChange")   // v0.0.935 — ⌥-drag: nodes join / leave wraps, one undo step
+    {
+        auto* changes = obj->getProperty ("changes").getArray();
+        if (changes == nullptr || changes->isEmpty()) return;
+        pendingSettingsSnapshot = juce::var(); pendingSettingsNodeId.clear();
+        // The drag that made this drop belongs to the same undo step: the
+        // nodes are put back where the drag started for the "before"
+        // snapshot, then where they were dropped (moves alone aren't undoable)
+        auto applyMoves = [&] (bool toEnd)
+        {
+            if (auto* moves = obj->getProperty ("moves").getArray())
+                for (const auto& m : *moves)
+                    if (auto* mo = m.getDynamicObject())
+                    {
+                        const auto x = (float) (double) mo->getProperty (toEnd ? "toX" : "fromX");
+                        const auto y = (float) (double) mo->getProperty (toEnd ? "toY" : "fromY");
+                        if ((bool) mo->getProperty ("wrap"))   // a folded wrap's box (merged into another)
+                        {
+                            if (auto* pk = graph.findWrap (mo->getProperty ("id").toString())) { pk->x = x; pk->y = y; }
+                        }
+                        else if (auto* n = graph.findNode (mo->getProperty ("id").toString()))
+                        {
+                            n->x = x; n->y = y;
+                        }
+                    }
+        };
+        applyMoves (false);
+        const auto before = graph.toVar();
+        applyMoves (true);
+        bool any = false;
+        for (const auto& c : *changes)
+            if (auto* co = c.getDynamicObject())
+                any = graph.changeWrapMembers (co->getProperty ("wrapId").toString(),
+                                               strings (co->getProperty ("add")),
+                                               strings (co->getProperty ("remove")),
+                                               strings (co->getProperty ("ports"))) || any;
+        if (! any) return;
+        graph.pushExistingSnapshot (before);
+    }
+    else if (type == "wrapSetPins")   // v0.0.932 — pin / unpin / rename a pinned control: one undo step
+    {
+        auto* p = graph.findWrap (wrapId);
+        if (p == nullptr) return;
+        std::vector<WrapPin> pins;
+        if (auto* arr = obj->getProperty ("pins").getArray())
+            for (const auto& v : *arr)
+                if (auto* q = v.getDynamicObject())
+                {
+                    WrapPin pin { q->getProperty ("nodeId").toString(), (int) q->getProperty ("index"),
+                                  q->getProperty ("label").toString() };
+                    if (p->nodeIds.contains (pin.nodeId)) pins.push_back (pin);
+                }
+        if (pins == p->pins) return;
+        pendingSettingsSnapshot = juce::var(); pendingSettingsNodeId.clear();
+        graph.pushSnapshot();
+        p->pins = std::move (pins);
+    }
+    else if (type == "wrapRemove")   // delete the wrap AND its nodes — one undo step
+    {
+        auto* p = graph.findWrap (wrapId);
+        if (p == nullptr) return;
+        const auto members = p->nodeIds;
+        pendingSettingsSnapshot = juce::var(); pendingSettingsNodeId.clear();
+        graph.pushSnapshot();
+        graph.suspendNotifications();
+        for (const auto& id : members) graph.removeNode (id);   // also drops the emptied wrap
+        graph.removeWrap (wrapId);
+        graph.resumeNotifications();   // one rebuild, pushes the graph
+        pushUndoState();
+        return;
+    }
+    else if (type == "wrapSetOpen")   // not undoable; the UI already shows it
+    {
+        if (auto* p = graph.findWrap (wrapId))
+        {
+            p->open = (bool) obj->getProperty ("open");
+            if (obj->hasProperty ("ports")) p->ports = strings (obj->getProperty ("ports"));
+        }
+        return;
+    }
+    else if (type == "wrapMove")   // not undoable, like moving a node
+    {
+        if (auto* p = graph.findWrap (wrapId))
+        {
+            p->x = (float) (double) obj->getProperty ("x");
+            p->y = (float) (double) obj->getProperty ("y");
+        }
+        return;
+    }
+    else return;
+
+    pushGraphToUI();
+    pushUndoState();
+}
+

@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "AudioSim (Windows)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/Run/AudioSim.exe",
+      "cwd": "${workspaceFolder}/Run",
+      "args": [],
+      "stopAtEntry": false,
+      "preLaunchTask": "Build AudioSim"
+    }
+  ]
+}

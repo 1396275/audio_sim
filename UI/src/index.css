@@ -1,0 +1,365 @@
+/* Patchy v0.0.301 - custom checkbox build */
+/* ── Reset & base ─────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  color-scheme: dark;
+  --bg:          #0d0f14;
+  --surface:     rgba(20, 23, 32, 0.88);
+  --surface2:    rgba(28, 32, 48, 0.88);
+  --border:      #2a2f42;
+  --border-hi:   #3d4460;
+  --text:        #d0d5e8;
+  --text-muted:  #5a6080;
+  --text-dim:    #8890aa;
+
+  --midi:        #a78bfa;   /* violet */
+  --midi-dim:    #3b2f6e;
+  --midi-glow:   rgba(167,139,250,.35);
+
+  --audio:       #34d399;   /* emerald */
+  --audio-dim:   #1a4034;
+  --audio-glow:  rgba(52,211,153,.35);
+
+  --av:          #fb923c;   /* orange */
+  --av-dim:      #4a2510;
+  --av-glow:     rgba(251,146,60,.35);
+
+  /* ── Protocol type colours ────────────────────────────────────────────── */
+  --osc:         #22d3ee;   /* cyan/teal */
+  --osc-dim:     #0a3a42;
+  --osc-glow:    rgba(34,211,238,.35);
+
+  --dmx:         #fbbf24;   /* amber/gold */
+  --dmx-dim:     #42300a;
+  --dmx-glow:    rgba(251,191,36,.35);
+  --artnet:      #fde68a;   /* pale amber — ArtNet (DMX over UDP) */
+  --artnet-dim:  #3d2e04;
+  --artnet-glow: rgba(253,230,138,.35);
+
+  --mqtt:        #fb7185;   /* coral/salmon */
+  --mqtt-dim:    #4a1020;
+  --mqtt-glow:   rgba(251,113,133,.35);
+
+  --udp:         #60a5fa;   /* steel blue */
+  --udp-dim:     #1a2d4a;
+  --udp-glow:    rgba(96,165,250,.35);
+
+  --value:       #e879f9;   /* fuchsia/magenta — Converter colour specifically */
+  --value-dim:   #3d1a45;
+  --value-glow:  rgba(232,121,249,.35);
+
+  /* Plain Generic Value's own native colour — NOT the same as --value
+     above, which is specifically Converter's colour now. A node whose
+     only type, mirrored on both sides, is plain Generic Value needs its
+     own colour or it'd be visually indistinguishable from a genuine
+     Converter. Proposed: slate grey — every other colour in this palette
+     is vibrant/saturated (protocol-specific), so a neutral, muted tone
+     both stays visually distinct from all of them and fits "generic"
+     semantically. Open to change if a different colour is preferred. */
+  --generic:      #94a3b8;
+  --generic-dim:  #262c36;
+  --generic-glow: rgba(148,163,184,.35);
+
+  --error:       #f87171;   /* red — reserved for errors/warnings */
+  --error-dim:   #4a1010;
+  --error-glow:  rgba(248,113,113,.35);
+
+  --accent:      #38bdf8;   /* sky */
+  --danger:      #f87171;
+  --on-accent:   #0d0f14;
+  --toggle-thumb: #d0d5e8;
+
+  --plot-bg:     #0a0f18;
+  --scope-bg:    rgba(13, 15, 20, 0.52);
+  --plot-grid:   rgba(255,255,255,0.06);
+  --plot-zero:   rgba(255,255,255,0.15);
+  --plot-label:  #8890aa;
+  --plot-line:   rgba(255,255,255,0.18);
+  --wave-left:   #4fc3f7;
+  --wave-right:  #81c784;
+  --wave-clip:   #ef5350;
+  --wave-trigger: #ffc832;
+  --plot-track:  #1f2937;
+  --flash-midi:  #b2ebf2;
+  --flash-udp:   #93c5fd;
+  --flash-mqtt:  #fb7185;
+  --flash-osc:   #67e8f9;
+  --flash-artnet: #fef08a;
+  --dmx-rgb:     251,191,36;
+  --shadow-node: 0 4px 16px rgba(0,0,0,.5);
+  --shadow-panel: 0 8px 32px rgba(0,0,0,.6);
+  --shadow-menu: 0 8px 24px rgba(0,0,0,.6);
+  --wire-selection: drop-shadow(0 0 3px rgba(255,255,255,.9)) drop-shadow(0 0 6px rgba(255,255,255,.45));
+
+  --node-w:      220px;
+  --port-size:   10px;
+  --radius:      6px;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg:          #edf2f8;
+  --surface:     rgba(255,255,255,.96);
+  --surface2:    rgba(246,248,252,.98);
+  --border:      #ccd5e1;
+  --border-hi:   #aab8cb;
+  --text:        #1e293b;
+  --text-muted:  #64748b;
+  --text-dim:    #526078;
+  --midi:        #7041c6;
+  --midi-dim:    #eee6fb;
+  --midi-glow:   rgba(112,65,198,.18);
+  --audio:       #087a54;
+  --audio-dim:   #def3e9;
+  --audio-glow:  rgba(8,122,84,.18);
+  --av:          #b65310;
+  --av-dim:      #fcebdc;
+  --av-glow:     rgba(182,83,16,.18);
+  --osc:         #087a8d;
+  --osc-dim:     #def2f5;
+  --osc-glow:    rgba(8,122,141,.18);
+  --dmx:         #976400;
+  --dmx-dim:     #fff1ce;
+  --dmx-glow:    rgba(151,100,0,.18);
+  --artnet:      #84600a;
+  --artnet-dim:  #fbf1d4;
+  --artnet-glow: rgba(132,96,10,.18);
+  --mqtt:        #bd3654;
+  --mqtt-dim:    #fce6ec;
+  --mqtt-glow:   rgba(189,54,84,.18);
+  --udp:         #2563c5;
+  --udp-dim:     #e5edfd;
+  --udp-glow:    rgba(37,99,197,.18);
+  --value:       #a429b5;
+  --value-dim:   #f7e3fa;
+  --value-glow:  rgba(164,41,181,.18);
+  --generic:     #52627a;
+  --generic-dim: #e8edf3;
+  --generic-glow: rgba(82,98,122,.18);
+  --error:       #c9343c;
+  --error-dim:   #fce5e6;
+  --error-glow:  rgba(201,52,60,.18);
+  --accent:      #076ca8;
+  --danger:      #c9343c;
+  --on-accent:   #ffffff;
+  --toggle-thumb: #ffffff;
+  --plot-bg:     #f5f8fc;
+  --scope-bg:    #f5f8fc;
+  --plot-grid:   rgba(30,41,59,.10);
+  --plot-zero:   rgba(30,41,59,.25);
+  --plot-label:  #526078;
+  --plot-line:   rgba(30,41,59,.45);
+  --wave-left:   #0676b2;
+  --wave-right:  #278044;
+  --wave-clip:   #c9343c;
+  --wave-trigger: #996400;
+  --plot-track:  #dce4ef;
+  --flash-midi:  #854bd6;
+  --flash-udp:   #175bd1;
+  --flash-mqtt:  #d12750;
+  --flash-osc:   #007e96;
+  --flash-artnet: #a16b00;
+  --dmx-rgb:     151,100,0;
+  --shadow-node: 0 3px 12px rgba(30,41,59,.12);
+  --shadow-panel: 0 8px 28px rgba(30,41,59,.16);
+  --shadow-menu: 0 6px 20px rgba(30,41,59,.14);
+  --wire-selection: drop-shadow(0 0 2px rgba(7,108,168,.65)) drop-shadow(0 0 5px rgba(7,108,168,.3));
+}
+
+html, body, #root {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── ReactFlow canvas ─────────────────────────────────────────────────────── */
+.react-flow__background { background: var(--bg); }
+
+/* Edge colours */
+.react-flow__edge-path { stroke-width: 2; }
+.edge-midi   { stroke: var(--midi)  !important; }
+.edge-audio  { stroke: rgb(20,80,20) !important; }
+.edge-mixed  { stroke: var(--av)    !important; }
+.edge-osc    { stroke: var(--osc)   !important; }
+.edge-dmx    { stroke: var(--dmx)   !important; }
+.edge-artnet { stroke: var(--artnet) !important; }
+.edge-mqtt   { stroke: var(--mqtt)  !important; }
+.edge-udp    { stroke: var(--udp)   !important; }
+.edge-value  { stroke: var(--value) !important; }
+/* v0.0.934 — a selected wire shows it (the colours above override
+   ReactFlow's own selected stroke) */
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke-width: 3.5 !important;
+  filter: var(--wire-selection);
+}
+
+/* Connection line while dragging */
+.react-flow__connection-path { stroke: var(--accent); stroke-width: 2; stroke-dasharray: 6 3; }
+
+/* ── Scrollbar ────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ── Checkboxes ───────────────────────────────────────────────────────────── */
+input[type="checkbox"],
+input[type="checkbox"]:not([disabled]) {
+  appearance: none !important;
+  -webkit-appearance: none !important;
+  width: 13px !important;
+  height: 13px !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 3px !important;
+  background: var(--surface) !important;
+  cursor: pointer;
+  position: relative;
+  flex-shrink: 0;
+  transition: background 0.15s, border-color 0.15s;
+  display: inline-block;
+  vertical-align: middle;
+}
+input[type="checkbox"]:checked,
+input[type="checkbox"]:checked:not([disabled]) {
+  background: var(--accent) !important;
+  border-color: var(--accent) !important;
+}
+input[type="checkbox"]:checked::after {
+  content: '';
+  position: absolute;
+  left: 3px;
+  top: 0px;
+  width: 5px;
+  height: 8px;
+  border: 2px solid var(--bg);
+  border-top: none;
+  border-left: none;
+  transform: rotate(45deg);
+}
+input[type="checkbox"]:hover {
+  border-color: var(--accent) !important;
+}
+
+/* ── Range sliders — rectangular console style ───────────────────────────── */
+input[type="range"] {
+  appearance: none !important;
+  -webkit-appearance: none !important;
+  background: transparent;
+  cursor: pointer;
+}
+
+/* Track */
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  background: var(--border);
+  border-radius: 0;        /* rectangular */
+}
+input[type="range"]::-moz-range-track {
+  height: 4px;
+  background: var(--border);
+  border-radius: 0;
+}
+
+/* Thumb — rectangular fader cap */
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 10px;
+  height: 18px;
+  background: var(--thumb-color, var(--text-dim));
+  border: 1px solid var(--border-hi);
+  border-radius: 2px;      /* slightly rounded rectangular */
+  margin-top: -7px;        /* centre on track */
+  transition: background 0.1s;
+}
+input[type="range"]::-moz-range-thumb {
+  width: 10px;
+  height: 18px;
+  background: var(--text-dim);
+  border: 1px solid var(--border-hi);
+  border-radius: 2px;
+  border: none;
+}
+input[type="range"]:hover::-webkit-slider-thumb {
+  background: var(--text);
+}
+input[type="range"]:active::-webkit-slider-thumb {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Vertical sliders (writing-mode: vertical-lr) */
+input[type="range"][style*="vertical"] {
+  padding: 0;
+}
+input[type="range"][style*="vertical"]::-webkit-slider-runnable-track {
+  width: 4px;
+  height: 100%;
+}
+input[type="range"][style*="vertical"]::-webkit-slider-thumb {
+  width: 18px;
+  height: 10px;
+  margin-top: 0;
+  margin-left: -7px;
+}
+
+/* ── Dual-handle range slider (AudioFreqToDmxNode's Freq Band control) ──────
+   Two <input type="range"> stacked absolutely over each other, same track.
+   The base element (and its track) is click-through; only each slider's own
+   thumb is interactive, so a click always lands on the nearest handle
+   instead of always hitting whichever input is on top in the DOM.
+   Only the SECOND (last-child) input's own track is hidden — both were
+   transparent in an earlier draft, which meant neither rail ever rendered
+   at all. The first input's track keeps the normal visible styling. */
+.dual-range input[type="range"] {
+  position: absolute;
+  pointer-events: none;
+}
+.dual-range input[type="range"]:last-child::-webkit-slider-runnable-track {
+  background: transparent;
+}
+.dual-range input[type="range"]:last-child::-moz-range-track {
+  background: transparent;
+}
+.dual-range input[type="range"]::-webkit-slider-thumb {
+  pointer-events: auto;
+}
+.dual-range input[type="range"]::-moz-range-thumb {
+  pointer-events: auto;
+}
+
+/* ── ReactFlow controls + attribution ────────────────────────────────────── */
+.react-flow__controls {
+  background: var(--surface) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius) !important;
+  box-shadow: var(--shadow-node) !important;
+}
+.react-flow__controls-button {
+  background: transparent !important;
+  border-bottom: 1px solid var(--border) !important;
+  color: var(--text-dim) !important;
+  fill: var(--text-dim) !important;
+}
+.react-flow__controls-button:hover {
+  background: var(--surface2) !important;
+  fill: var(--text) !important;
+}
+.react-flow__attribution {
+  background: var(--surface) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius) !important;
+  padding: 2px 8px !important;
+}
+.react-flow__attribution a {
+  color: var(--text-muted) !important;
+  font-size: 9px !important;
+  text-decoration: none !important;
+}
+.react-flow__attribution a:hover {
+  color: var(--text) !important;
+}

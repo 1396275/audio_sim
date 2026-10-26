@@ -1,0 +1,380 @@
+#include "PatchyProcessor.h"
+#include "PatchyEditor.h"
+#include "DiagLog.h"
+
+PatchyEditor::~PatchyEditor()
+{
+    diagLog ("PatchyEditor: window closed");   // v0.0.919 — lifecycle visibility (hosts)
+    static_cast<PatchyProcessor&> (processor).setEditorOpen (false);   // v0.0.919 — see setEditorOpen()
+}
+
+PatchyEditor::PatchyEditor (PatchyProcessor& p)
+    : AudioProcessorEditor (&p),
+      bridge (p.getGraphModel(), &p.getRegistry(),
+               [&p](const juce::String& nodeId, const juce::String& devId)
+               { p.setMidiDevice (nodeId, devId); },
+               [&p](const juce::String& nodeId, const juce::String& devName)
+               { p.setAudioDevice (nodeId, devName); },
+               [&p]() { return p.drainAllMidiMonitorEvents(); },
+               [&p]() { return p.getAudioSnapshots(); },
+               [&p]() { p.clearGraphTrash(); },
+               [&p]() { return p.getPortActivity(); },
+               [&p](const juce::String& nid, uint8_t s, uint8_t d1, uint8_t d2)
+               { p.pushMidiKeyEvent (nid, s, d1, d2); },
+               [&p](const juce::String& nid, const juce::String& name)
+               { p.setNodeCustomName (nid, name); },
+               [&p](const juce::String& nid, int idx, float val)
+               { p.setPaxParameter (nid, idx, val); },
+               // New graph
+               [&p]() { p.newGraph(); },
+               // Load graph from JSON
+               [&p](const juce::String& json) { p.loadGraphFromJson (json); })
+{
+    bridge.getHardwareSampleRate = [&p]() { return p.getAudioDeviceManager().getTargetSampleRate(); };
+    bridge.getSpectrumSnapshots      = [&p]() { return p.getSpectrumSnapshots(); };
+    bridge.getWelchSnapshots         = [&p]() { return p.getWelchSnapshots(); };
+    p.resetWelchSnapshots();
+    bridge.getAudioPlayerStatuses    = [&p]() { return p.getAudioPlayerStatuses(); };
+    bridge.getPendingAudioPlayerFileLoads = [&p]() { return p.collectPendingAudioPlayerFileLoads(); };
+    bridge.onGetPaxAudioOutCount   = [&p](const juce::String& nid) { return p.getPaxAudioOutCount (nid); };
+    bridge.onPrunePaxEdges         = [&p](const juce::String& nid) { p.pruneProcessingGraphEdges (nid); };
+    bridge.onSetAudioDeviceChannels  = [&p](const juce::String& nid, const std::vector<int>& ch)
+                                       { p.setAudioDeviceChannels (nid, ch); };
+    bridge.onSetUdpSettings          = [&p](const juce::String& nid, int port, int mode,
+                                            const juce::String& targetHost, const juce::String& multicastAddr)
+                                       { p.setUdpSettings (nid, port, mode, targetHost, multicastAddr); };
+    bridge.onSetOscSettings          = [&p](const juce::String& nid, int port,
+                                            const juce::String& targetHost, const juce::String& oscAddress)
+                                       { p.setOscSettings (nid, port, targetHost, oscAddress); };
+    bridge.onSetMqttSubscribeSettings = [&p](const juce::String& nid, const juce::String& host, int port,
+                                             const juce::String& topic, int qos,
+                                             const juce::String& username, const juce::String& password)
+                                       { p.setMqttSubscribeSettings (nid, host, port, topic, qos, username, password); };
+    bridge.onSetMqttPublishSettings   = [&p](const juce::String& nid, const juce::String& host, int port,
+                                             const juce::String& topic, int qos, bool retain,
+                                             const juce::String& username, const juce::String& password)
+                                       { p.setMqttPublishSettings (nid, host, port, topic, qos, retain, username, password); };
+    bridge.onMqttConsoleSend          = [&p](const juce::String& nid, const juce::String& topic, float payload)
+                                       { p.mqttConsoleSend (nid, topic, payload); };
+    bridge.onSetArtNetSettings       = [&p](const juce::String& nid, int universe,
+                                            const juce::String& targetHost)
+                                       { p.setArtNetSettings (nid, universe, targetHost); };
+    bridge.onSetDmxSettings          = [&p](const juce::String& nid, const juce::String& devicePath, int universe)
+                                       { p.setDmxSettings (nid, devicePath, universe); };
+    bridge.drainDmxSnapshots         = [&p]() { return p.drainAllDmxSnapshots(); };
+    bridge.isHostPaused              = [&p]() { return p.isRunningIndependently(); };   // v0.0.919
+    bridge.getKeepRunning            = [&p]() { return p.getKeepRunningWhenHostPaused(); };   // v0.0.919
+    bridge.setKeepRunning            = [&p] (bool on) { p.setKeepRunningWhenHostPaused (on); };
+    bridge.drainOscMonitor           = [&p]() { return p.drainAllOscMonitorEvents(); };
+    bridge.drainUdpMonitor           = [&p]() { return p.drainAllUdpMonitorEvents(); };
+    bridge.drainMqttMonitor          = [&p]() { return p.drainAllMqttMonitorEvents(); };
+    bridge.onSetDmxConsoleChannel    = [&p](const juce::String& nid, int channel, uint8_t value)
+                                       {
+                                           auto* node = p.getProcessingGraph().findDmxConsoleNode (nid);
+                                           if (!node && p.getPendingGraph())
+                                               node = p.getPendingGraph()->findDmxConsoleNode (nid);
+                                           if (node) node->setChannel (channel, value);
+                                           p.saveDmxConsoleChannels (nid);
+                                       };
+    bridge.onSetMidiChMatrixCell     = [&p](const juce::String& nid, int r, int c)
+                                       {
+                                           auto* node = p.getProcessingGraph().findMidiChMatrixNode (nid);
+                                           if (!node && p.getPendingGraph())
+                                               node = p.getPendingGraph()->findMidiChMatrixNode (nid);
+                                           if (node) node->toggleCell (r, c);
+                                           p.saveMidiChMatrixState (nid);
+                                       };
+    bridge.onSetMidiChMatrixGridSize = [&p](const juce::String& nid, int n)
+                                       {
+                                           auto* node = p.getProcessingGraph().findMidiChMatrixNode (nid);
+                                           if (!node && p.getPendingGraph())
+                                               node = p.getPendingGraph()->findMidiChMatrixNode (nid);
+                                           if (node) node->setGridSize (n);
+                                           p.saveMidiChMatrixState (nid);
+                                       };
+    bridge.onSetMidiChMatrixDropUnmapped = [&p](const juce::String& nid, bool drop)
+                                       {
+                                           auto* node = p.getProcessingGraph().findMidiChMatrixNode (nid);
+                                           if (!node && p.getPendingGraph())
+                                               node = p.getPendingGraph()->findMidiChMatrixNode (nid);
+                                           if (node) node->setDropUnmapped (drop);
+                                           p.saveMidiChMatrixState (nid);
+                                       };
+    bridge.onMidiChMatrixReset       = [&p](const juce::String& nid)
+                                       {
+                                           auto* node = p.getProcessingGraph().findMidiChMatrixNode (nid);
+                                           if (!node && p.getPendingGraph())
+                                               node = p.getPendingGraph()->findMidiChMatrixNode (nid);
+                                           if (node) node->resetToDefault();
+                                           p.saveMidiChMatrixState (nid);
+                                       };
+    bridge.onSetLearnArm             = [&p](const juce::String& nid, bool on)   // v0.0.929
+                                       {
+                                           if (auto* n = p.getProcessingGraph().findNode (nid)) n->armLearn (on);
+                                           if (auto* pg = p.getPendingGraph())
+                                               if (auto* n = pg->findNode (nid)) n->armLearn (on);
+                                       };
+    bridge.onNodeSettingsChanged     = [&p](const juce::String& nid, const juce::String& json)   // v0.0.925
+                                       {
+                                           p.applyMidiMorpherSettings (nid, json);
+                                           p.applyAudioSourceSettings (nid, json);
+                                       };
+    bridge.onSetMidiOutDeviceChannelFilter = [&p](const juce::String& nid, std::uint16_t mask)
+                                       {
+                                           auto* node = p.getProcessingGraph().findMidiOutDeviceNode (nid);
+                                           if (!node && p.getPendingGraph())
+                                               node = p.getPendingGraph()->findMidiOutDeviceNode (nid);
+                                           if (node) node->setChannelFilter (mask);
+                                           p.saveMidiOutDeviceChannelFilter (nid);
+                                       };
+    // AudioPlayerNode's own controls — all operate directly on the shared,
+    // persistent AudioPlayerState (see AudioPlayerNode.h's own comment for
+    // why this differs from the DMX Console callback above, which needs
+    // the live node instance itself since setChannel() is a node method,
+    // not shared state).
+    bridge.onAudioPlayerLoadFile      = [&p, this](const juce::String& nid, const juce::String& filePath)
+                                       {
+                                           auto* state = p.getOrCreateAudioPlayerState (nid);
+                                           if (state == nullptr) return;
+                                           bool ok = false;
+                                           {
+                                               const juce::ScopedLock sourceLock (p.getCallbackLock());
+                                               ok = state->loadFile (juce::File (filePath), p.getLastSampleRate());
+                                           }
+                                           // The UI commits the new file path before the layout
+                                           // rebuild, so restoring an older path cannot undo this load.
+                                           if (ok) state->layoutDirty.store (true);
+
+                                           // Push the result back to the UI so React can update its own
+                                           // settingsJson (file name/path) — React owns settings
+                                           // persistence, this just tells it what actually loaded.
+                                           auto* result = new juce::DynamicObject();
+                                           result->setProperty ("nodeId", nid);
+                                           result->setProperty ("success", ok);
+                                           if (ok)
+                                           {
+                                               result->setProperty ("fileName", state->fileName);
+                                               result->setProperty ("filePath", filePath);
+                                               juce::Array<juce::var> peaksArr;
+                                               for (auto& pk : state->waveformPeaks)
+                                               {
+                                                   peaksArr.add (pk.first);
+                                                   peaksArr.add (pk.second);
+                                               }
+                                               result->setProperty ("peaks", peaksArr);
+                                               result->setProperty ("numSamples", (int) state->fileBuffer.getNumSamples());
+                                               result->setProperty ("sourceSampleRate", state->fileSampleRate);
+                                               result->setProperty ("sourceChannels", state->fileBuffer.getNumChannels());
+                                           }
+                                           bridge.pushToUI ("onAudioPlayerFileLoaded",
+                                                            juce::JSON::toString (juce::var (result), true));
+                                       };
+    bridge.onAudioPlayerRequestFileInfo = [&p, this](const juce::String& nid)
+                                       {
+                                           // A direct, immediate pull — not the periodic timer-based push
+                                           // (pushPendingAudioPlayerFileLoads) — added specifically to close
+                                           // a real race: a project reload's own restore-triggered load can
+                                           // fire that push before the frontend's own component has even
+                                           // mounted to listen for it, silently missing the one-shot event.
+                                           // The frontend calls this itself on mount instead, when it
+                                           // believes a file should already be loaded but has no peaks yet.
+                                           auto* state = p.getOrCreateAudioPlayerState (nid);
+                                           if (state == nullptr || state->fileBuffer.getNumSamples() == 0) return;
+
+                                           auto* result = new juce::DynamicObject();
+                                           result->setProperty ("nodeId", nid);
+                                           result->setProperty ("success", true);
+                                           result->setProperty ("fileName", state->fileName);
+                                           juce::Array<juce::var> peaksArr;
+                                           for (auto& pk : state->waveformPeaks)
+                                           {
+                                               peaksArr.add (pk.first);
+                                               peaksArr.add (pk.second);
+                                           }
+                                           result->setProperty ("peaks", peaksArr);
+                                           result->setProperty ("numSamples", (int) state->fileBuffer.getNumSamples());
+                                           result->setProperty ("sourceSampleRate", state->fileSampleRate);
+                                               result->setProperty ("sourceChannels", state->fileBuffer.getNumChannels());
+                                           bridge.pushToUI ("onAudioPlayerFileLoaded",
+                                                            juce::JSON::toString (juce::var (result), true));
+                                       };
+    bridge.onAudioPlayerSetPlaying    = [&p](const juce::String& nid, bool playing)
+                                       {
+                                           auto* state = p.getOrCreateAudioPlayerState (nid);
+                                           if (state) state->playing.store (playing, std::memory_order_relaxed);
+                                       };
+    bridge.onAudioPlayerSeek          = [&p](const juce::String& nid, double fraction)
+                                       {
+                                           auto* state = p.getOrCreateAudioPlayerState (nid);
+                                           if (state == nullptr) return;
+                                           int64_t numSamples = state->fileBuffer.getNumSamples();
+                                           if (numSamples <= 0) return;
+                                           int64_t target = (int64_t) (juce::jlimit (0.0, 1.0, fraction) * (double) numSamples);
+                                           state->seekRequest.store (target, std::memory_order_relaxed);
+                                       };
+    bridge.onAudioPlayerReturnToStart = [&p](const juce::String& nid)
+                                       {
+                                           auto* state = p.getOrCreateAudioPlayerState (nid);
+                                           if (state == nullptr) return;
+                                           state->seekRequest.store (0, std::memory_order_relaxed);
+                                           state->playing.store (false, std::memory_order_relaxed);
+                                       };
+    bridge.onAudioPlayerSetLiveParam  = [&p](const juce::String& nid, const juce::String& key, const juce::String& value)
+                                       { p.setAudioPlayerLiveParam (nid, key, value); };
+    bridge.onSetNodeDisabled          = [&p](const juce::String& nid, bool disabled)
+                                       {
+                                           auto* node = p.getProcessingGraph().findNode (nid);
+                                           if (!node && p.getPendingGraph())
+                                               node = p.getPendingGraph()->findNode (nid);
+                                           if (node) node->disabled = disabled;
+                                       };
+    bridge.onRestoreDmxConsoleChannels = [&p](const juce::String& nid, const juce::String& json)
+                                       { p.restoreDmxConsoleChannels (nid, json); };
+    bridge.onResetDmxConsoleChannels   = [&p](const juce::String& nid)
+                                       {
+                                           auto* node = p.getProcessingGraph().findDmxConsoleNode (nid);
+                                           if (!node && p.getPendingGraph())
+                                               node = p.getPendingGraph()->findDmxConsoleNode (nid);
+                                           if (node) node->resetChannels();
+                                       };
+    bridge.onSetDmxBlackout          = [&p](const juce::String& nid, bool active)
+                                       {
+                                           auto* node = p.getProcessingGraph().findDmxConsoleNode (nid);
+                                           if (!node && p.getPendingGraph())
+                                               node = p.getPendingGraph()->findDmxConsoleNode (nid);
+                                           if (node) node->setBlackout (active);
+                                       };
+    bridge.onRestoreDmxBlackout      = [&p](const juce::String& nid, bool active)
+                                       {
+                                           auto* node = p.getProcessingGraph().findDmxConsoleNode (nid);
+                                           if (!node && p.getPendingGraph())
+                                               node = p.getPendingGraph()->findDmxConsoleNode (nid);
+                                           if (node) node->restoreBlackout (active);
+                                       };
+
+    // ── ArtNet Console callbacks (mirrors DMX Console pattern) ────────────────
+    bridge.drainArtNetSnapshots        = [&p]() { return p.drainAllArtNetSnapshots(); };
+    bridge.onSetArtNetConsoleChannel   = [&p](const juce::String& nid, int channel, uint8_t value)
+                                       {
+                                           auto* node = p.getProcessingGraph().findArtNetConsoleNode (nid);
+                                           if (!node && p.getPendingGraph())
+                                               node = p.getPendingGraph()->findArtNetConsoleNode (nid);
+                                           if (node) node->setChannel (channel, value);
+                                           p.saveArtNetConsoleChannels (nid);
+                                       };
+    bridge.onRestoreArtNetConsoleChannels = [&p](const juce::String& nid, const juce::String& json)
+                                       { p.restoreArtNetConsoleChannels (nid, json); };
+    bridge.onResetArtNetConsoleChannels   = [&p](const juce::String& nid)
+                                       {
+                                           auto* node = p.getProcessingGraph().findArtNetConsoleNode (nid);
+                                           if (!node && p.getPendingGraph())
+                                               node = p.getPendingGraph()->findArtNetConsoleNode (nid);
+                                           if (node) node->resetChannels();
+                                       };
+    bridge.onSetArtNetBlackout         = [&p](const juce::String& nid, bool active)
+                                       {
+                                           auto* node = p.getProcessingGraph().findArtNetConsoleNode (nid);
+                                           if (!node && p.getPendingGraph())
+                                               node = p.getPendingGraph()->findArtNetConsoleNode (nid);
+                                           if (node) node->setBlackout (active);
+                                       };
+    bridge.onRestoreArtNetBlackout     = [&p](const juce::String& nid, bool active)
+                                       {
+                                           auto* node = p.getProcessingGraph().findArtNetConsoleNode (nid);
+                                           if (!node && p.getPendingGraph())
+                                               node = p.getPendingGraph()->findArtNetConsoleNode (nid);
+                                           if (node) node->restoreBlackout (active);
+                                       };
+    bridge.onSetArtNetUniverseFilter   = [&p](const juce::String& nid, int filter)
+                                       {
+                                           auto* node = p.getProcessingGraph().findArtNetMonitorNode (nid);
+                                           if (!node && p.getPendingGraph())
+                                               node = p.getPendingGraph()->findArtNetMonitorNode (nid);
+                                           if (node) node->setUniverseFilter (filter);
+                                       };
+    diagLog ("PatchyEditor: window opened");   // v0.0.919 — lifecycle visibility (hosts)
+    p.setEditorOpen (true);                    // v0.0.919 — see PatchyProcessor::setEditorOpen()
+    addAndMakeVisible (bridge);
+    // v0.0.920 (2026-10-02) — resizing in plugin hosts. Logic gives AU
+    // windows no resize handle, and JUCE's own corner grip (tried in 919) is
+    // drawn UNDER the WebView, which covers the whole window — it could never
+    // be grabbed. The grip now lives in the web UI (bottom-right, plugin
+    // builds only) and sends "resizeEditor" → setSize() below; hosts follow
+    // the plugin's new size. The last size is saved with the project
+    // (PatchyProcessor::setEditorSize()). Default 900×600 for plugins
+    // (1100×720 was too big for a MacBook Air screen); the Standalone keeps
+    // resizing through its own window, as before.
+    const bool isPlugin = p.wrapperType != juce::AudioProcessor::wrapperType_Standalone;
+    // Read the remembered size BEFORE setResizeLimits(): with no size yet, it
+    // snaps the window to the 480×320 minimum, whose resized() used to
+    // overwrite the remembered size before it was read (user: size not kept).
+    const int savedW = p.getEditorWidth(), savedH = p.getEditorHeight();
+    setResizable (true, false);
+    setResizeLimits (480, 320, 8192, 8192);
+    if (isPlugin)
+        setSize (savedW > 0 ? savedW : 900, savedH > 0 ? savedH : 600);
+    else
+        setSize (640, 400);
+    sizeRestored = true;   // from now on, resized() remembers the size
+    bridge.resizeEditor = [this] (int w, int h)   // v0.0.920 — from the web UI's grip
+    {
+        setSize (juce::jlimit (480, 8192, w), juce::jlimit (320, 8192, h));
+    };
+    bridge.loadUI();
+}
+
+void PatchyEditor::paint (juce::Graphics& g)
+{
+    g.fillAll (juce::Colour (0xff0d0f14));
+}
+
+void PatchyEditor::resized()
+{
+    bridge.setBounds (getLocalBounds());
+    // v0.0.920 — remember the plugin window size (saved with the project).
+    auto& p = static_cast<PatchyProcessor&> (processor);
+    if (sizeRestored && p.wrapperType != juce::AudioProcessor::wrapperType_Standalone)
+        p.setEditorSize (getWidth(), getHeight());
+}
+
+bool PatchyEditor::keyPressed (const juce::KeyPress& key, juce::Component*)
+{
+    const bool cmd   = key.getModifiers().isCommandDown();
+    const bool shift = key.getModifiers().isShiftDown();
+
+    // Escape: forward to WebView so React ghost mode can cancel
+    if (key.getKeyCode() == juce::KeyPress::escapeKey)
+    {
+        bridge.pushToUI ("onKeyEvent", "\"Escape\"");
+        return false;  // don't consume — let WebView handle it too
+    }
+
+    if (! cmd) return false;
+
+    // Phase 6 rename fix, 2026-09-25 — while a UI text field has focus,
+    // Cmd+Z / Cmd+Shift+Z must not undo/redo the graph (it removed a
+    // just-dropped node while its name was being typed). Consumed and
+    // ignored here; graph undo works again as soon as the field loses focus.
+    if (key.getKeyCode() == 'Z' && bridge.isTextEditing())
+        return true;
+
+    if      (key.getKeyCode() == 'N')              { bridge.handleFileNew();    return true; }
+    else if (key.getKeyCode() == 'O')              { bridge.handleFileOpen();   return true; }
+    else if (key.getKeyCode() == 'S' && ! shift)   { bridge.handleFileSave();   return true; }
+    else if (key.getKeyCode() == 'S' &&   shift)   { bridge.handleFileSaveAs(); return true; }
+    else if (key.getKeyCode() == 'Z' && ! shift)   { bridge.handleUndo(); return true; }
+    else if (key.getKeyCode() == 'Z' &&   shift)   { bridge.handleRedo(); return true; }
+    // v0.0.930 — ⌘G wrap the selected nodes, ⌘⇧G unwrap (the UI knows the selection)
+    else if (key.getKeyCode() == 'G' && ! shift)   { bridge.pushToUI ("onKeyEvent", "\"Wrap\"");   return true; }
+    else if (key.getKeyCode() == 'G' &&   shift)   { bridge.pushToUI ("onKeyEvent", "\"Unwrap\""); return true; }
+
+    return false;
+}
+
+void PatchyEditor::parentHierarchyChanged()
+{
+    // Register as key listener on the top-level window so we intercept
+    // shortcuts even when WebBrowserComponent has keyboard focus
+    if (auto* topLevel = getTopLevelComponent())
+        topLevel->addKeyListener (this);
+}

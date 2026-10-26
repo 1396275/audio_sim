@@ -1,0 +1,1227 @@
+/**
+ * NodeShared.tsx
+ *
+ * Shared hooks and components used across all Patchy node types.
+ * Eliminates duplicated boilerplate from MidiMonitorNode, AudioMonitorNode,
+ * MidiKeyboardNode and GenericNode.
+ */
+
+import ValueBox from './ValueBox';   // v0.0.943
+import { useCallback, useState, useEffect, useLayoutEffect, useContext, useRef } from 'react';
+import { Handle, Position, useReactFlow, useUpdateNodeInternals } from '@xyflow/react';
+import { Settings, X, Power, Pencil } from 'lucide-react';
+import { Bridge, PaxInfo } from './Bridge';
+import { HintContext, NODE_HINTS, BUTTON_HINTS } from './HintPanel';
+import { themeColor, useTheme } from './Theme';
+
+// Module-level Pax info map — populated (in App.tsx) when the Pax list
+// arrives from the backend. Stores the full PaxInfo entry per paxName
+// (not just params) so a placed node's colour auto-detection can look up
+// colourCategory — a per-Pax-*type* property (from the registry), not
+// per-node-*instance*. Lives here rather than in App.tsx or GenericNode.tsx
+// directly: both need it, and App.tsx already imports GenericNode to
+// register it as a node type, so declaring it in either would create a
+// circular import. NodeUtils.tsx is a shared, lower-level file both
+// already depend on safely.
+export const _paxInfoMap = new Map<string, PaxInfo>();
+
+// ── Resolve a CSS custom property to its actual computed value ────────────────
+// Needed anywhere a colour has to be combined with something CSS's own
+// var() syntax can't do alone — concatenating a hex-alpha suffix (e.g.
+// `${accent}44` for a translucent tint), or handing a colour to Canvas 2D,
+// which can't resolve CSS custom properties at all. `var(--x)` on its own
+// works fine directly in a style object; the problem is specifically
+// string-concatenating anything onto it, which produces invalid CSS
+// (`var(--x)44` isn't parseable) that the browser silently drops rather
+// than erroring — no crash, just a missing tint/glow that's easy to miss.
+// First written for AudioToDmxNode.tsx's canvas rendering (2026-07-30);
+// extracted here (2026-08-12) after finding NodeSelect.tsx had the exact
+// same unresolved bug in its DOM styles — call this once per render and
+// reuse the result, not inline on every use, since getComputedStyle is a
+// real DOM read, not free.
+export function resolveCssColor (value: string, fallback: string = '#888888'): string {
+  if (!value.startsWith('var(')) return value;
+  const varName = value.slice(4, value.indexOf(')')).split(',')[0].trim();
+  const resolved = themeColor(varName);
+  return resolved || fallback;
+}
+
+export function useThemeColor(value: string, fallback?: string): string {
+  useTheme();
+  return resolveCssColor(value, fallback);
+}
+
+// ── Hybrid/Converter colour auto-detection ────────────────────────────────────
+// Rule agreed in conversation (see Architecture.md's "Per-port value typing
+// mechanism" entry for the full design story): compare the set of port
+// types on a node's input side against its output side. A type present on
+// only one side means the node is converting that type — Converter. If
+// every type mirrors on both sides: exactly one distinct type total gets
+// its own native colour; more than one gets Hybrid. Fully automatic from
+// the node's own declared ports — nothing a Pax author has to specify,
+// unless the node is a pure source or pure sink (nothing to compare input
+// against output at all) — the one case the rule genuinely can't resolve,
+// where colourCategory (from the registry, looked up via paxName) is
+// consulted instead.
+//
+// Exported (and living here, not in GenericNode.tsx) so both GenericNode.tsx
+// (placed nodes) and Sidebar.tsx (the pre-placement listing) can use the
+// exact same algorithm — moved here after finding the sidebar was still
+// colouring by a fixed per-paxType lookup, producing a real, visible
+// mismatch against a placed node's genuinely auto-detected colour.
+//
+// ArtNet and plain DMX share PortType::DMX internally (see the backend's
+// PaxValueType comment) — distinguished here the same way the backend
+// does, by label text, so they're treated as genuinely different types
+// for the mirroring comparison, not silently merged.
+function portGroupKey (p: { type: string; label: string }): string {
+  if (p.type === 'dmx' && p.label.toLowerCase().startsWith ('artdmx')) return 'artnet';
+  return p.type;
+}
+
+const NATIVE_THEME_BY_KEY: Record<string, { accent: string; dim: string; glow: string }> = {
+  midi:   { accent: 'var(--midi)',    dim: 'var(--midi-dim)',    glow: 'var(--midi-glow)' },
+  audio:  { accent: 'var(--audio)',   dim: 'var(--audio-dim)',   glow: 'var(--audio-glow)' },
+  osc:    { accent: 'var(--osc)',     dim: 'var(--osc-dim)',     glow: 'var(--osc-glow)' },
+  dmx:    { accent: 'var(--dmx)',     dim: 'var(--dmx-dim)',     glow: 'var(--dmx-glow)' },
+  artnet: { accent: 'var(--artnet)',  dim: 'var(--artnet-dim)',  glow: 'var(--artnet-glow)' },
+  mqtt:   { accent: 'var(--mqtt)',    dim: 'var(--mqtt-dim)',    glow: 'var(--mqtt-glow)' },
+  udp:    { accent: 'var(--udp)',     dim: 'var(--udp-dim)',     glow: 'var(--udp-glow)' },
+  // Plain Generic Value gets its OWN native colour (--generic), distinct
+  // from --value, which is Converter's colour specifically — see
+  // index.css's --generic comment for why these can't share one colour.
+  value:  { accent: 'var(--generic)', dim: 'var(--generic-dim)', glow: 'var(--generic-glow)' },
+};
+
+const HYBRID_THEME    = { accent: 'var(--av)',    dim: 'var(--av-dim)',    glow: 'var(--av-glow)' };
+const CONVERTER_THEME = { accent: 'var(--value)', dim: 'var(--value-dim)', glow: 'var(--value-glow)' };
+
+// colourCategory override values — mirrors PAX_COLOURCAT_* in PaxAPI.h.
+// Only ever consulted for the pure-source/pure-sink case above; never a
+// general override, so it can't make an already-clear node's colour
+// misrepresent what it actually does.
+const COLOURCAT_THEME: Record<number, { accent: string; dim: string; glow: string }> = {
+  0: NATIVE_THEME_BY_KEY.midi,
+  1: NATIVE_THEME_BY_KEY.audio,
+  2: HYBRID_THEME,
+  3: CONVERTER_THEME,
+  4: NATIVE_THEME_BY_KEY.osc,
+  5: NATIVE_THEME_BY_KEY.dmx,
+  6: NATIVE_THEME_BY_KEY.mqtt,
+  7: NATIVE_THEME_BY_KEY.udp,
+  8: NATIVE_THEME_BY_KEY.artnet,
+};
+
+// colourCategory override values, as category KEYS (not theme objects) —
+// used by detectPaxCategoryKey below. 'generic' is deliberately its own
+// key, distinct from 'value' (portGroupKey's raw type string) — a node's
+// PORT can be type 'value' (generic), but the node's overall CATEGORY,
+// once detected as a single mirrored generic type, is called 'generic'
+// throughout the UI (sidebar section name, tag word) to avoid confusion
+// with 'value' meaning something more specific elsewhere.
+const COLOURCAT_KEY: Record<number, string> = {
+  0: 'midi', 1: 'audio', 2: 'hybrid', 3: 'converter',
+  4: 'osc', 5: 'dmx', 6: 'mqtt', 7: 'udp', 8: 'artnet',
+};
+
+/** The single source of truth for Hybrid-vs-Converter-vs-native-type
+ * detection — returns one of: midi, audio, hybrid, converter, osc, dmx,
+ * artnet, mqtt, udp, generic. detectPaxTheme, detectPaxTagPrefix, and
+ * Sidebar.tsx's section grouping all derive from this one function
+ * rather than each re-implementing the same input/output-set comparison —
+ * refactored into this shape while fixing the sidebar's section grouping
+ * to match a node's actual detected category instead of its raw
+ * (pre-detection) paxType. */
+export function detectPaxCategoryKey (
+  ports: { type: string; label: string; direction: string }[],
+  colourCategory: number | undefined
+): string {
+  const inputKeys  = new Set (ports.filter (p => p.direction === 'input').map (portGroupKey));
+  const outputKeys = new Set (ports.filter (p => p.direction === 'output').map (portGroupKey));
+  const allKeys     = new Set ([...inputKeys, ...outputKeys]);
+  const isPureSourceOrSink = inputKeys.size === 0 || outputKeys.size === 0;
+
+  const asCategoryKey = (k: string) => (k === 'value' ? 'generic' : k);
+
+  if (isPureSourceOrSink) {
+    if (colourCategory !== undefined && colourCategory >= 0 && COLOURCAT_KEY[colourCategory])
+      return COLOURCAT_KEY[colourCategory];
+    if (allKeys.size === 1) return asCategoryKey ([...allKeys][0]);
+    return 'hybrid';
+  }
+
+  const allMirror = [...allKeys].every (k => inputKeys.has (k) && outputKeys.has (k));
+  if (! allMirror) return 'converter';
+  if (allKeys.size === 1) return asCategoryKey ([...allKeys][0]);
+  return 'hybrid';
+}
+
+const THEME_BY_CATEGORY_KEY: Record<string, { accent: string; dim: string; glow: string }> = {
+  midi: NATIVE_THEME_BY_KEY.midi, audio: NATIVE_THEME_BY_KEY.audio,
+  osc: NATIVE_THEME_BY_KEY.osc, dmx: NATIVE_THEME_BY_KEY.dmx,
+  artnet: NATIVE_THEME_BY_KEY.artnet, mqtt: NATIVE_THEME_BY_KEY.mqtt,
+  udp: NATIVE_THEME_BY_KEY.udp, generic: NATIVE_THEME_BY_KEY.value,
+  hybrid: HYBRID_THEME, converter: CONVERTER_THEME,
+};
+
+export function detectPaxTheme (
+  ports: { type: string; label: string; direction: string }[],
+  colourCategory: number | undefined
+): { accent: string; dim: string; glow: string } {
+  return THEME_BY_CATEGORY_KEY[detectPaxCategoryKey (ports, colourCategory)] ?? HYBRID_THEME;
+}
+
+// Converter has no prefix — the fuchsia colour already conveys "this
+// converts"; unlike the type-specific prefixes below, a "CONVERTER" word
+// adds width without adding information the colour doesn't already carry.
+const TAG_PREFIX_BY_CATEGORY_KEY: Record<string, string> = {
+  midi: 'MIDI', audio: 'AUDIO', hybrid: 'HYBRID', converter: '',
+  osc: 'OSC', dmx: 'DMX', artnet: 'ARTNET', mqtt: 'MQTT', udp: 'UDP',
+  generic: 'VALUE',
+};
+
+export function detectPaxTagPrefix (
+  ports: { type: string; label: string; direction: string }[],
+  colourCategory: number | undefined
+): string {
+  const key = detectPaxCategoryKey (ports, colourCategory);
+  return TAG_PREFIX_BY_CATEGORY_KEY[key] ?? 'PLUGIN';
+}
+
+
+// ── NodeHandle ───────────────────────────────────────────────────────────────
+/**
+ * Standard port handle with consistent sizing and styling.
+ * colour: e.g. 'var(--midi)' or 'var(--audio)'
+ */
+// ── Port anchors — v0.0.918 (2026-09-29) ─────────────────────────────────────
+// Phase 6 "Port alignment pass". A port can be anchored to any element inside
+// its node: mark the element with data-port-anchor="<name>" and pass
+// anchor="<name>" to NodeHandle; the port then sits on that element's vertical
+// centre, whatever the node's layout, zoom, collapsed sections or content.
+// Several ports on one anchor are spread 14 px apart around its centre
+// (index/total), the same spacing the offset path uses — or, with
+// anchorSpread="down", downwards from the anchor (first port on it), for
+// nodes whose anchor is their first row.
+// data-port-anchor-first="<name>" on an element anchors <name> to that
+// element's CURRENT first child (a body whose first row varies with state).
+//
+// Performance (agreed 2026-09-25): ONE ResizeObserver per node (not one per
+// port), observing the node element and its anchors; measurements batched in a
+// single requestAnimationFrame; re-measured only when an observed size
+// changes, never per render. Torn down when the node's last anchored port
+// unmounts. Positions are relative to the handles' offsetParent (what a
+// handle's `top` is resolved against), border excluded, zoom removed.
+type AnchorSubscriber = (positions: Map<string, number>) => void;
+interface NodeAnchorEntry {
+  observer:    ResizeObserver;
+  observed:    Set<Element>;
+  subscribers: Map<AnchorSubscriber, () => HTMLElement | null>;
+  positions:   Map<string, number>;
+  raf:         number;
+}
+const nodeAnchorRegistry = new Map<string, NodeAnchorEntry>();
+
+function measureNodeAnchors (nodeId: string) {
+  const entry = nodeAnchorRegistry.get(nodeId);
+  if (!entry) return;
+  entry.raf = 0;
+  let handleEl: HTMLElement | null = null;
+  for (const get of entry.subscribers.values()) { handleEl = get(); if (handleEl) break; }
+  const ref  = handleEl?.offsetParent as HTMLElement | null;
+  const node = handleEl?.closest('.react-flow__node') as HTMLElement | null;
+  if (!ref || !node) return;
+
+  // Pick up anchors that appeared since the last pass (expanded sections…).
+  if (!entry.observed.has(node)) { entry.observer.observe(node); entry.observed.add(node); }
+  const anchors: Array<[string, HTMLElement]> = [];
+  node.querySelectorAll<HTMLElement>('[data-port-anchor]').forEach(el => anchors.push([el.dataset.portAnchor!, el]));
+  node.querySelectorAll<HTMLElement>('[data-port-anchor-first]').forEach(el => {
+    const first = el.firstElementChild as HTMLElement | null;
+    if (first) anchors.push([el.dataset.portAnchorFirst!, first]);
+    if (!entry.observed.has(el)) { entry.observer.observe(el); entry.observed.add(el); }
+  });
+  anchors.forEach(([, el]) => { if (!entry.observed.has(el)) { entry.observer.observe(el); entry.observed.add(el); } });
+
+  const refRect = ref.getBoundingClientRect();
+  const scale   = ref.offsetHeight > 0 ? refRect.height / ref.offsetHeight : 1;   // canvas zoom
+  const next    = new Map<string, number>();
+  anchors.forEach(([name, el]) => {
+    const r = el.getBoundingClientRect();
+    if (r.height === 0 && r.width === 0) return;   // hidden
+    next.set(name, (r.top - refRect.top + r.height / 2) / scale - ref.clientTop);
+  });
+
+  let changed = next.size !== entry.positions.size;
+  if (!changed) for (const [k, v] of next) if (Math.abs((entry.positions.get(k) ?? NaN) - v) > 0.5) { changed = true; break; }
+  if (!changed) return;
+  entry.positions = next;
+  entry.subscribers.forEach((_, cb) => cb(next));
+}
+
+function subscribePortAnchors (nodeId: string, getHandle: () => HTMLElement | null, cb: AnchorSubscriber): () => void {
+  let entry = nodeAnchorRegistry.get(nodeId);
+  if (!entry) {
+    const created: NodeAnchorEntry = {
+      observer:    new ResizeObserver(() => {
+                     if (!created.raf) created.raf = requestAnimationFrame(() => measureNodeAnchors(nodeId));
+                   }),
+      observed:    new Set(),
+      subscribers: new Map(),
+      positions:   new Map(),
+      raf:         0,
+    };
+    nodeAnchorRegistry.set(nodeId, created);
+    entry = created;
+  }
+  entry.subscribers.set(cb, getHandle);
+  if (entry.positions.size) cb(entry.positions);
+  if (!entry.raf) entry.raf = requestAnimationFrame(() => measureNodeAnchors(nodeId));   // first pass
+  return () => {
+    const e = nodeAnchorRegistry.get(nodeId);
+    if (!e) return;
+    e.subscribers.delete(cb);
+    if (e.subscribers.size === 0) {
+      if (e.raf) cancelAnimationFrame(e.raf);
+      e.observer.disconnect();
+      nodeAnchorRegistry.delete(nodeId);
+    }
+  };
+}
+
+export function NodeHandle ({ nodeId, label, direction, colour, index = 0, total = 1, portBodyRef, portId, offset = 0, anchor, anchorSpread = 'centre' }: {
+  nodeId:       string;
+  label:        string;
+  direction:    'in' | 'out';
+  colour:       string;
+  index?:       number;
+  total?:       number;
+  portBodyRef?: React.RefObject<HTMLDivElement | null>;
+  portId?:      string;
+  offset?:      number;
+  anchor?:      string;   // v0.0.918 — see "Port anchors" above; takes precedence over portBodyRef/offset
+  anchorSpread?: 'centre' | 'down';   // v0.0.918 — several ports: around the anchor, or down from it
+}) {
+  const isInput = direction === 'in';
+  const [topVal, setTopVal] = useState<string>('50%');
+
+  useEffect(() => {
+    if (anchor) return;   // v0.0.918 — anchored ports are placed by the effect below
+    if (!portBodyRef?.current) { setTopVal('50%'); return; }
+    const measure = () => {
+      const el = portBodyRef.current;
+      if (!el) { setTopVal('50%'); return; }
+      // Place port 12px below the header (headerHeight = el.offsetTop)
+      const headerHeight = el.offsetTop;
+      const spacing      = total <= 1 ? 0 : 14 * index;
+      setTopVal(`${headerHeight + 12 + spacing + offset}px`);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(portBodyRef.current!);
+    return () => observer.disconnect();
+    // `offset` added 2026-09-25: a measured offset (Pax ports aligned to a
+    // slider rail, see GenericNode) arrives after the first render and must
+    // re-place the handle; before, only a body resize did.
+  }, [portBodyRef, portBodyRef?.current, total, index, offset, anchor]);
+
+  // v0.0.918 — anchored placement. Falls back to the node's centre while the
+  // anchor isn't in the DOM (collapsed node), like the offset path does.
+  const handleRef = useRef<HTMLDivElement>(null);
+  const [anchorTop, setAnchorTop] = useState<number | null>(null);
+  const updateNodeInternals = useUpdateNodeInternals();
+  useEffect(() => {
+    if (!anchor) { setAnchorTop(null); return; }
+    return subscribePortAnchors(nodeId, () => handleRef.current, positions => {
+      const y = positions.get(anchor);
+      const spread = total <= 1 ? 0
+                   : anchorSpread === 'down' ? index * 14
+                   : (index - (total - 1) / 2) * 14;
+      setAnchorTop(y === undefined ? null : Math.round(y + spread + offset));
+    });
+  }, [nodeId, anchor, anchorSpread, index, total, offset]);
+  useEffect(() => {
+    if (anchor) updateNodeInternals(nodeId);   // edges follow the moved handle
+  }, [anchor, anchorTop, nodeId, updateNodeInternals]);
+
+  const top = anchor ? (anchorTop === null ? '50%' : `${anchorTop}px`)
+                     : (portBodyRef ? topVal : '50%');
+
+  return (
+    <Handle
+      ref={handleRef}
+      type={isInput ? 'target' : 'source'}
+      position={isInput ? Position.Left : Position.Right}
+      id={portId ?? `${nodeId}_${label}_${direction}`}
+      style={{
+        background:  colour,
+        width:       10,
+        height:      10,
+        border:      '2px solid var(--bg)',
+        top,
+      }}
+    />
+  );
+}
+
+// ── Checkbox ─────────────────────────────────────────────────────────────────
+/**
+ * Custom checkbox — replaces native <input type="checkbox"> which ignores
+ * CSS overrides in JUCE's embedded WebKit.
+ */
+export function Checkbox ({ checked, onChange, label, accent = 'var(--text-dim)' }: {
+  checked:  boolean;
+  onChange: (v: boolean) => void;
+  label?:   string;
+  accent?:  string;
+}) {
+  return (
+    <label style={{ display: 'flex', alignItems: 'center', gap: 6,
+                    cursor: 'pointer', userSelect: 'none' }}
+           onPointerDown={e => e.stopPropagation()}
+           onClick={e => e.stopPropagation()}>
+      <div
+        onClick={() => onChange(!checked)}
+        style={{
+          width:        13,
+          height:       13,
+          border:       `1px solid ${checked ? accent : 'var(--border)'}`,
+          borderRadius: 3,
+          background:   checked ? accent : 'var(--surface)',
+          flexShrink:   0,
+          position:     'relative',
+          transition:   'background 0.15s, border-color 0.15s',
+        }}
+      >
+        {checked && (
+          <div style={{
+            position:      'absolute',
+            left:          3,
+            top:           0,
+            width:         5,
+            height:        8,
+            borderRight:   '2px solid var(--bg)',
+            borderBottom:  '2px solid var(--bg)',
+            transform:     'rotate(45deg)',
+          }} />
+        )}
+      </div>
+      {label && (
+        <span style={{ fontSize: 10, color: 'var(--text-dim)' }}>{label}</span>
+      )}
+    </label>
+  );
+}
+
+// ── useNodeSettings ───────────────────────────────────────────────────────────
+/** Persists settings panel open state across graph updates (survives undo/redo) */
+const _settingsOpen = new Map<string, boolean>();
+
+/**
+ * Manages settings panel open/close state, including elevating the node's
+ * z-index via ReactFlow's updateNode so the settings panel always appears
+ * above other nodes.
+ */
+export function useNodeSettings (id: string) {
+  const { updateNode } = useReactFlow();
+  const [showSettings, setShowSettings] = useState(() => _settingsOpen.get(id) ?? false);
+
+  const openSettings = useCallback(() => {
+    _settingsOpen.set(id, true);
+    setShowSettings(true);
+    updateNode(id, { style: { zIndex: 9999 } });
+  }, [id, updateNode]);
+
+  const closeSettings = useCallback(() => {
+    _settingsOpen.set(id, false);
+    setShowSettings(false);
+    updateNode(id, { style: { zIndex: undefined } });
+  }, [id, updateNode]);
+
+  const toggleSettings = useCallback(() => {
+    if (showSettings) closeSettings();
+    else              openSettings();
+  }, [showSettings, openSettings, closeSettings]);
+
+  return { showSettings, openSettings, closeSettings, toggleSettings };
+}
+
+// ── useNodeDelete ─────────────────────────────────────────────────────────────
+/**
+ * Returns a handleDelete callback that notifies the C++ bridge and removes
+ * the node from the ReactFlow graph.
+ */
+export function useNodeDelete (id: string) {
+  const { deleteElements } = useReactFlow();
+
+  const handleDelete = useCallback(() => {
+    Bridge.removeNode(id);
+    deleteElements({ nodes: [{ id }] });
+  }, [id, deleteElements]);
+
+  return { handleDelete };
+}
+
+// ── useNodeDisabled ───────────────────────────────────────────────────────────
+/**
+ * Disable/Enable feature, 2026-09-12. Unlike useNodeSettings' own showSettings
+ * (purely local, ephemeral UI state), `disabled` is genuine, backend-owned,
+ * persisted node data — already pushed as part of each node's own `data`
+ * (see RawNode.disabled, populated via the backend's own toVar()) — so this
+ * hook takes the CURRENT value as a parameter rather than managing its own
+ * state, and simply dispatches the toggle via the existing, generic
+ * Bridge.setNodeParam() rather than needing a brand-new, dedicated Bridge
+ * method.
+ */
+export function useNodeDisabled (id: string, disabled: boolean | undefined) {
+  const toggleDisabled = useCallback(() => {
+    Bridge.setNodeParam(id, 'disabled', disabled ? '0' : '1');
+  }, [id, disabled]);
+
+  return { disabled: !! disabled, toggleDisabled };
+}
+
+// ── useNodeCollapsed ─────────────────────────────────────────────────────────
+/**
+ * Manages collapsed/expanded state for a node.
+ * When collapsed, the node shrinks to just its header bar.
+ */
+export function useNodeCollapsed (id: string, forceCollapsed?: boolean) {
+  const { updateNode } = useReactFlow();
+  const updateNodeInternals = useUpdateNodeInternals();
+  const [collapsed, setCollapsed] = useState(false);
+
+  // Respond to global fold/unfold toggle
+  useEffect(() => {
+    if (forceCollapsed === undefined) return;
+    setCollapsed(forceCollapsed);
+    updateNode(id, { style: { height: forceCollapsed ? 'auto' : undefined } });
+    setTimeout(() => updateNodeInternals(id), 1);
+  }, [forceCollapsed]);
+
+  const toggleCollapsed = useCallback(() => {
+    setCollapsed(c => {
+      const next = !c;
+      updateNode(id, { style: { height: next ? 'auto' : undefined } });
+      setTimeout(() => updateNodeInternals(id), 1);
+      return next;
+    });
+  }, [id, updateNode, updateNodeInternals]);
+
+  return { collapsed, toggleCollapsed };
+}
+
+// ── NodeHeaderButton ──────────────────────────────────────────────────────────
+/**
+ * A small header button with consistent styling.
+ * Use `danger` for the delete button (red hover).
+ * Use `active` + `activeAccent` for toggle buttons (settings, pause etc.)
+ */
+export function NodeHeaderButton ({
+  onClick, title, active = false, activeAccent, danger = false, onHint, children,
+}: {
+  onClick:       () => void;
+  title?:        string;
+  active?:       boolean;
+  activeAccent?: string;
+  danger?:       boolean;
+  onHint?:       { onMouseEnter: () => void; onMouseLeave: () => void };
+  children:      React.ReactNode;
+}) {
+  const accent = activeAccent ?? 'var(--accent)';
+  return (
+    <button
+      onClick={onClick}
+      // v0.0.945 — two quick clicks on a header button are two clicks, never
+      // the header's double-click (which folds the node)
+      onDoubleClick={e => e.stopPropagation()}
+      title={title}
+      style={{
+        background:   active ? `color-mix(in srgb, ${accent} 20%, transparent)` : 'transparent',
+        border:       `1px solid ${active ? accent : 'var(--border)'}`,
+        borderRadius: 3,
+        color:        active ? accent : 'var(--text-muted)',
+        cursor:       'pointer',
+        fontSize:     19,
+        width:        22,
+        height:       22,
+        padding:      0,
+        display:      'flex',
+        alignItems:   'center',
+        justifyContent: 'center',
+        transition:   'color 0.15s, border-color 0.15s',
+      }}
+      onMouseEnter={e => {
+        const b = e.currentTarget;
+        if (danger) {
+          b.style.color       = 'var(--danger)';
+          b.style.borderColor = 'var(--danger)';
+        } else if (!active) {
+          b.style.color       = 'var(--text)';
+          b.style.borderColor = 'var(--border-hi)';
+        }
+        onHint?.onMouseEnter?.();
+      }}
+      onMouseLeave={e => {
+        const b = e.currentTarget;
+        b.style.color       = active ? accent : 'var(--text-muted)';
+        b.style.borderColor = active ? accent : 'var(--border)';
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+// ── nodeContainerStyle ────────────────────────────────────────────────────────
+/** Standard node container style — border, shadow, selection highlight. */
+export function nodeContainerStyle (
+  accent: string, selected: boolean,
+  opts?: { bg?: string; glow?: string; disabled?: boolean }
+): React.CSSProperties {
+  const bg   = opts?.bg   ?? 'var(--surface2)';
+  // FIXED (2026-08-12): opts.glow, when a caller provides one, is already
+  // safe to use as-is (GenericNode.tsx does, for example). The *default*
+  // used to concatenate a hex-alpha suffix directly onto accent — which
+  // every caller here passes as a raw CSS var() string — producing
+  // invalid CSS the browser silently dropped, same bug class as
+  // NodeSelect.tsx. resolveCssColor fixes it for every caller that relies
+  // on this default (AudioToDmxNode.tsx, EnvelopeNode.tsx,
+  // SpectrumyserNode.tsx), in one place.
+  const glow = opts?.glow ?? `${resolveCssColor(accent)}33`;
+  return {
+    background:   bg,
+    border:       `1px solid ${selected ? accent : 'var(--border)'}`,
+    borderTop:    `3px solid ${accent}`,
+    borderRadius: 'var(--radius)',
+    fontFamily:   "'JetBrains Mono', monospace",
+    boxShadow:    selected
+      ? `0 0 0 1px ${accent}, 0 8px 32px ${glow}`
+      : 'var(--shadow-node)',
+    // Disable/Enable feature, 2026-09-12 — a disabled node appears
+    // greyed out (desaturated + dimmed), same treatment regardless of
+    // which specific node component renders it, since this is applied
+    // centrally here rather than per-component.
+    filter:       opts?.disabled ? 'grayscale(0.8) opacity(0.55)' : 'none',
+    transition:   'box-shadow .15s, border-color .15s, filter .15s',
+    position:     'relative' as const,
+  };
+}
+
+// ── Shared style constants ────────────────────────────────────────────────────
+export const settingsPanelStyle: React.CSSProperties = {
+  padding: '8px 10px',
+  fontSize: 9,
+  color: 'var(--text)',
+  borderTop: '1px solid var(--border)',
+};
+
+export const sectionDividerStyle: React.CSSProperties = {
+  borderTop: '1px solid var(--border)',
+  marginTop: 4,
+  paddingTop: 4,
+};
+
+// ── NodeCollapseArrow ─────────────────────────────────────────────────────────
+/** Reusable collapse/expand arrow — used in all custom node headers. */
+export function NodeCollapseArrow ({ collapsed, accent }: { collapsed: boolean; accent: string }) {
+  return (
+    <span style={{ color: accent, opacity: 0.7, display: 'inline-block',
+      transform: collapsed ? 'rotate(0deg)' : 'rotate(90deg)',
+      transition: 'transform 0.2s' }}>
+      <svg width="8" height="10" viewBox="0 0 8 10" style={{ display: 'block' }}>
+        <polygon points="0,0 8,5 0,10" fill="currentColor" />
+      </svg>
+    </span>
+  );
+}
+
+// ── NodeHeader ────────────────────────────────────────────────────────────────
+/**
+ * Standard node header bar: title on the left, action buttons on the right.
+ * Pass extra buttons (pause, clear etc.) via the `children` slot — they appear
+ * between the title and the built-in settings + delete buttons.
+ */
+export function NodeHeader ({
+  title, accent, showSettings, onToggleSettings, onDelete, collapsed, onToggleCollapsed,
+  disabled, onToggleDisabled, children, rename, subtitle,
+}: {
+  title:              string;
+  // v0.0.926 — optional short muted text after the title (e.g. the MIDI
+  // Morpher's rule summary when folded). Not part of the editable name.
+  subtitle?:          string;
+  accent:             string;
+  // Optional since 2026-09-25 — a node with nothing left in its settings
+  // panel once the Name row moved to the header (MQTT Console) has no cog.
+  showSettings?:      boolean;
+  onToggleSettings?:  () => void;
+  // Phase 6 in-place rename, 2026-09-25 — when given, the title becomes an
+  // EditableTitle (pencil on hover). value = current custom name ('' = none).
+  rename?:            { value: string; placeholder: string; onCommit: (name: string) => void };
+  onDelete:           () => void;
+  collapsed?:         boolean;
+  onToggleCollapsed?: () => void;
+  // Disable/Enable feature, 2026-09-12 — both optional: a node that
+  // doesn't pass onToggleDisabled at all (the 3 Console node types, per
+  // the user's own explicit decision — they're only ever driven by
+  // direct manual interaction, so the feature doesn't apply) simply
+  // never renders this button.
+  disabled?:          boolean;
+  onToggleDisabled?:  () => void;
+  children?:          React.ReactNode;
+}) {
+  const { setHint } = useContext(HintContext);
+  const nodeHint = NODE_HINTS[title] ?? null;
+
+  return (
+    <div
+      onDoubleClick={onToggleCollapsed}
+      onMouseEnter={e => {
+        // Only set node hint if entering from outside the header (not from a child button)
+        if (!e.currentTarget.contains(e.relatedTarget as Node) && nodeHint)
+          setHint(nodeHint);
+      }}
+      onMouseLeave={e => {
+        // Only clear if leaving the header entirely (not moving to a child button)
+        if (!e.currentTarget.contains(e.relatedTarget as Node))
+          setHint(null);
+      }}
+      style={{
+        padding:        '6px 8px',
+        borderBottom:   collapsed ? 'none' : '1px solid var(--border)',
+        display:        'flex',
+        alignItems:     'center',
+        justifyContent: 'space-between',
+        gap:            4,
+        cursor:         onToggleCollapsed ? 'pointer' : 'default',
+        userSelect:     'none',
+      }}>
+      {/* Collapse indicator + Title */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+        {onToggleCollapsed && (
+          <span
+            onMouseEnter={() => setHint(BUTTON_HINTS.fold)}
+            onMouseLeave={() => setHint(null)}
+            style={{
+              fontSize:   14,
+              color:      accent,
+              opacity:    0.7,
+              transition: 'transform 0.2s',
+              display:    'inline-block',
+              transform:  collapsed ? 'rotate(0deg)' : 'rotate(90deg)',
+            }}>
+              <svg width="8" height="10" viewBox="0 0 8 10" style={{ display:'block' }}>
+                <polygon points="0,0 8,5 0,10" fill="currentColor" />
+              </svg>
+            </span>
+        )}
+        {rename ? (
+          <EditableTitle display={title} value={rename.value} placeholder={rename.placeholder}
+            onCommit={rename.onCommit}
+            textStyle={{ fontSize: 11, fontWeight: 700, color: accent, letterSpacing: '0.1em',
+                         fontFamily: "'Syne', sans-serif" }} />
+        ) : (
+          <div style={{
+            fontSize:     11,
+            fontWeight:   700,
+            color:        accent,
+            letterSpacing:'0.1em',
+            fontFamily:   "'Syne', sans-serif",
+          }}>
+            {title}
+          </div>
+        )}
+        {subtitle && (
+          <span title={subtitle} style={{ fontSize: 10, color: 'var(--text-dim)', whiteSpace: 'nowrap',
+                                          overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 180,
+                                          marginLeft: 4, fontFamily: "'JetBrains Mono', monospace" }}>
+            {subtitle}
+          </span>
+        )}
+      </div>
+
+      {/* Action buttons */}
+      <div style={{ display: 'flex', gap: 4 }}>
+        {/* Disable/Enable — only rendered for nodes that pass this in */}
+        {onToggleDisabled && (
+          <NodeHeaderButton
+            onClick={onToggleDisabled}
+            active={! disabled}
+            activeAccent={accent}
+            onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.toggleDisabled), onMouseLeave: () => setHint(null) }}
+          >
+            <Power size={14} />
+          </NodeHeaderButton>
+        )}
+
+        {/* Extra node-specific buttons (pause, clear, etc.) */}
+        {children}
+
+        {/* Settings — only when the node has a settings panel */}
+        {onToggleSettings && (
+          <NodeHeaderButton
+            onClick={onToggleSettings}
+            active={!! showSettings}
+            activeAccent={accent}
+            onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.settings), onMouseLeave: () => setHint(null) }}
+          >
+            <Settings size={14} />
+          </NodeHeaderButton>
+        )}
+
+        {/* Delete */}
+        <NodeHeaderButton onClick={onDelete} danger
+          onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.deleteNode), onMouseLeave: () => setHint(null) }}
+        >
+          <X size={14} />
+        </NodeHeaderButton>
+      </div>
+    </div>
+  );
+}
+
+// ── SettingsPanelHeader ───────────────────────────────────────────────────────
+/**
+ * Reusable header row for settings panels — title + R (reset) + ✕ (close) buttons.
+ */
+export function SettingsPanelHeader ({ title, onReset, onClose }: {
+  title:   string;
+  onReset: () => void;
+  onClose: () => void;
+}) {
+  const { setHint } = useContext(HintContext);
+  return (
+    <div style={{ display: 'flex', justifyContent: 'space-between',
+                  alignItems: 'center', marginBottom: 8 }}>
+      <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.1em',
+                     color: 'var(--text-muted)', textTransform: 'uppercase' }}>
+        {title}
+      </span>
+      <div style={{ display: 'flex', gap: 4 }}>
+        <NodeHeaderButton onClick={onReset}
+          onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.reset), onMouseLeave: () => setHint(null) }}><span style={{ fontSize: 11, fontWeight: 700 }}>R</span></NodeHeaderButton>
+        <NodeHeaderButton onClick={onClose} danger
+          onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.close), onMouseLeave: () => setHint(null) }}><X size={13} /></NodeHeaderButton>
+      </div>
+    </div>
+  );
+}
+
+// ── EditableTitle ───────────────────────────────────────────────────────────
+// Phase 6 "universal, persistent node rename" — in-place version, 2026-09-25.
+// Replaces the earlier settings-panel "Name" rows (NameField), at the user's
+// request: renaming now happens directly in the header. Shows the title; a
+// small pencil appears on hover; clicking it turns the title into a field
+// right where it is. Enter or clicking away commits (one undo step, via the
+// caller's own onCommit); Escape cancels without committing. Chosen over
+// Cmd+Click (already ReactFlow's multi-select) and double-click (already
+// fold/unfold). Every pointer/double-click event on the pencil and the field
+// is stopped, so neither drags the node nor folds it.
+//
+// Escape: in the standalone app C++ (PatchyEditor::keyPressed) re-sends it as
+// a synthetic keydown on `window`, not on the field — both paths handled.
+// WebKit's autocomplete drop-down (which ate the first Escape) is off, both
+// here and app-wide (App.tsx).
+// Layout (user's requests, 2026-09-25): titles always show in UPPERCASE, on a
+// single line. The title area grows with its text up to TITLE_MAX_W (the node
+// grows with the header — nodes that used a fixed `width` now use `minWidth`).
+// A longer title is cut with an ellipsis at rest and, on hover, scrolls
+// slowly right-to-left in a continuous loop (marquee). The edit field is a
+// plain single-line input that grows up to TITLE_MAX_W, then scrolls natively.
+// (An intermediate 2-line version was dropped: editing behaved oddly.)
+const TITLE_MAX_W     = 200;
+const TITLE_MIN_W     = 60;
+const MARQUEE_GAP     = 40;    // px between the end of the text and its repeat
+const MARQUEE_SPEED   = 30;    // px per second
+let _titleMeasureCanvas: HTMLCanvasElement | null = null;   // shared, for text measurement
+
+export function EditableTitle ({ display, value, placeholder, onCommit, textStyle }: {
+  display:     string;                  // what the header shows (custom name or default title)
+  value:       string;                  // the current CUSTOM name ('' = none)
+  placeholder: string;                  // default title, shown while the field is empty
+  onCommit:    (name: string) => void;  // persist the new custom name ('' = back to default)
+  textStyle:   React.CSSProperties;     // the header's own title typography
+}) {
+  const [editing,   setEditing]   = useState (false);
+  const [hover,     setHover]     = useState (false);
+  const [scrolling, setScrolling] = useState (false);
+  const [draft,     setDraft]     = useState (value);
+  const inputRef      = useRef<HTMLInputElement>(null);
+  const boxRef        = useRef<HTMLDivElement>(null);
+  const trackRef      = useRef<HTMLSpanElement>(null);
+  const skipCommitRef = useRef (false);
+
+  const start = () => { setDraft (value); skipCommitRef.current = false; setScrolling (false); setEditing (true); };
+  const commit = () => {
+    setEditing (false);
+    if (skipCommitRef.current) { skipCommitRef.current = false; return; }
+    const v = draft.trim();
+    if (v !== value) onCommit (v);
+  };
+  const cancel = () => { skipCommitRef.current = true; inputRef.current?.blur(); };
+
+  useEffect (() => {
+    if (! editing) return;
+    inputRef.current?.focus();
+    inputRef.current?.select();
+    const onWindowKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && document.activeElement === inputRef.current) cancel();
+    };
+    window.addEventListener ('keydown', onWindowKey);
+    return () => window.removeEventListener ('keydown', onWindowKey);
+  }, [editing]);
+
+  // Edit field width, from the text itself (or the placeholder when empty),
+  // uppercased and measured with a canvas using the field's own computed
+  // font + letter spacing — independent of the surrounding layout (an
+  // earlier layout-based measurement came back far too narrow).
+  useLayoutEffect (() => {
+    if (! editing) return;
+    const el = inputRef.current;
+    if (! el) return;
+    const cs  = getComputedStyle (el);
+    const ctx = (_titleMeasureCanvas ??= document.createElement ('canvas')).getContext ('2d');
+    if (! ctx) return;
+    ctx.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+    const text  = (draft || placeholder).toUpperCase();
+    const textW = ctx.measureText (text).width + (parseFloat (cs.letterSpacing) || 0) * text.length;
+    el.style.width = `${Math.min (TITLE_MAX_W, Math.max (TITLE_MIN_W, Math.ceil (textW) + 14))}px`;
+  }, [editing, draft, placeholder]);
+
+  // Hover marquee: only if the title actually overflows its box.
+  useEffect (() => {
+    if (editing || ! hover) { setScrolling (false); return; }
+    const box = boxRef.current;
+    setScrolling (!! box && box.scrollWidth > box.clientWidth + 1);
+  }, [hover, editing, display]);
+
+  // The scroll itself: the track holds the text twice (with a gap), and moves
+  // left by exactly one text + gap, looping — seamless, continuous.
+  useEffect (() => {
+    if (! scrolling) return;
+    const track = trackRef.current;
+    if (! track || typeof track.animate !== 'function') return;
+    const dist = (track.scrollWidth + MARQUEE_GAP) / 2;
+    const anim = track.animate (
+      [{ transform: 'translateX(0)' }, { transform: `translateX(-${dist}px)` }],
+      { duration: (dist / MARQUEE_SPEED) * 1000, iterations: Infinity, easing: 'linear' });
+    return () => anim.cancel();
+  }, [scrolling, display]);
+
+  const stop = (e: React.SyntheticEvent) => e.stopPropagation();
+  const caps: React.CSSProperties = { ...textStyle, textTransform: 'uppercase', whiteSpace: 'nowrap' };
+
+  if (editing)
+    return (
+      <input ref={inputRef} type="text" value={draft} placeholder={placeholder}
+        autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false}
+        className="nodrag nopan"
+        onMouseDown={stop} onPointerDown={stop} onDoubleClick={stop} onClick={stop}
+        onChange={e => setDraft (e.target.value)}
+        onBlur={commit}
+        onKeyDown={e => {
+          if (e.key === 'Enter')  { e.preventDefault(); inputRef.current?.blur(); }
+          if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancel(); }
+        }}
+        style={{ ...caps, background: 'var(--surface)', border: '1px solid var(--border-hi)',
+                 borderRadius: 3, outline: 'none', padding: '0 4px', margin: 0,
+                 width: TITLE_MIN_W, flexShrink: 0, boxSizing: 'border-box',
+                 // headers use userSelect:'none', which WebKit would apply
+                 // inside the field too (no selecting/placing the caret)
+                 userSelect: 'text', WebkitUserSelect: 'text', cursor: 'text' }} />
+    );
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}
+      onMouseEnter={() => setHover (true)} onMouseLeave={() => setHover (false)}>
+      <div ref={boxRef}
+        style={{ ...caps, overflow: 'hidden', minWidth: 0, maxWidth: TITLE_MAX_W,
+                 textOverflow: scrolling ? 'clip' : 'ellipsis' }}>
+        {scrolling ? (
+          <span ref={trackRef} style={{ display: 'inline-block', whiteSpace: 'nowrap', willChange: 'transform' }}>
+            {display}<span style={{ display: 'inline-block', width: MARQUEE_GAP }} />{display}
+          </span>
+        ) : display}
+      </div>
+      <span className="nodrag"
+        onMouseDown={stop} onPointerDown={stop} onDoubleClick={stop}
+        onClick={e => { e.stopPropagation(); start(); }}
+        title="Rename"
+        style={{ display: 'inline-flex', cursor: 'pointer', color: 'var(--text-muted)',
+                 opacity: hover ? 0.9 : 0, transition: 'opacity 0.15s', flexShrink: 0 }}>
+        <Pencil size={10} />
+      </span>
+    </div>
+  );
+}
+
+/** Phase 6 in-place rename, 2026-09-25 — onCommit for nodes whose name lives
+ *  in the graph model's own `customName` (all Pax + MIDI CH. Matrix; the
+ *  monitors/consoles keep theirs in settingsJson and pass their own commit).
+ *  One undoable step; setNodeLabel kept alongside as the old Pax rename did. */
+export function commitModelName (nodeId: string) {
+  return (name: string) => {
+    Bridge.setNodeCustomName (nodeId, name);
+    Bridge.setNodeLabel (nodeId, name);
+  };
+}
+
+// ── isLikelyCompleteHost ────────────────────────────────────────────────────
+// Checks whether a host string looks syntactically complete enough to be
+// worth attempting a connection to — either a valid IPv4 address, or a
+// hostname-shaped string with no leading/trailing/double dots. Deliberately
+// permissive on hostnames (can't fully validate without a real DNS lookup),
+// but this catches the overwhelmingly common case: partial states typed
+// character-by-character while entering an IP (e.g. "127.", "192.168.")
+// which would otherwise reach a blocking DNS resolution and freeze the whole
+// graph (confirmed upstream libmosquitto behaviour for MQTT — see
+// Architecture.md's MQTT locked decisions). Used by every {Protocol}DeviceUI
+// settings panel with a host-shaped field (UDP, OSC, MQTT, ArtNet).
+export function isLikelyCompleteHost(host: string): boolean {
+  if (!host) return false;
+  if (host.startsWith('.') || host.endsWith('.') || host.includes('..')) return false;
+
+  const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4Match) {
+    return ipv4Match.slice(1).every(octet => {
+      const n = parseInt(octet, 10);
+      return n >= 0 && n <= 255;
+    });
+  }
+
+  // Not a complete IPv4 shape — if it contains only digits and dots, it's
+  // a partial IP being typed (e.g. "127", "192.168"), not a hostname yet.
+  if (/^[\d.]+$/.test(host)) return false;
+
+  // Otherwise treat as a hostname-shaped string (e.g. "mybroker.local",
+  // "localhost") — permissive, since hostnames vary widely in valid form.
+  return true;
+}
+
+// ── portColour ───────────────────────────────────────────────────────────────
+// Maps a classified port type string (see App.tsx's getPortType/
+// colourForHandleId) to its display colour. Used as a fallback wherever a
+// port's type is known generically rather than via a specific protocol's
+// own accent colour.
+export function portColour (type: string): string {
+  switch (type) {
+    case 'audio': return 'rgb(20,80,20)';
+    case 'osc':   return 'var(--osc)';
+    case 'dmx':   return 'var(--dmx)';
+    case 'mqtt':  return 'var(--mqtt)';
+    case 'udp':   return 'var(--udp)';
+    case 'value': return 'var(--value)';
+    default:      return 'var(--midi)';
+  }
+}
+
+// ── Shared slider/stepper/dual-range controls ───────────────────────────────
+// Extracted from AudioToDmxNode.tsx (2026-08-26) so AudioPeakToOscNode.tsx
+// could reuse the same, already-proven dual-head frequency-range slider
+// rather than duplicate it — per the user's own explicit request. All three
+// were originally private to that one file; now shared here, matching this
+// file's own established role as the home for cross-node UI primitives.
+// Behaviour is unchanged from the originals — this is a pure relocation,
+// not a rewrite.
+
+const FREQ_MIN = 20, FREQ_MAX = 20000;
+export const freqLabel = (hz: number) =>
+  hz >= 1000 ? `${(hz / 1000).toFixed(2)}k` : `${Math.round(hz)}`;
+
+// v0.0.943 — a readable step for a slider without one (step 0 = "any"):
+// about 1/500 of the range, rounded to 1, 2 or 5 × a power of ten.
+export function niceStep (range: number): number {
+  const raw = range / 500;
+  if (raw <= 0) return 1;
+  const p = Math.pow (10, Math.floor (Math.log10 (raw)));
+  const m = raw / p;
+  return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p;
+}
+
+// ── Slider row — label on the left, matching EnvelopeNode's layout ──────────
+// v0.0.943 — the value on the right is a value box (drag / ⇧ fine / double-
+// click to type); `readout` replaces it when the slider isn't in the value's
+// own units (Envelope's log-mapped Hz).
+export function SliderRow({ label, value, min, max, step = 0, format, onChange, onDoubleClick, onCommit, color, log, readout }: {
+  label:         string;
+  value:         number;
+  min:           number;
+  max:           number;
+  step?:         number;
+  format:        (v: number) => string;
+  onChange:      (v: number) => void;
+  onDoubleClick: () => void;
+  onCommit?:     () => void;
+  color:         string;
+  log?:          boolean;
+  readout?:      React.ReactNode;
+}) {
+  const boxStep = step > 0 ? step : niceStep (max - min);
+  return (
+    <div className="nodrag" onMouseDown={e => e.stopPropagation()}
+      style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 3 }}>
+      <span style={{ color: 'var(--text-muted)', minWidth: 60, fontSize: 8 }}>{label}</span>
+      <input type="range" min={min} max={max} step={step === 0 ? 'any' : step}
+        value={value} className="nodrag"
+        onMouseDown={e => e.stopPropagation()}
+        onMouseUp={onCommit} onKeyUp={onCommit}
+        onDoubleClick={e => { e.stopPropagation(); onDoubleClick(); onCommit?.(); }}
+        onChange={e => onChange(parseFloat(e.target.value))}
+        style={{ flex: 1, ['--thumb-color' as any]: color }} />
+      {readout ?? (
+        <ValueBox value={value} min={min} max={max} step={boxStep} log={log} format={format} accent={color}
+          onLive={onChange} onCommit={v => { onChange(v); onCommit?.(); }}
+          width={46} style={readoutBoxStyle (color)} />
+      )}
+    </div>
+  );
+}
+
+// v0.0.943 — a slider's value box looks like the plain readout it replaces
+// (small, coloured, right-aligned) with a faint frame that shows it's live
+export const readoutBoxStyle = (color: string): React.CSSProperties => ({
+  fontSize: 8, color, textAlign: 'right', padding: '1px 3px',
+  border: `1px solid color-mix(in srgb, ${color} 25%, transparent)`, background: 'transparent',
+});
+
+// ── Number stepper — identical control to EnvelopeNode's CC Number/MIDI Ch ──
+// v0.0.943 — the number itself is now the shared value box (drag, ⇧ fine,
+// double-click to type); the − / + buttons stay where asked for.
+export function Stepper({ label, value, min, max, width = 28, color, buttons = false, log, onChange }: {
+  label:    string;
+  value:    number;
+  min:      number;
+  max:      number;
+  width?:   number;
+  color:    string;
+  buttons?: boolean;
+  log?:     boolean;
+  onChange: (v: number) => void;
+}) {
+  const colorHex = useThemeColor(color);
+  const btn = (text: string, v: number) => (
+    <div onClick={() => onChange(Math.max(min, Math.min(max, v)))}
+      onDoubleClick={e => e.stopPropagation()} style={{
+      width: 16, height: 16, display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: 'var(--surface)', borderRadius: 2, cursor: 'pointer', fontSize: 10,
+      color: 'var(--text-muted)', userSelect: 'none',
+    }}>{text}</div>
+  );
+  return (
+    <div className="nodrag" onDoubleClick={e => e.stopPropagation()}
+      style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 3 }}>
+      {label && <span style={{ color: 'var(--text-muted)', minWidth: 60, fontSize: 8 }}>{label}</span>}
+      <div style={{ display: 'flex', alignItems: 'center', gap: buttons ? 3 : 0 }}>
+        {buttons && btn('−', value - 1)}
+        <ValueBox value={value} min={min} max={max} log={log} accent={color}
+          onLive={onChange} onCommit={onChange} width={width + 6}
+          style={{ fontSize: 9, color, padding: '1px 2px', borderRadius: 2,
+                   border: `1px solid ${colorHex}44`, background: 'var(--surface)' }} />
+        {buttons && btn('+', value + 1)}
+      </div>
+    </div>
+  );
+}
+
+// ── Freq Band dual-handle slider ─────────────────────────────────────────────
+// One slider, two heads (Band Low / Band High), plus a Stepper at each
+// extremity that narrows the slider's own min/max span (a "zoom" window).
+// v0.0.943 — ⌘ / Ctrl + drag (a head or a Hz label) moves the WHOLE band,
+// keeping its width (same ratio); `log` places the heads proportionally (Hz);
+// without `onZoomChange` there are no zoom ends (Envelope).
+export function FreqBandDual({ bandLow, bandHigh, zoomMin, zoomMax, color, onBandChange, onBandSet, onZoomChange, onCommit, log = false }: {
+  bandLow:      number;
+  bandHigh:     number;
+  zoomMin:      number;
+  zoomMax:      number;
+  color:        string;
+  onBandChange: (which: 'low' | 'high', v: number) => void;
+  onBandSet?:   (low: number, high: number) => void;   // ⌘ + drag moves the whole band
+  onZoomChange?: (which: 'min' | 'max', v: number) => void;
+  onCommit:     () => void;
+  log?:         boolean;
+}) {
+  // Head position ↔ Hz: linear in the zoom window, or proportional (log)
+  const POS = 1000;
+  const toPos   = (hz: number) => log ? Math.log (Math.max (hz, zoomMin) / zoomMin) / Math.log (zoomMax / zoomMin) * POS
+                                      : (hz - zoomMin) / (zoomMax - zoomMin) * POS;
+  const fromPos = (p: number)  => Math.round (log ? zoomMin * Math.pow (zoomMax / zoomMin, p / POS)
+                                                  : zoomMin + p / POS * (zoomMax - zoomMin));
+  const pct = (hz: number) => `${Math.max (0, Math.min (100, toPos (hz) / POS * 100))}%`;
+
+  // the other edge follows by the same ratio; stops at the window's edges
+  const moveBand = (which: 'low' | 'high', v: number) => {
+    if (! onBandSet) return;
+    const r = which === 'low' ? v / bandLow : v / bandHigh;
+    let lo = bandLow * r, hi = bandHigh * r;
+    if (lo < zoomMin) { hi *= zoomMin / lo; lo = zoomMin; }
+    if (hi > zoomMax) { lo *= zoomMax / hi; hi = zoomMax; }
+    onBandSet (Math.round (Math.max (zoomMin, lo)), Math.round (Math.min (zoomMax, hi)));
+  };
+
+  // ⌘ held while dragging a head (read live: pressing it mid-drag moves the band from there)
+  const cmd = useRef (false);
+  useEffect (() => {
+    const k = (e: KeyboardEvent) => { if (e.key === 'Meta' || e.key === 'Control') cmd.current = e.type === 'keydown'; };
+    window.addEventListener ('keydown', k); window.addEventListener ('keyup', k);
+    return () => { window.removeEventListener ('keydown', k); window.removeEventListener ('keyup', k); };
+  }, []);
+  const head = (which: 'low' | 'high', v: number) => {
+    if (cmd.current && onBandSet) moveBand (which, v); else onBandChange (which, v);
+  };
+  const headDown = (e: React.MouseEvent) => { cmd.current = e.metaKey || e.ctrlKey; };
+
+  const label = (which: 'low' | 'high') => {
+    const lo = which === 'low';
+    return (
+      <span style={{
+        position: 'absolute', top: -12, zIndex: 2, left: pct (lo ? bandLow : bandHigh),
+        transform: lo ? 'translateX(calc(-100% - 3px))' : 'translateX(5px)', whiteSpace: 'nowrap',
+      }}>
+        <ValueBox value={lo ? bandLow : bandHigh} min={lo ? zoomMin : bandLow} max={lo ? bandHigh : zoomMax}
+          log format={freqLabel} accent={color}
+          onLive={v => onBandChange (which, v)} onCommit={v => { onBandChange (which, v); onCommit(); }}
+          onLinked={onBandSet && (v => moveBand (which, v))} linkKey="cmd" onRelease={onCommit}
+          linkMin={zoomMin} linkMax={zoomMax}
+          width="auto" style={{ ...readoutBoxStyle (color), textAlign: 'center', minWidth: 30 }} />
+      </span>
+    );
+  };
+
+  return (
+    <div className="nodrag" onMouseDown={e => e.stopPropagation()} style={{
+      marginBottom: 3, background: 'var(--surface)', border: '1px solid var(--border)',
+      borderRadius: 3, padding: '4px 6px 5px',
+    }}
+      title={onBandSet ? '⌘ + drag a head or a value: moves the whole band' : undefined}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 10 }}>
+        {onZoomChange && (
+          <Stepper label="" value={zoomMin} min={FREQ_MIN} max={zoomMax - 10} width={26} color={color} log
+            onChange={v => onZoomChange('min', v)} />
+        )}
+        <div className="dual-range" style={{ position: 'relative', flex: 1, height: 16 }}>
+          {label ('low')}
+          {label ('high')}
+          <input type="range" min={0} max={POS} step={1}
+            value={toPos (bandLow)}
+            onMouseDown={headDown}
+            onMouseUp={onCommit} onKeyUp={onCommit}
+            onChange={e => head ('low', fromPos (Number (e.target.value)))}
+            onDoubleClick={e => { e.stopPropagation(); onBandChange('low', 200); onCommit(); }}
+            style={{ width: '100%', top: 5, left: 0, ['--thumb-color' as any]: color }} />
+          <input type="range" min={0} max={POS} step={1}
+            value={toPos (bandHigh)}
+            onMouseDown={headDown}
+            onMouseUp={onCommit} onKeyUp={onCommit}
+            onChange={e => head ('high', fromPos (Number (e.target.value)))}
+            onDoubleClick={e => { e.stopPropagation(); onBandChange('high', 2000); onCommit(); }}
+            style={{ width: '100%', top: 5, left: 0, ['--thumb-color' as any]: color }} />
+        </div>
+        {onZoomChange && (
+          <Stepper label="" value={zoomMax} min={zoomMin + 10} max={FREQ_MAX} width={34} color={color} log
+            onChange={v => onZoomChange('max', v)} />
+        )}
+      </div>
+    </div>
+  );
+}

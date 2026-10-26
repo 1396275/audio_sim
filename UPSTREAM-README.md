@@ -1,0 +1,827 @@
+![Patchy](Assets/PatchyLogo.jpg)
+
+## About
+
+**Patchy** is a JUCE 8 VST3 / AU / Standalone node-graph audio/MIDI plugin with a React/ReactFlow UI served via `WebBrowserComponent`. It lets you build and connect audio and MIDI processing chains visually — in real time, inside your DAW or as a standalone application — and extend it with custom node types compiled as dynamic libraries (`.dylib` / `.so` / `.dll`) without recompiling the host.
+
+> Version 0.0.945
+
+---
+
+## Table of Contents
+
+<!-- TOC -->
+  * [About](#about)
+  * [Table of Contents](#table-of-contents)
+  * [Feature Overview](#feature-overview)
+  * [Project Structure](#project-structure)
+  * [Built-in Nodes](#built-in-nodes)
+  * [Signal Flow Visualisation](#signal-flow-visualisation)
+  * [DAW Mode](#daw-mode)
+    * [Safety locks](#safety-locks)
+  * [Standalone Mode](#standalone-mode)
+  * [Pax System](#pax-system)
+    * [Pax folder locations](#pax-folder-locations)
+    * [Bundled Pax](#bundled-pax)
+    * [Parameter persistence](#parameter-persistence)
+    * [Dynamic port counts](#dynamic-port-counts)
+    * [Building a Pax](#building-a-pax)
+  * [Patch Files](#patch-files)
+    * [Burger menu `☰` (top-right)](#burger-menu--top-right)
+  * [Fragment Export / Import](#fragment-export--import)
+    * [Export](#export)
+    * [Import — Ghost Overlay UX](#import--ghost-overlay-ux)
+  * [MIDI Morpher](#midi-morpher)
+  * [Wraps](#wraps)
+  * [Channel Selection](#channel-selection)
+  * [Undo / Redo](#undo--redo)
+  * [Keyboard Shortcuts](#keyboard-shortcuts)
+  * [Building](#building)
+    * [Prerequisites](#prerequisites)
+    * [Host (VST3 / AU / Standalone)](#host-vst3--au--standalone)
+    * [UI dev server (hot reload)](#ui-dev-server-hot-reload)
+  * [Writing a Pax](#writing-a-pax)
+    * [Optional exports](#optional-exports)
+  * [API Reference](#api-reference)
+    * [PAX_Descriptor](#pax_descriptor)
+    * [PAX_MidiEvent](#pax_midievent)
+    * [PAX_ParameterInfo](#pax_parameterinfo)
+    * [PAX_Value  *(new in API v2, gained `portIndex` in API v3)*](#pax_value-new-in-api-v2-gained-portindex-in-api-v3)
+    * [PAX_ProcessContext  *(new in API v2, gained a DMX universe path in API v4)*](#pax_processcontext-new-in-api-v2-gained-a-dmx-universe-path-in-api-v4)
+  * [Thread Safety](#thread-safety)
+  * [Performance](#performance)
+  * [Licensing](#licensing)
+<!-- TOC -->
+
+---
+
+## Feature Overview
+
+- **Visual node graph** — drag, connect and rearrange processing nodes on a zoomable/pannable canvas
+- **Strict port typing** — connections are only valid between matching protocol types (MIDI, Audio, OSC, DMX, ArtNet, MQTT, UDP); a UDP node can never be wired directly into an MQTT node or any other mismatched protocol, by design — cross-protocol bridging is meant to go through dedicated converter Pax, not a raw connection
+- **Centred node drop** — nodes appear centred on the drop point, sized correctly for every node type
+- **Real-time signal flow** — ports and edges animate with live MIDI flash and audio VU colour (green → yellow → red); DMX gets its own treatment, gradual amber intensity tracking the actual channel value rather than a discrete flash, matching its nature as a continuously-held signal rather than a discrete event
+- **512-channel DMX universe** — a dedicated wide-payload path (`PAX_ProcessContext`'s `dmxFrameIn`/`dmxFrameOut`, API v4) separate from the general `PAX_Value` mechanism, whose 56-byte inline buffer previously truncated any DMX-carrying node — built-in and Pax alike — to its first 56 of 512 channels
+- **Multi-source DMX merging** — several sources (Pax or built-in) feeding the same DMX Out combine correctly via HTP (Highest Takes Precedence), the same convention real DMX consoles/mergers use, rather than the last one silently overwriting the others
+- **Colour-coded connection preview** — the dashed line shown while dragging a new connection matches the source port's own protocol colour, not a fixed generic accent
+- **Per-port VU** — multi-output nodes (Splitter, Spectrumyser) colour each output dot independently
+- **Per-port typed Pax flash** — a Pax with multiple differently-typed Value ports (e.g. MQTT + DMX on the same node) flashes each output in its own correct protocol colour, not one blanket colour for the whole node
+- **Automatic Hybrid/Converter node colouring** — a Pax's overall colour is auto-detected from its own declared ports: a type present on only one side (input or output) marks it a Converter (fuchsia); every type mirrored on both sides gives it a single native colour if there's only one, or Hybrid (orange) if there's more than one — e.g. Envelope (Audio+MIDI, mirrored) is Hybrid, `MqttToValuePax` (MQTT in, generic out — not mirrored) is a Converter
+- **Live read-only Pax parameters, folding settings for multi-param Pax** — a Pax can mark a parameter as a live display rather than an editable control (`PAX_isParameterReadOnly`), e.g. `OscToValuePax`/`ValueToDMXPax`'s own "Current Value". A Pax with exactly one such display shows it compactly in the node header, no settings toggle needed; a Pax with more than one parameter gets a settings cog instead, folding its full controls behind a click and showing a labelled summary of the rest when closed (e.g. `ValueToDMXPax` folded: "min: 0.00 - max: 1.00 - value: 0.786") — a Pax with exactly one *editable* parameter (`LevelPax`, `AmpPax`) is unaffected either way, always shown directly
+- **Per-node channel selection** — Audio IN/OUT nodes expose a settings panel to select any combination of physical channels; supports devices up to 256 channels (e.g. Blackhole 16ch)
+- **DAW mode** — full bidirectional audio and MIDI routing between Patchy and your DAW track via a virtual "DAW" device; two AU variants (Patchy instrument, Patchy FX effect); keeps running when the host pauses (Logic) while its window is open, or always as a per-project option; resizable plugin window (size saved per project)
+- **Standalone mode** — full standalone app with its own audio device selection, window bounds persistence and last-folder memory; Open Recent and optional reopen-last-project at launch
+- **Audio devices that behave** — hardware Audio In/Out devices follow the host's sample rate and buffer size; the Standalone restores your buffer size if the system changes it behind its back; optional startup fade per Audio In device and an automatic short fade after a device dropout (no click when an interface restarts its stream); the Mac won't idle-sleep while an audio device is open
+- **Port-in-use and device status** — UDP / OSC / Art-Net In nodes show when their port is taken by another app (red summary + cog dot, retried automatically); DMX In/Out show "in use", "can't open" and half-duplex conflicts; DMX / Art-Net Monitors show NO SIGNAL when input stops; several Art-Net In nodes share one socket on port 6454
+- **Sidebar** — pinned, or auto-hide (slides out at the left edge, away again 3 s after the cursor leaves, at once on a click in the graph; stays while a hint is showing)
+- **Log file** — `~/Library/Logs/Patchy/Patchy.log` (lifecycle, devices, diagnostics)
+- **DAW device protection** — DAW loopback and DAW host devices locked by default; unlockable via Preferences
+- **Patch files** — save/load/new graph state as human-readable `.patchy` JSON files
+- **Auto-save** — full graph state persisted automatically via DAW project state
+- **Fragment export/import** — select any nodes, export as a reusable `.patchy` fragment, reimport with ghost-placement UX
+- **50-step undo/redo** — full graph snapshot history via `⌘Z` / `⌘⇧Z`
+- **Per-node Disable/Enable** — power-icon toggle in most nodes' own header (undo-tracked); most nodes cut (stop processing, output goes silent), same-type in-place Pax (Level/Amp/Transpose/StereoSplitter) pass audio/MIDI through unchanged instead, like a normal plugin bypass; not present on the 3 Console nodes, the 7 Monitor nodes, or MIDI Keyboard, since disabling them wouldn't change anything a user could see or hear
+- **MIDI CH. Matrix** — a resizable (4×4 to 16×16) channel-remap grid: click a cell to route input channel N to output channel M, with one-to-many fan-out; unmapped channels either dropped or passed through unchanged via a header toggle; live per-channel label flash on activity, mirroring the same real-time flash language used for edges elsewhere; disabled state passes every channel straight through unchanged (N→N), matching Transpose's own bypass behaviour
+- **MIDI Out Device channel filter** — a per-device output filter, in the same "Ch. 1, 3, 7" / "Ch. Omni" style as MIDI Monitor's own display filter, but genuinely functional here: only the selected channels actually reach the physical device, everything else is silently held back before it ever leaves the plugin. Handy for narrowing an omni-only synth down to a single receiving channel without needing a full Matrix. Empty selection = Omni (every channel sent), matching this node's own original behaviour, so nothing changes until you opt in
+- **MIDI Morpher** — turns MIDI events matching one rule (channel, message, Data1/Data2 ranges) into others: change channel or message type, rescale / invert / fix values, swap Data1/Data2, pitch bend as one 14-bit value; unmatched events pass through or are blocked. Two faces on the same rule — **Basic** (the rule as a sentence, e.g. *"CC 7 on ch 3 → CC 110"*, edited in plain words: When / Send / Value) and **Advanced** (MidiDash-style IN/OUT table, full rule editor); live feedback (matching rows light up, last-morph readout, transfer curves, warnings for parts of a rule that can't apply). See [MIDI Morpher](#midi-morpher)
+- **MIDI Learn** — click Learn, move a knob or play a key, and the node fills itself in (type, number, channel); first available in the MIDI Morpher, built as a generic mechanism for other nodes
+- **Value fields** — drag up/down to change a value, double-click to type it, ⌥ Option + drag to set a range's low and high together (MIDI Morpher; to be used across all nodes)
+- **Note names** — Yamaha (C3 = 60) or Roland (C4 = 60) convention, per node, in MIDI Monitor, MIDI Keyboard and MIDI Morpher
+- **In-place rename** — hover a node's title, click the ✎ pencil and type a name (Enter / click away to keep, Escape to cancel); one undo step; saved with the project
+- **Parameter persistence** — Pax parameters (sliders, steps) survive graph rebuilds, file loads and app restarts
+- **Built-in nodes** — MIDI In/Out, Audio In/Out, MIDI Monitor, Audio Monitor (oscilloscope), Audio Player (file/sine/noise source), MIDI Keyboard, MIDI CH. Matrix (resizable channel-remap matrix), MIDI Morpher (one MIDI rule per node, Basic/Advanced, Learn), UDP In/Out, OSC In/Out, ArtNet In/Out, DMX In/Out, DMX Monitor, DMX Console, ArtNet Monitor, ArtNet Console, OSC Monitor, UDP Monitor, MQTT Subscribe, MQTT Publish, MQTT Monitor, MQTT Console
+- **Protocol device nodes** — Phase 3 built-in nodes for network and hardware protocols; UDP, OSC 1.0, Art-Net (ArtDmx), DMX USB (Enttec Pro/Mk2); live byte-rate labels; change-driven activity flash
+- **DMX Monitor + Console** — vertical fader bank and bargraph display for all 512 DMX channels; configurable visible count (8/16/24/32); page navigation; dec/pct/hex format; custom name; Blackout button; full undo/redo; Console is output-only
+- **ArtNet Monitor + Console** — same 512-channel fader/bargraph as DMX; universe selector (0–32767); universe filter on Monitor (show all or filter by universe, "--" on mismatch); Blackout button; full undo/redo; Console is output-only
+- **OSC Monitor** — scrolling message log showing the complete OSC message (address + every typed argument, not just the first); address substring filter; pause/clear; independent raw-capture path so multi-arg messages are never collapsed
+- **UDP Monitor** — scrolling log of raw UDP packets with sender IP:port, byte count, and a hex/ASCII toggle display; pause/clear; same independent raw-capture rationale as OSC Monitor
+- **MQTT Subscribe** — connects to a broker (via `libmosquitto`) and subscribes to a topic; host/port/topic/QoS/username/password settings; auto-generated unique client ID per instance
+- **MQTT Publish** — publishes to a broker topic; topic can be overridden per-message from the incoming value (mirrors OSC Out's address override); numeric payload as plain decimal text; retain flag
+- **MQTT Monitor** — pass-through display of MQTT topic+payload traffic; TIME/TOPIC/PAYLOAD scrolling log, pause/clear
+- **MQTT Console** — manual topic+payload composer; topic field with a remembered-topics dropdown, numeric payload, explicit Send (button or Enter); pure value source, no broker connection of its own
+- **Audio Player** — three source modes: audio file playback (WAV/AIFF always available; FLAC/OGG/MP3 also supported), a sine generator, or white/pink noise; static waveform display with click-to-seek and a moving playhead; log-scale frequency slider and dB-scale level slider (both default to a conservative, safety-conscious level); source node, output only
+- **Pax system** — drop a `.dylib/.so/.dll` into the Pax folder; new node type appears in the sidebar on next launch
+- **Dynamic port counts** — Pax can change their output port count at runtime (e.g. Spectrumyser band count) without audio interruption
+- **Restructured burger menu** — `☰` top-right opens File and Edit flyout submenus with keyboard shortcuts
+- **Hint panel** — hover any node, button, port or edge to see a description in the sidebar hint panel; hovering a Value edge (a Pax adapter/converter's generic value port) shows its current, live numeric value, updating continuously while hovered
+- **Wraps** — select a few nodes, `⌘G`, and they fold into one box showing only the connections that cross its border; its ⚙ panel shows every Pax parameter inside; open it in place to work on the nodes, fold it back, unwrap (`⌘⇧G`); saved with the project, undoable; nothing changes in the processing. See [Wraps](#wraps)
+- **Fold/Unfold** — double-click header to collapse nodes; edges merge gracefully to centre
+- **WebView UI** — React + ReactFlow running inside JUCE's `WebBrowserComponent`; all UI logic is TypeScript, all audio logic is C++
+
+---
+
+## Project Structure
+
+```
+Patchy/
+├── Source/                          Core C++ engine
+│   ├── PatchyProcessor.h/.cpp       AudioProcessor — owns all state
+│   ├── PatchyEditor.h/.cpp          AudioProcessorEditor + keyboard shortcuts
+│   ├── WebBridge.h                  JS↔C++ bridge — class declaration (all 5 .cpp below implement it)
+│   ├── WebBridge.cpp                Browser/WebView plumbing + constructor
+│   ├── WebBridge_Dispatch.cpp       Message dispatcher — handleMessage() + all its handlers
+│   ├── WebBridge_Push.cpp           Push-to-UI functions + 30fps timer
+│   ├── WebBridge_FileIO.cpp         File save/open/new + Undo/Redo
+│   ├── WebBridge_Fragments.cpp      Fragment export/import dialogs
+│   ├── GraphModel.h/.cpp            UI data model (message thread)
+│   ├── ProcessingGraph.h/.cpp       Topological sort + audio/MIDI routing
+│   ├── NodeProcessor.h/.cpp         Abstract base — single + multi-port buffers
+│   ├── MidiDeviceNodes.h/.cpp       MIDI In (type 1) + MIDI Out (type 2)
+│   ├── AudioDeviceNodes.h/.cpp      Audio In (type 3) + Audio Out (type 4)
+│   │                                Includes AudioDeviceManager + multi-channel FIFO
+│   ├── UdpDeviceNodes.h/.cpp        UDP In (type 8) + UDP Out (type 9) + UdpDeviceManager
+│   │                                Background socket thread, lock-free FIFO, byte-rate counter
+│   ├── UdpMonitorNode.h/.cpp        UDP Monitor (type 21) + UdpMonitorBuffer
+│   │                                Full-detail raw capture (sender IP/port), independent of routed PAX_Value
+│   ├── MqttDeviceNodes.h/.cpp       MQTT Subscribe (22) + Publish (23) + Monitor (24) + Console (25) + MqttDeviceManager
+│   │                                libmosquitto — first external C library dependency in the project
+│   ├── OscDeviceNodes.h/.cpp        OSC In (type 10) + OSC Out (type 11) + OscDeviceManager
+│   │                                Manual OscCodec (no juce_osc), OSC 1.0, byte-rate counter
+│   ├── OscMonitorNode.h/.cpp        OSC Monitor (type 20) + OscMonitorBuffer
+│   │                                Full-detail raw capture, independent of routed PAX_Value
+│   ├── ArtNetDeviceNodes.h/.cpp     ArtNet In (type 12) + ArtNet Out (type 13) + ArtNetDeviceManager
+│   │                                Manual ArtNetCodec, ArtDmx, port 6454, change-driven flash
+│   ├── SerialPort.h                 Cross-platform serial port abstraction (POSIX + Win32, no deps)
+│   ├── DmxDeviceNodes.h/.cpp        DMX In (type 14) + DMX Out (type 15) + DmxDeviceManager
+│   │                                EnttecProCodec, Mk2 auto-detection, universe 0/1
+│   ├── DmxMonitorNode.h/.cpp        DMX Monitor (type 16) + DmxMonitorBuffer
+│   ├── DmxConsoleNode.h/.cpp        DMX Console (type 17); #includes DmxMonitorNode.h
+│   ├── ArtNetMonitorNode.h/.cpp     ArtNet Monitor (type 18) + ArtNetMonitorBuffer; #includes DmxMonitorNode.h
+│   ├── ArtNetConsoleNode.h/.cpp     ArtNet Console (type 19); #includes ArtNetMonitorNode.h
+│   │                                DmxMonitorBuffer, vertical faders, 30Hz telemetry
+│   ├── MidiMonitorNode.h/.cpp       MIDI Monitor (type 5)
+│   ├── AudioMonitorNode.h/.cpp      Audio Monitor (type 6)
+│   ├── MidiKeyboardNode.h/.cpp      MIDI Keyboard (type 7)
+│   ├── MidiChMatrixNode.h           MIDI CH. Matrix (type 27) — resizable channel-remap grid
+│   ├── MidiMorpherNode.h            MIDI Morpher (type 28) — one MIDI rule per node, live feedback, Learn
+│   ├── ArtNetReceiver.h/.cpp        One shared UDP 6454 socket for every Art-Net In node
+│   ├── PortBindState.h              Port-in-use detection + quiet retry (UDP / OSC / Art-Net In)
+│   ├── StartupFadeRegistry.h        Per-device startup fade list (Audio In), app-wide
+│   ├── SleepGuard.h/.cpp            Blocks idle sleep while a hardware audio device is open (macOS)
+│   ├── PatchyLog.h/.cpp             Async file logger → ~/Library/Logs/Patchy/Patchy.log
+│   ├── DiagLog.h                    TEMPORARY timestamped diagnostics (audio click investigation)
+│   ├── AppSettings.h                App-wide settings JSON (recent files, reopen last project)
+│   ├── AudioPlayerNode.h/.cpp       Audio Player (type 26); file playback (WAV/AIFF/FLAC/OGG/MP3), sine, or noise
+│   │                                AudioPlayerState survives graph rebuilds; log-scale frequency, dB level
+│   └── StandaloneApp.h/.cpp         Standalone wrapper (window bounds, file location)
+│
+├── Pax/                          Pax ecosystem
+│   ├── PaxAPI.h                   The ONLY header a Pax author needs
+│   ├── PaxRegistry.h/.cpp         Loads Pax, owns DynamicLibrary handles
+│   ├── PaxScanner.h/.cpp          Discovers Pax in platform folders
+│   ├── CMakeLists.txt             Builds every Pax (universal on macOS) + Pax_Install target
+│   ├── build_pax.sh / .bat        Build every Pax from the command line
+│   ├── LevelPax/                  Audio level control (-60dB to +6dB)
+│   ├── AmpPax/                    Audio amplifier (0dB to +24dB)
+│   ├── TransposePax/              MIDI transpose (-24 to +24 semitones)
+│   ├── ChannelFilterPax/          MIDI channel filter/force (study example, pairs with TransposePax)
+│   ├── EnvelopePax/               Audio envelope → MIDI CC converter
+│   ├── StereoSplitterPax/         Stereo → Left + Right split (1 in / 2 out)
+│   ├── MqttToValuePax/            MQTT → generic Value adapter (first Phase 4 converter)
+│   ├── OscToValuePax/             OSC → generic Value adapter
+│   ├── ValueToDMXPax/             Generic Value → DMX channel adapter
+│   ├── SpectrumyserPax/           FFT spectrum analyser with band outputs
+│   ├── AudioToDmxPax/             Audio (RMS or isolated frequency band) → DMX channel, first Pax hosted inside a DAW
+│   ├── MidiToDmxPax/              MIDI CC → DMX channel adapter
+│   ├── UdpValueToMidiCCPax/       Generic Value → MIDI CC adapter
+│   └── AudioPeakToOscPax/         Audio RMS/Peak → OSC float adapter
+│
+├── UI/                              React / TypeScript frontend
+│   └── src/
+│       ├── App.tsx                  ReactFlow canvas, graph sync, port activity, menus
+│       ├── Bridge.ts                JS↔C++ typed façade + subscriber system
+│       ├── NodeUtils.tsx            Shared hooks, components + style helpers (incl. isLikelyCompleteHost, portColour)
+│       ├── GenericNode.tsx          Main shell for device nodes + Pax nodes (types 1–4, 8–15, 22–23, 100+)
+│       ├── AudioDeviceUI.tsx        Audio In/Out settings panel + summary
+│       ├── UdpDeviceUI.tsx          UDP In/Out settings panel + summary
+│       ├── OscDeviceUI.tsx          OSC In/Out settings panel + summary
+│       ├── MqttDeviceUI.tsx         MQTT Subscribe/Publish settings panels + summaries
+│       ├── ArtNetDeviceUI.tsx       ArtNet In/Out settings panel + summary
+│       ├── DmxDeviceUI.tsx          DMX In/Out settings panel + summary
+│       ├── MidiMonitorNode.tsx      MIDI Monitor node (type 5)
+│       ├── AudioMonitorNode.tsx     Audio Monitor node (type 6)
+│       ├── MidiKeyboardNode.tsx     MIDI Keyboard node (type 7)
+│       ├── MidiDeviceUI.tsx         MIDI In/Out device summary + MIDI Out channel filter panel
+│       ├── MidiChMatrixNode.tsx     MIDI CH. Matrix node (type 27)
+│       ├── MidiMorpherNode.tsx      MIDI Morpher node (type 28) — Basic/Advanced faces, live feedback, Learn
+│       ├── WrapNode.tsx             Wraps — the folded box and the open-wrap frame (drawn-only, derived in App.tsx)
+│       ├── MorpherCore.ts           MIDI Morpher rule logic (mirrors the C++ engine), no React
+│       ├── MorpherBasic.ts          MIDI Morpher Basic mode: rule ↔ plain-words conversion, sentence, note names
+│       ├── Learn.ts                 Generic MIDI Learn: decodeLearned + useMidiLearn hook
+│       ├── DmxShared.tsx            Shared DMX types, constants, DmxFader, DmxSettingsPanel, NameInput
+│       ├── DmxMonitorNode.tsx       DMX Monitor node (type 16)
+│       ├── DmxConsoleNode.tsx       DMX Console node (type 17)
+│       ├── ArtNetMonitorNode.tsx    ArtNet Monitor node (type 18)
+│       ├── ArtNetConsoleNode.tsx    ArtNet Console node (type 19)
+│       ├── OscMonitorNode.tsx       OSC Monitor node (type 20) — scrolling log, full multi-arg display
+│       ├── UdpMonitorNode.tsx       UDP Monitor node (type 21) — scrolling log, hex/ASCII toggle
+│       ├── MqttMonitorNode.tsx      MQTT Monitor node (type 24) — scrolling log, TIME/TOPIC/PAYLOAD
+│       ├── MqttConsoleNode.tsx      MQTT Console node (type 25) — manual topic+payload composer
+│       ├── AudioPlayerNode.tsx      Audio Player node (type 26) — waveform + click-to-seek, log-scale frequency, dB level
+│       ├── SpectrumyserNode.tsx     Spectrumyser custom node with FFT canvas
+│       ├── EnvelopeNode.tsx         Envelope custom node with live canvas
+│       ├── ChannelFilterPaxNode.tsx Channel Filter Pax custom node (channel buttons)
+│       ├── AudioToDmxNode.tsx       Audio to DMX Pax custom node
+│       ├── AudioPeakToOscNode.tsx   Audio Peak to OSC Pax custom node (+ _BandStyle variant)
+│       ├── HintPanel.tsx            Hint context, panel, and hint dictionaries
+│       ├── Sidebar.tsx              Node palette + hint panel
+│       ├── NodeSelect.tsx           Shared custom combobox with hint + warning support
+│       ├── DawContext.ts            DAW mode context (loopback + host device toggles)
+│       └── PreferencesPanel.tsx     Graph preferences (DAW routing, audio settings)
+│
+├── FYI/                             Developer notes (gitignored)
+│   ├── Architecture.md             Detailed technical architecture + design decisions
+│   ├── SessionLog.md               Full chronological dev diary — bug hunts, refactors, commit messages
+│   └── Utils/
+│       └── migrate_patch_ids.py    Migrate .patchy files: legacy node IDs to current format
+│
+├── Tests/                           Unit tests (JUCE UnitTest) — CMake target PatchyTests
+│   ├── PatchyTestRunner.cpp         Runner (all tests, or one category as argument)
+│   ├── GraphModelTests.cpp          Graph model: nodes, ports, connections, cycles, round trip
+│   ├── MqttConnectionOwnershipTests.cpp
+│   ├── WaitableEventCpuSpinTests.cpp
+│   └── MidiMorpherTests.cpp         MIDI Morpher engine, live feedback and Learn
+│
+├── Tools/                           Developer utilities
+│   └── migrate_patchy_v1_to_v2.py  Migrate .patchy files: addonName→paxName
+│
+├── cmake/
+│   └── FyiBackup.cmake              Backs up the git-ignored FYI/ notes at each CMake configure
+│
+├── CMakeLists.txt                   Main build — host + UI bundle
+└── README.md                        This file
+```
+
+---
+
+## Built-in Nodes
+
+| Type | Name | Ports | Description |
+|------|------|-------|-------------|
+| 1 | MIDI In Device | MIDI Out | Receives from a physical or virtual MIDI input, or from the DAW track ("DAW", plugin builds) |
+| 2 | MIDI Out Device | MIDI In | Sends to a physical or virtual MIDI output, or to the DAW ("DAW", plugin builds); optional channel filter |
+| 3 | Audio In Device | Audio Out | Captures from physical device or DAW track; channel-selectable |
+| 4 | Audio Out Device | Audio In | Sends to physical device or DAW track; channel-selectable |
+| 5 | MIDI Monitor | MIDI In + Out | Inspects MIDI events; pass-through; event table with filters; note names Yamaha (C3) / Roland (C4) |
+| 6 | Audio Monitor | Audio In | Stereo oscilloscope; trigger modes; VU zoom |
+| 7 | MIDI Keyboard | MIDI In + Out | Virtual keyboard; pitch/mod wheels; upstream note display; note names Yamaha (C3) / Roland (C4) |
+| 8 | UDP In Device | UDP Out | Listens on a UDP port; Unicast · Multicast · Broadcast; live byte-rate |
+| 9 | UDP Out Device | UDP In | Sends datagrams to a configured host:port; Unicast · Multicast · Broadcast |
+| 10 | OSC In Device | OSC Out | Listens on a UDP port; parses OSC 1.0 messages; live byte-rate |
+| 11 | OSC Out Device | OSC In | Sends PAX_Value events as OSC messages to a configured host:port; configurable OSC address |
+| 12 | ArtNet In Device | ArtDMX Out | Listens on UDP port 6454; parses ArtDmx; universe filtering; change-driven flash; live byte-rate |
+| 13 | ArtNet Out Device | ArtDMX In | Sends PAX_Value blobs as ArtDmx packets to a configured host; configurable universe |
+| 14 | DMX In Device | DMX Out | Receives DMX512 from an Enttec DMX USB Pro; serial port selector; Mk2 auto-detection; live byte-rate |
+| 15 | DMX Out Device | DMX In | Sends DMX512 to an Enttec DMX USB Pro; universe 0 (Pro) or 1 (Mk2 port 2) |
+| 16 | DMX Monitor | DMX In + DMX Out | Displays all 512 DMX channels as vertical bargraphs; pass-through; configurable visible count |
+| 17 | DMX Console | DMX Out | 512-channel vertical fader bank; blackout; configurable visible count (8/16/24/32); page navigation; dec/pct/hex format; custom name; output-only (no input port) |
+| 18 | ArtNet Monitor | ArtDMX In + ArtDMX Out | Displays all 512 ArtNet channels as vertical bargraphs; pass-through; universe filter; "--" on mismatch |
+| 19 | ArtNet Console | ArtDMX Out | 512-channel vertical fader bank; universe selector (0–32767); blackout; configurable visible count; output-only |
+| 20 | OSC Monitor | OSC In + OSC Out | Scrolling log of complete OSC messages (address + every typed arg); pass-through; address substring filter; pause/clear |
+| 21 | UDP Monitor | UDP In + UDP Out | Scrolling log of raw UDP packets (sender IP:port, byte count, hex/ASCII toggle); pass-through; pause/clear |
+| 22 | MQTT Subscribe | MQTT Out | Connects to a broker and subscribes to a topic (`libmosquitto`); host/port/topic/QoS/username/password; source node, output only |
+| 23 | MQTT Publish | MQTT In | Publishes to a broker topic (`libmosquitto`); topic overridable per-message from incoming value; numeric payload as plain decimal text; retain flag; sink node, input only |
+| 24 | MQTT Monitor | MQTT In + MQTT Out | Pass-through display of MQTT topic+payload traffic; TIME/TOPIC/PAYLOAD scrolling log |
+| 25 | MQTT Console | MQTT Out | Manual topic+payload composer; topic history dropdown, explicit Send; source node, output only, no broker connection of its own |
+| 26 | Audio Player | Audio Out | File playback (WAV/AIFF/FLAC/OGG/MP3), sine generator, or white/pink noise; static waveform with click-to-seek, log-scale frequency slider, dB level slider; source node, output only |
+| 27 | MIDI CH. Matrix | MIDI In + MIDI Out | Resizable (4×4 to 16×16) channel-remap grid with one-to-many fan-out; unmapped channels dropped or passed (funnel); per-channel activity flash |
+| 28 | MIDI Morpher | MIDI In + MIDI Out | One MIDI rule per node: match channel / message / Data1-Data2 ranges, send another channel / message / values (scaled, inverted, fixed, swapped); Basic (sentence) and Advanced (table) faces; live feedback; Learn. See [MIDI Morpher](#midi-morpher) |
+| 100+ | Pax nodes | Per descriptor | Dynamically loaded from `.dylib/.so/.dll` |
+
+---
+
+## Signal Flow Visualisation
+
+All ports and edges animate live at 30fps:
+
+**MIDI activity** — flashes bright cyan-white (80ms) on OUT port, edge and downstream IN port
+
+**UDP activity** — flashes steel blue (80ms) on UDP Out port, edge and downstream IN port; live byte-rate label (B/s or kB/s) displayed inline on UDP In nodes while packets are flowing
+
+**OSC activity** — flashes cyan/teal (80ms) on OSC Out port, edge and downstream IN port; live byte-rate label displayed inline on OSC In nodes while messages are arriving
+
+**ArtNet activity** — flashes pale amber (80ms) on ArtDMX Out port, edge and downstream IN port; change-driven (no flash on 44Hz heartbeat refresh, only on DMX value changes); live byte-rate label on ArtNet In nodes
+
+**MQTT activity** — flashes coral/salmon (80ms) on MQTT Out port, edge and downstream IN port; applies to Subscribe, Publish, Monitor and Console alike
+
+**Audio level** — continuously reflects RMS level via colour:
+- Silence → dim base colour
+- Low → green · Mid → yellow · High → red
+- Glow intensity scales with level
+
+**Multi-output nodes** (Splitter, Spectrumyser) colour each output dot independently using per-port RMS.
+
+**Important:** only explicitly connected audio paths produce sound. Observer nodes (AudioMonitor, Spectrumyser) do not route audio to the output unless connected to an AudioOut device node.
+
+---
+
+## DAW Mode
+
+When loaded as a VST3/AU plugin, Patchy operates in DAW mode:
+
+- **"DAW" virtual device** appears at the top of Audio In/Out and MIDI In/Out device combos
+- Selecting "DAW" on AudioIN routes the DAW track's audio into the graph
+- Selecting "DAW" on AudioOUT routes processed audio back to the DAW track
+- Selecting "DAW" on MIDI In / MIDI Out receives the track's MIDI / sends MIDI back to the host (in Logic, sending to a track works through MIDI Out → "Logic Pro Virtual In")
+- **Empty graph** → audio passes through transparently (DAW track unaffected)
+- **Two AU variants** — **Patchy** (instrument) and **Patchy FX** (MIDI-controlled effect, AU only — gets the track's audio in Logic); VST3 has the single Patchy
+- **Host paused** — some hosts (Logic) stop calling a plugin whose track isn't live; Patchy then keeps its graph running by itself while its window is open (a discreet "Host paused — Patchy running independently" note appears bottom-left), or always if **Preferences → DAW Routing → Keep running when the host pauses, even with this window closed** is on (saved per project)
+- **Resizable window** — drag the grip in the bottom-right corner; the size is saved with the project (default 900×600)
+
+### Safety locks
+
+| Setting | Default | Risk if enabled |
+|---------|---------|-----------------| 
+| DAW loopback (AudioOUT → DAW) | 🔒 Locked | Feedback loop |
+| DAW host devices (Bitwig, Ableton, etc.) | 🔒 Locked | Signal doubling |
+
+Both can be unlocked via **Preferences → Graph → DAW Routing**.
+
+---
+
+## Standalone Mode
+
+When launched as a standalone application, Patchy:
+
+- Opens with its own `AudioDeviceManager` — select input/output devices per node
+- **Remembers window position and size** across sessions
+- **Remembers last file location** — file dialogs reopen in the last used folder
+- Audio settings (sample rate, buffer size, feedback mute) configurable via Preferences; if macOS restarts the audio device at another buffer size (e.g. when a second device opens), Patchy puts yours back
+- Supports the same patch file workflow as DAW mode, plus **☰ → File → Open Recent** (last 10) and **Preferences → Startup → Reopen last project at launch** (asked on first launch; a moved file can be located)
+- Keeps the Mac from idle-sleeping while a hardware audio device is open
+
+---
+
+## Pax System
+
+Pax are shared libraries implementing the `PAX_Descriptor` C API in `Pax/PaxAPI.h`. Discovered at startup by `PaxScanner`, loaded by `PaxRegistry`.
+
+### Pax folder locations
+
+| Platform | Path |
+|----------|------|
+| macOS | `~/Library/Patchy/Pax/` |
+| Windows | `%APPDATA%\Patchy\Pax\` |
+| Linux | `~/.patchy/pax/` |
+
+### Bundled Pax
+
+| Pax | Type | Ports | Parameters |
+|-------|------|-------|------------|
+| Level | Audio | 1in/1out | Level: -60dB to +6dB |
+| Amp | Audio | 1in/1out | Amp: 0dB to +24dB |
+| Transpose | MIDI | 1in/1out | Semitones: -24 to +24 |
+| Channel Filter | MIDI | 1in/1out | Channel (1-16), Mode (Filter: keep only that channel / Force: move everything to it); channel-less messages always pass; a small study example next to Transpose |
+| Envelope | AV Hybrid | 1m+1a in / 1m+1a out | Mode, CC, Attack, Release, Band filters |
+| Splitter | Audio | 1in/2out | — (L→out1, R→out2) |
+| Spectrumyser | Audio | 1in/1-5out | Band count (1-5), per-band frequency range |
+| MQTT to Value | Converter | 1 MQTT in / 1 Value out | — (stateless passthrough; first Phase 4 adapter, bridges MQTT payloads into the generic Value graph) |
+| OSC to Value | Converter | 1 OSC in / 1 Value out | Current Value (read-only live display) |
+| Value to DMX | Converter | 1 Value in / 1 DMX out | DMX Channel (1-512), Input Min/Max (default 0.0/1.0), Current Value (read-only live display) |
+| Audio to DMX | Converter | 1 Audio in / 1 DMX out | Mode (RMS/Freq Range), Sensitivity (dB), Damping (0-500ms), DMX Channel (1-512); first Pax hosted inside a DAW, not just standalone |
+| MIDI to DMX | Converter | 1 MIDI in / 1 DMX out | MIDI CC (0-127), DMX Channel (1-512), Current Value (read-only live display) |
+| UDP Value to MIDI CC | Converter | 1 Value in / 1 MIDI out | MIDI CC (0-127), MIDI Channel (1-16), Input Min/Max (default 0.0/1.0), MIDI CC Value (read-only live display) |
+| Audio Peak to OSC | Converter | 1 Audio in / 1 OSC out | Mode (Whole/Freq Range), Measurement (RMS/Peak), Sensitivity (dB), Band Low/High (Hz), Damping (0-500ms), Send Mode (Change/Rate), Max Rate (1-100Hz); Measurement is fully orthogonal to Mode, giving all four combinations; Send Mode controls per-node whether messages only go out on genuine change or continuously at a throttled rate |
+
+### Parameter persistence
+
+Pax parameters are automatically saved in `settingsJson` on every change and restored when:
+- A patch file is loaded
+- The graph is rebuilt (adding/connecting nodes)
+- The app is restarted (via DAW project state or patch file)
+
+### Dynamic port counts
+
+Pax can change their output port count at runtime by exporting `PAX_getAudioOutputCount`. Patchy updates the node's ports and routing live — without a full graph rebuild or audio interruption — only when the count actually changes.
+
+### Building a Pax
+
+Recommended — `Pax/build_pax.sh` (macOS/Linux) or `Pax/build_pax.bat` (Windows) builds every bundled Pax in one go:
+
+```bash
+cd Pax
+./build_pax.sh              # build only, binaries land in Pax/build/pax/
+./build_pax.sh --install    # build + copy straight to the Pax folder for your platform
+./build_pax.sh --clean      # wipe the build directory first
+```
+
+Manual single-Pax build (what the script does under the hood, macOS example):
+
+```bash
+cd Pax/SpectrumyserPax
+clang++ -std=c++20 -shared -fPIC SpectrumyserPax.cpp \
+        -o SpectrumyserPax.dylib
+cp SpectrumyserPax.dylib ~/Library/Patchy/Pax/
+```
+
+---
+
+## Patch Files
+
+Patches are saved as `.patchy` files — plain JSON containing nodes, connections, viewport and settings. Fully human-readable and tweakable in any text editor.
+
+### Burger menu `☰` (top-right)
+
+The menu is organised into two flyout submenus, opening to the left on hover:
+
+**File ▸**
+- **New** `⌘N` — clear the graph
+- **Open…** `⌘O` — load a `.patchy` file
+- **Open Recent ▸** — the last 10 projects (Standalone); a missing file can be located or removed; **Clear Recent**
+- **Save** `⌘S` — save to current file, or prompt if unsaved
+- **Save As…** `⌘⇧S` — always prompt for location
+- **Export…** — export selected nodes as a fragment (enabled when nodes are selected)
+- **Import…** — import a `.patchy` fragment with ghost-placement UX
+
+**Edit ▸**
+- **Undo** `⌘Z` — step back through 50-step history
+- **Redo** `⌘⇧Z` — step forward
+- **Cut / Copy / Paste** — reserved, coming soon
+- **Wrap** `⌘G` — wrap the selected nodes (2 or more)
+- **Unwrap** `⌘⇧G` — unwrap the selected wrap (or the open wrap holding a selected node)
+- **Delete** `⌫` — remove selected nodes (enabled when nodes are selected)
+
+---
+
+## Fragment Export / Import
+
+Sub-graphs can be saved and reused as `.patchy` fragment files.
+
+### Export
+1. Select nodes on the canvas (`⌘`-click on node headers)
+2. **☰ → File → Export…** — enabled when nodes are selected, showing count
+3. Choose a filename — suggested name is derived from selected node types
+4. Only connections between selected nodes are included; external connections are silently dropped
+
+### Import — Ghost Overlay UX
+1. **☰ → File → Import…** → file picker opens
+2. A dashed bounding box follows the cursor showing node count and "click to place · esc to cancel"
+3. The canvas remains fully pannable/zoomable while holding the ghost
+4. **Click** → places nodes at cursor position
+5. **Escape** or **right-click** → cancels
+
+---
+
+## MIDI Morpher
+
+One rule per node — the node shows the whole route at a glance; chain several Morphers for more. Inspired by MidiDash's Map.
+
+**The rule**
+- **IN:** channel (Omni / 1–16), message (Any, Note Off, Note On, Poly AT, CC, Program, Channel AT, Pitch), Data1 range, Data2 range
+- **OUT:** channel (Copy / 1–16), message (Copy / a type), Data1 range, Data2 range, **Pull** (OUT Data1 takes the incoming Data2, OUT Data2 takes the incoming Data1)
+- An OUT range left at **Min–Max** keeps the value (rescaled only across type ranges, e.g. Pitch 0–16383 → CC 0–127); any other OUT range rescales the IN range onto it (high < low inverts, a single IN value gives a fixed one)
+- Pitch bend is one 14-bit value in Data1; Program and Channel AT have no Data2
+- Events outside the rule (out-of-range values included — ignored, never clamped) **pass through** (default) or are **blocked** (funnel button); system messages (clock…) always pass; disabled = everything passes unchanged
+
+**Basic and Advanced** — the same rule, two faces; switch in the panel (Basic | Advanced) or with the **B / A** badge in the header. New nodes start in Basic.
+- **Basic:** the body reads as a sentence (*"Any Note On → CC 74, value = velocity"*); the panel speaks plain words — **When** (Note On, Note Off, Knob-slider (CC), Pitch bend, Program change, Aftertouch (channel / poly), Any event; which number or any; channel), **Send** (same or another kind, number, channel) and **Value** (same, inverted, fixed at, limited to). Basic sets the ranges and Pull itself. A rule too complex for Basic is shown read-only with **Edit in Advanced**.
+- **Advanced:** MidiDash-style IN/OUT table in the body; full editor with transfer curves (how each OUT value follows its IN source) and warnings for settings that can't apply.
+
+**Live feedback** — the IN / OUT row (or sentence half) lights up when an event is morphed; the funnel gets a grey ring when unmatched events pass, red when they're blocked; the last morph is shown under the rule (`ch3 CC 7 = 64 → ch3 CC 110 = 64`); a folded node shows the rule in its header.
+
+**Learn** — click **Learn** in When / Send (Basic) or Input / Output (Advanced), then move a knob or play a key on a controller connected to the Morpher: the type, number and channel are filled in. Incoming events are held back while listening; a key press learns its Note On; click again to cancel, or it gives up after 10 s. One undo step per learned event.
+
+**Value fields** — drag up/down; double-click to type (a number, `min`, `max`, or a note name like `C3`); ⌥ Option + drag sets a row's low and high together (press / release ⌥ during the drag to link / unlink).
+
+---
+
+## Wraps
+
+Several nodes shown as one box, to tidy a busy canvas. A wrap is display and project state only: the nodes inside stay ordinary nodes with ordinary connections, so wrapping never changes what Patchy does with the signal.
+
+- **Wrap** — select 2 or more nodes and press `⌘G` (or **☰ → Edit → Wrap**). The box takes the place of the nodes, named *WRAP* (click the ✎ to rename it).
+- **The box's ports** are the connections crossing its border when it was wrapped or folded, plus any made since; each shows the port name and the node it belongs to. Connecting to one connects to that inner port. Signal flashes and VU show on the box as on the nodes inside.
+- **Open in place** — the ⤢ button or double-click the box: the nodes come back where they are, inside a dashed frame; fold them back with the frame's ⤡ button. Moving the box moves its nodes; drag the frame by its title bar to move them all.
+- **The open frame's ports** — the frame shows the same ports as the folded box (inputs on its left edge, outputs on its right, labelled, ordered by their node from top to bottom): wires from outside stop at the frame, and continue inside to their node — far less spaghetti. Both halves flash with the signal; connecting to a frame port connects to the inner port; a port with nothing connected outside keeps its inside part (dimmed). The frame's sides leave room for the labels, and the box and the frame list the ports in the same order.
+- **Pax controls** — the box shows a summary of the values of the Pax inside — live read-only values first, in the colour of their Pax's output wires (*● Current Value 0.786*; when several Pax share a name, the node's name is shown instead: *● OSC TO VALUE 0.5*), then the settings (*Min 0.00 · Max 1.00*), up to two lines — hover it to see all of them, live, right there (and in the hint panel); its ⚙ opens a panel with every Pax parameter inside, grouped by node — the same sliders / switches as on the nodes, one undo step per change. Every Pax is listed, the bespoke ones (Spectrumyser, Envelope, Audio→DMX, Audio Peak→OSC, Channel Filter) included — with their mode buttons (Amp / Band, RMS / Freq…) and their Low/High bands as one two-head slider within the node's zoom range (shown only in Band / Freq mode; Spectrumyser: only the bands in use); built-in nodes' controls are not listed (yet).
+- **📌 Pins** — in the ⚙ panel, the pin next to a parameter puts that control on the folded box itself, ready to use (a live value shows as a large readout); hover its label and click the ✎ to rename it (e.g. *Drive* instead of *Level · AMP*), click its 📌 to unpin it. Pinned values leave the summary; while ⚙ is open the pinned controls hide (like the summary), so pinning never moves the list. Pin, unpin and rename are each one undo step and are saved with the project.
+- **Enter** — the → button on the folded box or the open frame, or `⌘↑` with a wrap (or a node in an open wrap) selected: the canvas shows **only this wrap's nodes**, its outside connections on two rails (left: from outside, right: to outside, labelled, flashing with the signal). Work as usual inside — a node dropped from the sidebar is created in the wrap. Back with **Main** in the breadcrumb at the top-left, `⌘↓` or `Esc`; the wrap stays folded or open as it was, and each view keeps its own zoom / position.
+- **Unwrap** — `⌘⇧G`, **☰ → Edit → Unwrap**, or the box / frame's unwrap button: the wrap goes, the nodes stay.
+- **✕** on the box deletes the wrap **and** its nodes (undoable).
+- **Add / take out nodes** — hold **⌥ Option** while dragging: drop a node inside an open wrap's frame to add it (the frame lights up, "drop to add"), drop a member outside its frame to take it out (red, "drop to take out"). Its wires stay as they are. ⌥-drop a **folded wrap** into an open one to merge them: its nodes (and their pins) join, it goes. One undo step per drop — ⌘Z puts everything back where the drag began. Without ⌥, dragging works as usual (the frame just grows with its nodes).
+- A node belongs to one wrap at most; wraps don't nest. Wrapping nodes from an open wrap, or ⌥-dropping them into another, moves them to the new one.
+- **Wrap library** — the 🔖 button on a wrap (folded box or open frame) saves it to `~/Documents/Patchy/Wraps` under its name (asks before replacing one of the same name): its nodes, inner wires, settings, pins and pin labels — not its outside wires. The sidebar's **Wraps** section lists the library; drag one onto the canvas and an independent copy lands there, folded. Hover an item for ✎ rename and 🗑 delete (asks, moves the file to the Trash; wraps already placed aren't affected). The library folder can be changed in **Preferences → Wrap library** (e.g. a shared or synced folder; *Default* goes back to Documents › Patchy › Wraps). If it uses a Pax that isn't installed, that node is placed as a **ghost** (see below) and a warning names what's missing. Device nodes keep their device (pick another if it's busy or absent).
+- **Ghost nodes** — a node whose Pax isn't installed (a project, fragment or library wrap made on another machine) shows as a greyed, dashed **MISSING: NAME** node. It keeps its place, ports and wires and passes nothing; its settings are kept and saved with the project. Install the Pax and restart Patchy to bring the real node back. Wraps and ghosts fold to their header like any node (double-click the header, or the global fold button); an open wrap folds straight to its header, and unfolding it opens it again. A warning lists the missing Pax when the project opens or the fragment / wrap is dropped.
+- Export… of a selected folded wrap exports its nodes — and any wrap whose nodes are all exported goes into the file with them; Import… brings it back as a wrap.
+
+---
+
+## Channel Selection
+
+Audio IN and OUT device nodes support per-node channel selection for multi-channel devices (e.g. Blackhole 16ch, up to 256 channels).
+
+- Click the **⚙ gear icon** on any Audio IN or OUT node header to open the channel settings panel
+- Check any combination of channels — the selection is shown as a summary above the device combobox (e.g. `Ch 1, Ch 3, Ch 5`)
+- The settings panel adapts its layout (2 / 3 / 4 columns) for 16 / 32 / 128+ channel devices
+- **Warn + reset** — if the device is changed and the current channel selection is no longer valid, the selection resets to `Ch 1, Ch 2` and a warning badge appears on the gear icon
+- Channel selections are persisted in the patch file and are undo/redo aware
+
+**Routing semantics:**
+- **Audio IN** — selected physical input channels are captured and wrapped into contiguous graph channels (0, 1, 2…) for downstream nodes
+- **Audio OUT** — graph channels (0, 1, 2…) from upstream nodes are routed to the selected physical output channels
+
+---
+
+## Undo / Redo
+
+Patchy maintains a **50-step snapshot history** of the full graph state.
+
+| Action | Snapshot taken |
+|--------|---------------|
+| Drop a node | ✅ |
+| Delete a node | ✅ |
+| Draw a connection | ✅ |
+| Delete a connection | ✅ |
+| Change device selection | ✅ |
+| Change node settings | ✅ |
+| Import a fragment | ✅ |
+| Rename a node | ✅ |
+| Disable / enable a node | ✅ |
+| MIDI Learn (a learned event) | ✅ |
+| Wrap / unwrap / rename a wrap / delete a wrap | ✅ |
+| Pin / unpin / rename a pinned control | ✅ |
+| ⌥-drag a node into / out of a wrap | ✅ |
+| A value drag (whole drag = one step) | ✅ |
+| Move a node | ❌ (intentional — keeps history clean) |
+| Move a wrap, open / fold it | ❌ (same reason) |
+
+Undo/Redo is accessible via `⌘Z` / `⌘⇧Z`, or via **☰ → Edit → Undo / Redo**.
+
+---
+
+## Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `⌘N` | New graph |
+| `⌘O` | Open patch file |
+| `⌘S` | Save |
+| `⌘⇧S` | Save As |
+| `⌘Z` | Undo |
+| `⌘⇧Z` | Redo |
+| `⌘G` | Wrap the selected nodes |
+| `⌘⇧G` | Unwrap the selected wrap |
+| `⌘↑` / `⌘↓` (or `Esc`) | Enter the selected wrap / back to the main graph |
+| `⌥ Option` + drag a node | Add it to an open wrap (drop inside its frame) / take it out (drop outside) |
+| `F` | Fold / unfold all nodes |
+| `Space` | Play / Pause the selected Audio Player node |
+| `Space Space` (within 400ms) | Return the selected Audio Player node to the start |
+| `⌫` (or `Delete`) | Delete the selected node(s) or wire(s) — a selected wire is highlighted |
+| Double-click header | Collapse / expand node |
+| `Escape` | Cancel fragment import ghost / cancel a rename |
+| `Shift` + drag on the canvas | Box-select several nodes |
+| `⌘` + click on a node | Add / remove a node from the selection |
+| Drag a value field up/down | Change it (MIDI Morpher) |
+| `⌥ Option` + drag a value field | Set a range's low and high together |
+| Double-click a value field | Type a value (`min`, `max`, a note name…) |
+
+---
+
+## Building
+
+### Prerequisites
+- CMake 3.22+
+- JUCE 8 (fetched automatically via CMake FetchContent)
+- Node.js 18+ and npm (for UI build)
+- C++20 compiler
+- `libmosquitto` (MQTT support) — fetched and built from source by CMake as a static library (client only, no TLS) and linked into Patchy; nothing to install. The macOS build is universal (arm64 + x86_64) by default; `-DPATCHY_UNIVERSAL=OFF` builds for the host architecture only (faster debug builds).
+
+### Host (VST3 / AU / Standalone)
+
+```bash
+cmake -B cmake-build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build cmake-build-release -j$(nproc)
+```
+
+Useful targets:
+
+| Target | Builds |
+|--------|--------|
+| `Patchy_All` | VST3 + AU (instrument) + Standalone |
+| `PatchyFX_All` | Patchy FX (AU MIDI-controlled effect) |
+| `Pax_Install` | Every bundled Pax, copied to `~/Library/Patchy/Pax/` |
+| `Patchy_Everything` | All of the above in one go |
+| `PatchyTests` | Unit tests (`PATCHY_BUILD_TESTS`, ON by default); run the binary, optionally with a category name |
+
+**FYI notes backup** — `FYI/` (developer notes) is git-ignored, so every CMake configure saves it as a timestamped zip (`YYYY-MM-DD_HHMMSS_vX.Y.Z.zip`), only when something changed, keeping the newest 10. Default destination: iCloud Drive `Patchy-FYI-backups` (or `~/Documents/Patchy-FYI-backups`). Options: `PATCHY_FYI_BACKUP` (ON), `PATCHY_FYI_BACKUP_DIR` (any folder, e.g. on a NAS — when it isn't reachable, e.g. NAS not mounted, the backup goes to `~/Documents/Patchy-FYI-backups` instead and the NAS catches up at the next configure once mounted), `PATCHY_FYI_BACKUP_KEEP` (10). See `cmake/FyiBackup.cmake`.
+
+### UI dev server (hot reload)
+
+```bash
+cd UI && npm install && npm run dev
+```
+
+Configure the host with `-DNODEGRAPH_DEV_MODE=ON` (e.g. in a Debug build): the UI build is skipped and Patchy loads its UI from the Vite dev server (`localhost:5173`), so UI changes show up without rebuilding the plugin.
+
+Patchy is plain CMake, with no presets: open the folder in CLion (its CMake profiles, e.g. `cmake-build-debug`, are per-user in `.idea/`), VS Code (CMake Tools), or generate an Xcode project with `cmake -G Xcode`. Personal presets can go in `CMakeUserPresets.json` (git-ignored).
+
+---
+
+## Writing a Pax
+
+Include only `Pax/PaxAPI.h`. No JUCE dependency required.
+
+```cpp
+#include "PaxAPI.h"
+#include <cstring>
+
+struct MyPax {};
+
+extern "C" {
+
+const PAX_Descriptor* PAX_getDescriptor() {
+    static PAX_Descriptor d {
+        "My Pax", "My Studio", "1.0.0",
+        2,               // nodeType: 1=MIDI, 2=Audio, 3=AV, 4=Value only
+        PAX_API_VERSION,
+        1, 1, 0, 0       // audioIn, audioOut, midiIn, midiOut
+    };
+    return &d;
+}
+
+PAX_Instance* PAX_create()           { return new MyPax(); }
+void PAX_destroy (PAX_Instance* i)   { delete (MyPax*)i; }
+void PAX_prepare (PAX_Instance*, double, int) {}
+
+void PAX_process (PAX_Instance*, const PAX_ProcessContext* ctx)
+{
+    // Audio pass-through example
+    if (ctx->audioIn && ctx->audioOut)
+        for (int ch = 0; ch < ctx->numChannels; ++ch)
+            if (ctx->audioIn[ch] && ctx->audioOut[ch])
+                std::memcpy (ctx->audioOut[ch], ctx->audioIn[ch],
+                             (size_t) ctx->numSamples * sizeof (float));
+
+    // MIDI pass-through
+    *ctx->midiOutCount = 0;
+    for (int e = 0; e < ctx->midiInCount && e < ctx->midiMaxCount; ++e)
+        ctx->midiOut[(*ctx->midiOutCount)++] = ctx->midiIn[e];
+
+    // Value ports — live, routed by the host the same way audio/MIDI are:
+    // if (ctx->valuesOut && ctx->valueMaxCount > 0) { ... }
+}
+
+int   PAX_getParameterCount (PAX_Instance*)                          { return 0; }
+void  PAX_getParameterInfo  (PAX_Instance*, int, PAX_ParameterInfo*) {}
+float PAX_getParameter      (PAX_Instance*, int)                     { return 0.f; }
+void  PAX_setParameter      (PAX_Instance*, int, float)              {}
+
+} // extern "C"
+```
+
+### Optional exports
+
+| Symbol | Description |
+|--------|-------------|
+| `PAX_getAudioOutputCount` | Return current output port count (dynamic ports) |
+| `PAX_getValueInputCount` / `PAX_getValueOutputCount` | Return Value port counts (nodeType 4, cross-protocol adapters) — static, no instance needed, fixed at scan time |
+| `PAX_getValueInputType` / `PAX_getValueOutputType` | Return the specific type (`PAX_VALUETYPE_*` — MQTT/OSC/DMX/UDP/ArtNet/MIDI/generic) of the Value port at a given index, so a Pax can mix multiple differently-typed ports on one node rather than only generic Value — indexed, static, defaults to generic if not exported |
+| `PAX_isParameterReadOnly` | Render a parameter as a live-updating display rather than a draggable control — the host still calls `PAX_getParameter()` to read it, but never calls `PAX_setParameter()` on it from user interaction. For values a Pax wants to surface for visibility (e.g. the last value it received on a Value input) without inviting the user to edit what's actually just a live mirror of incoming data |
+| `PAX_isParameterLiveSynced` | Mark an *editable* parameter as also live-synced to the frontend — stays a normal, draggable control, but when the Pax changes its value internally (via `PAX_setParameter` from its own `PAX_process()`, not user interaction), the host also pushes that value to the frontend live so the control's on-screen position visually follows it. Deliberately opt-in per parameter, not a blanket watch-everything mechanism, to avoid racing a user's own in-progress drag on an unrelated control |
+| `PAX_getColourCategory` | Override the node's auto-detected colour category (Hybrid/Converter/native-type) — only consulted for a pure-source or pure-sink Pax, the one case the automatic rule can't resolve on its own |
+| `PAX_getFFTSize` | Return FFT magnitude bin count (for spectrum display) |
+| `PAX_getFFTMagnitudes` | Return pointer to FFT magnitude array |
+
+---
+
+## API Reference
+
+### PAX_Descriptor
+
+```c
+typedef struct {
+    const char* name;        // Display name in sidebar
+    const char* vendor;      // Author/studio
+    const char* version;     // Semver string e.g. "1.0.0"
+    int         nodeType;    // 1=MIDI, 2=Audio, 3=AV, 4=Value only (see PAX_getValueInputCount/OutputCount below)
+    int         apiVersion;  // Must equal PAX_API_VERSION
+    int         audioInputs;
+    int         audioOutputs;
+    int         midiInputs;
+    int         midiOutputs;
+} PAX_Descriptor;
+```
+
+### PAX_MidiEvent
+
+```c
+typedef struct {
+    int     sampleOffset;
+    uint8_t byteCount;
+    uint8_t bytes[3];
+} PAX_MidiEvent;
+```
+
+### PAX_ParameterInfo
+
+```c
+typedef struct {
+    const char* name;
+    float       minValue;
+    float       maxValue;
+    float       defaultValue;
+    float       step;   // 0 = continuous, ≥1 = integer steps
+} PAX_ParameterInfo;
+```
+
+### PAX_Value  *(new in API v2, gained `portIndex` in API v3)*
+
+```c
+typedef struct {
+    uint32_t key;        // Integer key resolved from name at setup time
+    uint8_t  type;       // Domain: PAX_TYPE_GENERIC/DMX/OSC/MQTT/UDP/ARTNET
+    uint8_t  dataType;   // PAX_DATA_FLOAT / PAX_DATA_STRING / PAX_DATA_BLOB
+    uint16_t dataSize;   // Byte length of data[] when dataType != PAX_DATA_FLOAT
+    float    value;      // Primary payload (default)
+    uint8_t  data[56];   // Inline buffer for strings/blobs
+    uint8_t  portIndex;  // Which declared Value output port this belongs to
+                          // (API v3) — 0 is always a safe default for a Pax
+                          // with only one Value output; only matters once
+                          // PAX_getValueOutputCount() > 1
+} PAX_Value;
+```
+
+### PAX_ProcessContext  *(new in API v2, gained a DMX universe path in API v4)*
+
+```c
+typedef struct {
+    float**              audioIn;        // [numChannels] input channel pointers
+    float**              audioOut;       // [numChannels] output channel pointers
+    int                  numChannels;    // Always 2 (stereo)
+    int                  numSamples;     // Block size
+    const PAX_MidiEvent* midiIn;
+    int                  midiInCount;
+    PAX_MidiEvent*       midiOut;
+    int*                 midiOutCount;
+    int                  midiMaxCount;
+    const PAX_Value*     valuesIn;
+    int                  valueInCount;
+    PAX_Value*           valuesOut;
+    int*                 valueOutCount;
+    int                  valueMaxCount;
+
+    // DMX universe (API v4) — a separate wide-payload path from Values
+    // above; PAX_Value.data[] is only 56 bytes, nowhere near enough for a
+    // full 512-channel universe. Always 512 bytes when non-NULL. Host
+    // zero-fills dmxFrameOut and clears *dmxFrameOutValid before each
+    // block, so a Pax only needs to touch the channel(s) it actually
+    // writes, not all 512. See `AudioToDmxPax` for a worked example.
+    const uint8_t* dmxFrameIn;
+    bool           dmxFrameInValid;
+    uint8_t*       dmxFrameOut;
+    bool*          dmxFrameOutValid;
+} PAX_ProcessContext;
+```
+
+---
+
+## Thread Safety
+
+| Operation | Thread | Mechanism |
+|-----------|--------|-----------|
+| `NodeProcessor::process()` | Audio | Lock-free per-node buffers |
+| `MidiMonitorBuffer::push()` | Audio | Atomic read/write indices |
+| `AudioMonitorBuffer::push()` | Audio | Atomic write position |
+| `AudioFifo::write/read()` | Audio + Device callback | Pre-allocated ring, `SpinLock` on channel selection |
+| `AudioPlayerNode` seek | Message → Audio | Request/consume: UI writes a target sample index to a separate atomic slot; only the audio thread ever writes the actual playback position, consuming (and clearing) the request at the top of its own block — avoids a read-modify-write race a plain cross-thread store into the position itself would hit |
+| Graph rebuild | Message | `pendingGraph` atomic swap in `processBlock` |
+| Old graph destruction | Message | `graphTrash` deferred bin |
+| Dynamic port resize | Message | `suspendProcessing` only when reducing ports |
+| `updateNodeAudioOutputCount` | Message | `suspendNotificationsQuiet` to avoid rebuild |
+| DAW host audio injection | Audio | Step 2 of `ProcessingGraph::process()` |
+
+**Rule:** no `std::mutex` on the audio thread. All audio↔message communication uses `std::atomic` or lock-free ring buffers / FIFOs.
+
+---
+
+## Performance
+
+Tested on MacBook Air (Apple Silicon), 44100 Hz / 512 samples:
+
+| Scenario | Result |
+|----------|--------|
+| 200 nodes added in batches | ~52ms total |
+| Audio chain: AudioIN → 400 chained Level nodes → AudioOUT | Smooth, no crackle |
+| Audio chain: AudioIN → 500 chained Level nodes → AudioOUT | Begins to break down |
+| Blackhole 16ch IN → OUT (all 16 channels active) | Smooth, no crackle |
+
+Practical patches rarely exceed 20–50 nodes. The bottleneck at scale is the 30fps port activity CSS injection across all nodes — not the audio processing itself.
+
+---
+
+## Licensing
+
+Patchy uses a **source-open, binary-paid** model:
+
+| What | Cost | Terms |
+|------|------|-------|
+| Source code | Free | GPL v3 — compile it yourself |
+| Official pre-built binary | Paid | Convenience fee — supports development |
+| Pax API (`PaxAPI.h`) | Free | MIT — no strings attached |
+| Bundled example Pax | Free | MIT — use as reference |
+
+Pax developers are free to license their Pax under any terms — proprietary, MIT, GPL, or anything else.
+
+---
+
+*Patchy v0.0.941 — JUCE 8 · React 19 · ReactFlow · Vite · TypeScript · Lucide*

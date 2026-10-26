@@ -1,0 +1,267 @@
+#pragma once
+#include "PaxScanner.h"
+#include "../Source/NodeProcessor.h"
+#include "../Source/GraphModel.h"
+#include <memory>
+#include <unordered_map>
+#include <vector>
+
+/**
+ * PaxRegistry
+ *
+ * Singleton (owned by PatchyProcessor).
+ * Loaded at startup from scan results.
+ *
+ * Responsibilities:
+ *   - Keep DynamicLibrary handles alive so function pointers remain valid
+ *   - Provide a factory: createNode(paxName) → NodeProcessor*
+ *   - Tell the UI which Pax names are available per nodeType
+ */
+/** Translates a PAX_VALUETYPE_* int (as returned by a Pax's
+ *  PAX_getValueInputType/OutputType) into the internal PaxValueType enum.
+ *  Centralised here rather than duplicated in WebBridge.cpp and
+ *  PatchyProcessor.cpp, which both need it to build a PaxPortSpec from
+ *  registry data. Unrecognised/out-of-range values default to Generic —
+ *  same safe-default reasoning as everywhere else in this mechanism. */
+PaxValueType paxValueTypeFromTag (int tag);
+
+class PaxRegistry
+{
+public:
+    PaxRegistry() = default;
+
+    /** Populate from a completed scan. Call once on startup. */
+    void load (const std::vector<PaxScanner::ScanResult>& scanResults);
+
+    /** Create a NodeProcessor that wraps a loaded Pax.
+     *  Returns nullptr if paxName is not registered. */
+    std::unique_ptr<NodeProcessor> createNode (const juce::String& nodeId,
+                                               const juce::String& paxName);
+
+    /** All registered Pax names, optionally filtered by nodeType (0 = all). */
+    std::vector<juce::String> getPaxNames (int nodeType = 0) const;
+
+    /** Returns true if at least one Pax is registered. */
+    bool hasPax() const { return ! entries.empty(); }
+
+    // Copied from a fresh instance once during registry loading. Own the name
+    // because some DLLs reuse a temporary character buffer between queries.
+    struct ParameterDescriptor
+    {
+        int index = 0;
+        juce::String name;
+        float minValue = 0.f, maxValue = 0.f, defaultValue = 0.f, step = 0.f;
+        bool readOnly = false;
+    };
+
+    /** Full descriptor info for UI display. */
+    struct Entry
+    {
+        juce::String                    name;
+        juce::String                    vendor;
+        juce::String                    version;
+        int                             nodeType     = 0;
+        int                             audioInputs  = 0;  // 0 = use nodeType default
+        int                             audioOutputs = 0;
+        bool                            hasChannelCapability = false;
+        int                             maxAudioChannels = 2; // Legacy DLLs retain their stereo stride.
+        int                             midiInputs   = 0;
+        int                             midiOutputs  = 0;
+        int                             valueInputs  = 0;  // resolved once at load() time from
+        int                             valueOutputs = 0;  // PAX_getValueInputCount/OutputCount, if exported
+        std::vector<int>                valueInputTypes;   // PAX_VALUETYPE_* per port, resolved from
+        std::vector<int>                valueOutputTypes;  // PAX_getValueInputType/OutputType, if exported
+        int                             colourCategory = -1;  // PAX_COLOURCAT_AUTO (-1) = auto-detect
+        juce::File                      file;
+        std::shared_ptr<juce::DynamicLibrary> lib;
+        std::vector<ParameterDescriptor> parameters;
+
+        // Resolved function pointers
+        using CreateFn  = PAX_Instance*  (*)();
+        using DestroyFn = void (*)(PAX_Instance*);
+        using PrepareFn = void (*)(PAX_Instance*, double, int);
+        using ProcessFn = void (*)(PAX_Instance*, const PAX_ProcessContext*);
+
+        using GetParamCountFn = int   (*)(PAX_Instance*);
+        using GetParamInfoFn  = void  (*)(PAX_Instance*, int, PAX_ParameterInfo*);
+        using GetParamFn      = float (*)(PAX_Instance*, int);
+        using SetParamFn          = void  (*)(PAX_Instance*, int, float);
+        using GetAudioOutCountFn  = int   (*)(PAX_Instance*);
+        using IsParamReadOnlyFn   = int   (*)(PAX_Instance*, int);
+        using IsParamLiveSyncedFn = int   (*)(PAX_Instance*, int);
+        using AudioPassthroughInputFn = int (*)(PAX_Instance*, int);
+        using MidiPassthroughFn = int (*)(PAX_Instance*);
+
+        CreateFn           create           = nullptr;
+        DestroyFn          destroy          = nullptr;
+        PrepareFn          prepare          = nullptr;
+        ProcessFn          process          = nullptr;
+        GetParamCountFn    getParamCount    = nullptr;
+        GetParamInfoFn     getParamInfo     = nullptr;
+        GetParamFn         getParam         = nullptr;
+        SetParamFn         setParam         = nullptr;
+        GetAudioOutCountFn getAudioOutCount = nullptr;
+        IsParamReadOnlyFn  isParamReadOnly  = nullptr;
+        IsParamLiveSyncedFn isParamLiveSynced = nullptr;
+        AudioPassthroughInputFn audioPassthroughInput = nullptr;
+        MidiPassthroughFn  midiPassthrough  = nullptr;
+    };
+
+    const std::vector<Entry>& getEntries() const { return entries; }
+
+private:
+    std::vector<Entry> entries;
+
+    // Keep libs alive by name for quick lookup
+    std::unordered_map<juce::String, int> nameToIndex;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * DynamicPaxProcessor
+ *
+ * A NodeProcessor that delegates process() to a loaded Pax instance.
+ */
+class DynamicPaxProcessor : public NodeProcessor
+{
+public:
+    DynamicPaxProcessor (const juce::String&             nodeId,
+                          const PaxRegistry::Entry& entry);
+    ~DynamicPaxProcessor() override;
+
+    void prepare (double sampleRate, int maxBlockSize) override;
+    int resolveAudioChannelCount (int routedInputChannels) const override
+    {
+        return std::min (maxAudioChannels, std::max (1, routedInputChannels));
+    }
+    int getOutputAudioChannels (int = 0) const override
+    {
+        if (audioOutputCount <= 0) return 0;
+        const int inputChannels = audioInputCount > 0 ? connectedInputAudioChannels : getAudioChannelCount();
+        return std::min ({ maxAudioChannels, getAudioChannelCount(), inputChannels });
+    }
+    void process (int numSamples) override;
+
+    const juce::String& getPaxName() const { return paxName; }
+    // Declared value OUTPUT port types (PAX_VALUETYPE_* per port, in port
+    // order) — see this same member's own declaration comment further
+    // down for the full reasoning. Small public accessor rather than a
+    // public member, matching getPaxName()'s own established pattern here.
+    const std::vector<int>& getValueOutputTypes() const { return valueOutputTypes; }
+    const std::vector<float>& getLastGenericValueValues() const { return lastGenericValueValues; }
+    juce::String customName;   // user-defined display name (for MidiMonitor NAME column)
+    std::function<void()> onPortCountChanged;  // called when dynamic port count changes
+    int audioInputCount  = 1;  // number of audio input ports
+    int audioOutputCount = 1;  // number of audio output ports
+
+    // Parameter access (called from message thread via WebBridge)
+    int   getParameterCount() const;
+    void  getParameterInfo  (int index, PAX_ParameterInfo& info) const;
+    float getParameter      (int index) const;
+    void  setParameter      (int index, float value);
+    /** True if this parameter should render as a live display rather than
+     *  an editable control — see PaxAPI.h's PAX_isParameterReadOnly doc.
+     *  false (normal, editable) if the Pax doesn't export this at all. */
+    bool  isParameterReadOnly (int index) const;
+    /** True if a backend-side change to this (still editable) parameter
+     *  should be pushed to the frontend live — see PaxAPI.h's
+     *  PAX_isParameterLiveSynced doc. false if the Pax doesn't export
+     *  this at all (safe default, no behaviour change for existing Pax). */
+    bool  isParameterLiveSynced (int index) const;
+    // Disable/Enable feature, 2026-09-11 — see PaxAPI.h's own
+    // PAX_getAudioPassthroughInput doc comment for the full reasoning.
+    // Returns the audio INPUT port index to copy into audio OUTPUT port
+    // `outputIndex` while this node is disabled, or -1 if this Pax
+    // either doesn't export this optional function at all, or exports it
+    // but declares no pass-through mapping for this specific output.
+    int   getAudioPassthroughInput (int outputIndex) const;
+    bool  getMidiPassthrough() const;
+
+    // REAL BUG FIX, 2026-09-16 — this override was missing entirely,
+    // which was the actual root cause of "pass-through Pax cuts audio
+    // instead": ProcessingGraph::process()'s own central check
+    // (`if (!n->disabled || n->passesThroughWhenDisabled()) n->process(...)`)
+    // never called process() at all for ANY disabled Pax, since this
+    // defaulted to NodeProcessor's own base "false" — meaning the
+    // pass-through logic already built inside this class's own process()
+    // (checking getAudioPassthroughInput()/getMidiPassthrough()) was
+    // completely unreachable dead code the whole time, for every Pax.
+    // Returns true only if this specific Pax genuinely exports either
+    // pass-through function — a Pax exporting neither (the cross-type
+    // converters: SpectrumyserPax, MqttToValuePax, etc.) correctly keeps
+    // returning false, staying "cut" as designed.
+    bool passesThroughWhenDisabled() const override
+    {
+        return fnAudioPassthroughInput != nullptr || fnMidiPassthrough != nullptr;
+    }
+
+    // Spectrum data access (for Spectrumyser Pax)
+    struct SpectrumData
+    {
+        int           fftSize   = 0;
+        const float*  mags      = nullptr;  // points into Pax memory — valid until next process()
+        bool          valid     = false;
+    };
+    SpectrumData getSpectrumData() const
+    {
+        if (! lib) return {};
+        using GetFFTSize = int         (*)(PAX_Instance*);
+        using GetFFTMags = const float* (*)(PAX_Instance*);
+        auto getSize = (GetFFTSize) lib->getFunction ("PAX_getFFTSize");
+        auto getMags = (GetFFTMags) lib->getFunction ("PAX_getFFTMagnitudes");
+        if (! getSize || ! getMags) return {};
+        return { getSize (instance), getMags (instance), true };
+    }
+
+private:
+    std::shared_ptr<juce::DynamicLibrary> lib;
+
+    PaxRegistry::Entry::CreateFn        fnCreate        = nullptr;
+    PaxRegistry::Entry::DestroyFn       fnDestroy       = nullptr;
+    PaxRegistry::Entry::PrepareFn       fnPrepare       = nullptr;
+    PaxRegistry::Entry::ProcessFn       fnProcess       = nullptr;
+    PaxRegistry::Entry::GetParamCountFn fnGetParamCount = nullptr;
+    PaxRegistry::Entry::GetParamInfoFn  fnGetParamInfo  = nullptr;
+    PaxRegistry::Entry::GetParamFn      fnGetParam      = nullptr;
+    PaxRegistry::Entry::SetParamFn          fnSetParam          = nullptr;
+    PaxRegistry::Entry::GetAudioOutCountFn  fnGetAudioOutCount  = nullptr;
+    PaxRegistry::Entry::IsParamReadOnlyFn   fnIsParamReadOnly   = nullptr;
+    PaxRegistry::Entry::IsParamLiveSyncedFn fnIsParamLiveSynced = nullptr;
+    PaxRegistry::Entry::AudioPassthroughInputFn fnAudioPassthroughInput = nullptr;
+    PaxRegistry::Entry::MidiPassthroughFn fnMidiPassthrough = nullptr;
+
+    PAX_Instance* instance   = nullptr;
+    juce::String  paxName;
+    // Declared value OUTPUT port types (PAX_VALUETYPE_* per port, in port
+    // order), copied once from the registry entry at construction —
+    // independent of outputValueCount (which reflects only how many were
+    // actually WRITTEN this specific block, not how many are declared).
+    // Needed to correctly enumerate every declared generic ("Value" edge,
+    // Phase 5's own live-readout-on-hover feature) output port even on a
+    // block where a port's own value hasn't changed and so was never
+    // rewritten.
+    std::vector<int> valueOutputTypes;
+    // Current value of each declared generic value output port — a
+    // genuinely persistent mirror, sized/indexed to match valueOutputTypes
+    // above. NOT the same thing as reading outputValues[] directly: that
+    // array gets explicitly zeroed every single block (see process()'s own
+    // outputValues.fill(PAX_Value{}) call) before the Pax's own code runs,
+    // so it only ever reflects THIS block's own fresh write, if any — never
+    // "the last real value" the way this mirror does. Found and fixed
+    // 2026-09-10 after a user's own real-world OSC test correctly showed
+    // the live-readout feature reading 0 almost all the time, despite
+    // genuinely changing values being sent continuously — an earlier claim
+    // that outputValues[] itself "persists between writes, same reasoning
+    // as dmxValue" (both on this member's own comment above and in
+    // PatchyProcessor.h's own getPortActivity()) was wrong: only checked
+    // that ctx.valuesOut wasn't a COPY of the array, never that the array
+    // gets explicitly RESET before every block regardless.
+    std::vector<float> lastGenericValueValues;
+    bool hasChannelCapability = false;
+    int maxAudioChannels = 2;
+    juce::AudioBuffer<float> compatibilityChannel;
+
+    static constexpr int kMaxMidiEvents = 256;
+    PAX_MidiEvent midiInBuf  [kMaxMidiEvents];
+    PAX_MidiEvent midiOutBuf [kMaxMidiEvents];
+};

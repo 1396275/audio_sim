@@ -1,0 +1,18 @@
+# Store text consistently across Windows and other development machines.
+* text=auto eol=lf
+
+# Windows launch/build scripts use native line endings on checkout.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Assets must never undergo text or line-ending conversion.
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.gif binary
+*.ico binary
+*.wav binary
+*.mp3 binary
+*.flac binary
+*.zip binary

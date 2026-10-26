@@ -1,0 +1,7 @@
+if(NOT TARGET libpthreadVC3)
+    message(FATAL_ERROR "The Windows pthreads dependency must be built before Mosquitto")
+endif()
+if(NOT TARGET PThreads4W::PThreads4W)
+    add_library(PThreads4W::PThreads4W ALIAS libpthreadVC3)
+endif()
+set(Pthreads4W_FOUND TRUE)

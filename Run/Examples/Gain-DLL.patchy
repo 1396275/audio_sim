@@ -1,0 +1,33 @@
+{
+  "nodes": [
+    {
+      "id": "demo_source", "label": "Source", "nodeType": 26,
+      "paxName": "", "selectedDeviceId": "", "customName": "440 Hz source",
+      "settingsJson": "{\"mode\":\"sine\",\"sineFrequency\":440,\"noiseType\":\"white\",\"level\":0.1,\"loop\":true,\"fileName\":\"\",\"filePath\":\"\"}",
+      "disabled": false, "x": 80, "y": 150
+    },
+    {
+      "id": "demo_gain", "label": "Level", "nodeType": 102,
+      "paxName": "Level", "selectedDeviceId": "", "customName": "Gain from DLL",
+      "settingsJson": "[-12]", "disabled": false, "x": 450, "y": 150
+    },
+    {
+      "id": "demo_scope", "label": "Audio Monitor", "nodeType": 6,
+      "paxName": "", "selectedDeviceId": "", "customName": "Output waveform",
+      "settingsJson": "", "disabled": false, "x": 750, "y": 150
+    }
+  ],
+  "connections": [
+    {
+      "id": "demo_connection_1", "sourceNodeId": "demo_source",
+      "sourcePortId": "demo_source_Audio Out_out", "targetNodeId": "demo_gain",
+      "targetPortId": "demo_gain_Audio In_in"
+    },
+    {
+      "id": "demo_connection_2", "sourceNodeId": "demo_gain",
+      "sourcePortId": "demo_gain_Audio Out_out", "targetNodeId": "demo_scope",
+      "targetPortId": "demo_scope_Audio In_in"
+    }
+  ],
+  "wraps": [], "viewportX": 0, "viewportY": 0, "viewportZoom": 0.9
+}

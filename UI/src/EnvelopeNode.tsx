@@ -1,0 +1,361 @@
+// Patchy — Envelope node UI
+
+import { useEffect, useRef, useState, useCallback, useContext } from 'react';
+import { NodeProps } from '@xyflow/react';
+import { Bridge } from './Bridge';
+import { SliderRow, Stepper, FreqBandDual, NodeHandle, useNodeCollapsed, useNodeDisabled, NodeHeaderButton, NodeCollapseArrow, nodeContainerStyle, settingsPanelStyle, sectionDividerStyle, useThemeColor, EditableTitle, commitModelName , SettingsPanelHeader } from './NodeUtils';
+import { HintContext } from './HintPanel';
+import { Settings, X, Power } from 'lucide-react';
+import { themeColor, useTheme } from './Theme';
+
+// Persist settings panel open state across graph updates (survives undo/redo)
+const _settingsOpen = new Map<string, boolean>();
+
+// Envelope is an AV node — use the AV colour
+const ACCENT   = 'var(--av)';
+const CANVAS_W = 250;
+const CANVAS_H = 48;
+
+// Log scale helpers (same as Spectrumyser)
+const FREQ_MIN = 20, FREQ_MAX = 20000;
+const freqLabel  = (hz: number) =>
+  hz >= 1000 ? `${(hz / 1000).toFixed(1)}k` : `${Math.round(hz)}`;
+
+// ── Envelope display canvas ───────────────────────────────────────────────────
+function EnvelopeDisplay({ ccValue, attack, release }: { ccValue: number; attack: number; release: number }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const history   = useRef<number[]>(new Array(CANVAS_W).fill(0));
+  const theme = useTheme();
+
+  useEffect(() => {
+    history.current.push(ccValue / 127);
+    if (history.current.length > CANVAS_W) history.current.shift();
+  }, [ccValue]);
+
+  useEffect(() => {
+    const c = canvasRef.current; if (!c) return;
+    const ctx = c.getContext('2d'); if (!ctx) return;
+    ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+    const accent = themeColor('--av');
+    ctx.fillStyle = themeColor('--plot-bg');
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+    // Grid line at 50%
+    ctx.strokeStyle = themeColor('--plot-grid'); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, CANVAS_H/2); ctx.lineTo(CANVAS_W, CANVAS_H/2); ctx.stroke();
+
+    // Ghost envelope shape (attack + sustain + release)
+    const totalMs  = attack + 200 + release; // attack + sustain plateau + release
+    const atkX     = (attack / totalMs) * CANVAS_W;
+    const relX     = CANVAS_W - (release / totalMs) * CANVAS_W;
+    ctx.strokeStyle = accent + '55';
+    ctx.fillStyle   = accent + '0a';
+    ctx.lineWidth   = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(0,    CANVAS_H);          // start bottom-left
+    ctx.lineTo(atkX, 4);                 // attack up
+    ctx.lineTo(relX, 4);                 // sustain plateau
+    ctx.lineTo(CANVAS_W, CANVAS_H);      // release down
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    // Envelope curve
+    const grad = ctx.createLinearGradient(0, 0, 0, CANVAS_H);
+    grad.addColorStop(0, accent);
+    grad.addColorStop(1, accent + '22');
+    ctx.fillStyle   = grad;
+    ctx.strokeStyle = accent;
+    ctx.lineWidth   = 1.5;
+    ctx.beginPath();
+    history.current.forEach((v, i) => {
+      const x = i, y = CANVAS_H - v * CANVAS_H;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.lineTo(CANVAS_W, CANVAS_H);
+    ctx.lineTo(0, CANVAS_H);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.beginPath();
+    history.current.forEach((v, i) => {
+      const x = i, y = CANVAS_H - v * CANVAS_H;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    // Current CC value label
+    ctx.fillStyle = themeColor('--text');
+    ctx.font = '9px monospace';
+    ctx.fillText(`CC ${Math.round(ccValue)}`, 4, 12);
+
+  }, [ccValue, attack, release, theme]);
+
+  return <canvas ref={canvasRef} width={CANVAS_W} height={CANVAS_H}
+    style={{ display: 'block', borderRadius: 2 }} />;
+}
+
+// v0.0.943 — SliderRow / Stepper are the shared ones (NodeUtils): value box
+// readouts (drag, ⇧ fine, double-click to type).
+
+// ── Main node ─────────────────────────────────────────────────────────────────
+export default function EnvelopeNode({ id, data, selected }: NodeProps) {
+  const { setHint }  = useContext(HintContext);
+  const { collapsed, toggleCollapsed } = useNodeCollapsed(id, (data as any)._forceCollapsed);
+  const { disabled, toggleDisabled } = useNodeDisabled(id, (data as any).disabled);
+  const [showSettings, setShowSettings] = useState(() => _settingsOpen.get(id) ?? false);
+  // FIXED (2026-08-12): resolved once per render, used only where a
+  // hex-alpha suffix gets concatenated onto ACCENT (the header background/
+  // border below) — same bug class as NodeSelect.tsx, and specifically
+  // the header-tint bug an old note already suspected this file had but
+  // never confirmed.
+  const accentHex = useThemeColor(ACCENT);
+
+  // Parameters
+  const [mode,       setMode]       = useState(0);    // 0=Amplitude, 1=Spectral
+  const [ccNumber,   setCcNumber]   = useState(11);
+  const [midiCh,     setMidiCh]     = useState(1);
+  const [attack,     setAttack]     = useState(10);
+  const [release,    setRelease]    = useState(200);
+  const [sensitivity,setSensitivity]= useState(1.0);
+  const [bandLow,    setBandLow]    = useState(200);
+  const [bandHigh,   setBandHigh]   = useState(2000);
+
+  // Live CC value from port activity
+  const [ccValue, setCcValue] = useState(0);
+  const portBodyRef = useRef<HTMLDivElement>(null);
+
+  // Restore params from paxParams in node data
+  useEffect(() => {
+    // paxParams contains parameter definitions (name/min/max/default)
+    // Use defaultValue to initialise — actual values come via Bridge.setPaxParameter
+    const params: any[] = (data as any)?.paxParams ?? [];
+    params.forEach((p: any, i: number) => {
+      const v = p.defaultValue ?? 0;
+      try {
+        switch (i) {
+          case 0: setMode(Math.round(v));        break;
+          case 1: setCcNumber(Math.round(v));    break;
+          case 2: setMidiCh(Math.round(v));      break;
+          case 3: setAttack(v);                  break;
+          case 4: setRelease(v);                 break;
+          case 5: setSensitivity(v);             break;
+          case 6: setBandLow(v);                 break;
+          case 7: setBandHigh(v);                break;
+        }
+      } catch {}
+    });
+  }, []);
+
+  // Restore state from settingsJson on undo/redo
+  useEffect(() => {
+    const sj = (data as any)?.settingsJson;
+    try {
+      const v = sj ? JSON.parse(sj) as number[]
+                   : [0, 11, 1, 10, 200, 1.0, 200, 2000]; // defaults
+      if (v.length < 8) return;
+      setMode(Math.round(v[0]));  setCcNumber(Math.round(v[1]));  setMidiCh(Math.round(v[2]));
+      setAttack(v[3]);  setRelease(v[4]);  setSensitivity(v[5]);  setBandLow(v[6]);  setBandHigh(v[7]);
+      v.forEach((val, i) => Bridge.setPaxParameter(id, i, val));
+    } catch {}
+  }, [(data as any)?.settingsJson]);
+
+  // Subscribe to port activity for live CC value (via MIDI out RMS)
+  useEffect(() => {
+    return Bridge.onPortActivity((entries: any[]) => {
+      const e = entries.find((e: any) => e.id === id);
+      if (e) setCcValue(Math.round((Math.max(e.l ?? 0, e.r ?? 0) / 1000) * 127));
+    });
+  }, [id]);
+
+  const setParam = useCallback((idx: number, val: number) => {
+    Bridge.setPaxParameter(id, idx, val);
+    // Build updated settings — use current state + override idx
+    const cur = [mode, ccNumber, midiCh, attack, release, sensitivity, bandLow, bandHigh];
+    cur[idx] = val;
+    Bridge.setNodeSettings(id, cur);
+    switch (idx) {
+      case 0: setMode(Math.round(val));       break;
+      case 1: setCcNumber(Math.round(val));   break;
+      case 2: setMidiCh(Math.round(val));     break;
+      case 3: setAttack(val);                 break;
+      case 4: setRelease(val);                break;
+      case 5: setSensitivity(val);            break;
+      case 6: setBandLow(val);                break;
+      case 7: setBandHigh(val);               break;
+    }
+  }, [id, mode, ccNumber, midiCh, attack, release, sensitivity, bandLow, bandHigh]);
+
+  // v0.0.943 — the band: both edges in one settings write
+  const setBand = (lo: number, hi: number) => {   // both in one settings write
+    Bridge.setPaxParameter(id, 6, lo); Bridge.setPaxParameter(id, 7, hi);
+    Bridge.setNodeSettings(id, [mode, ccNumber, midiCh, attack, release, sensitivity, lo, hi]);
+    setBandLow(lo); setBandHigh(hi);
+  };
+  const handleReset = useCallback(() => {
+    setParam(0, 0);
+    setParam(1, 11);
+    setParam(2, 1);
+    setParam(3, 10);
+    setParam(4, 200);
+    setParam(5, 1.0);
+    setParam(6, 200);
+    setParam(7, 2000);
+    Bridge.commitNodeSettings(id);
+  }, [id, setParam]);
+
+  const ports    = (data as any)?.ports ?? [];
+  const inAudio  = ports.filter((p: any) => p.type === 'audio' && p.direction === 'input');
+  const outAudio = ports.filter((p: any) => p.type === 'audio' && p.direction === 'output');
+  const inMidi   = ports.filter((p: any) => p.type === 'midi'  && p.direction === 'input');
+  const outMidi  = ports.filter((p: any) => p.type === 'midi'  && p.direction === 'output');
+  const label    = (data as any)?.label ?? 'Envelope';
+
+  return (
+    <div
+      onMouseEnter={() => setHint({ title:'Envelope', body:'Converts audio amplitude or a frequency band into a MIDI CC stream.\nIdeal for driving automation, LED controllers or modulation.' })}
+      onMouseLeave={() => setHint(null)}
+      style={{
+        ...nodeContainerStyle(ACCENT, !!selected, { disabled }),
+        minWidth: 280,
+      }}
+    >
+      {/* IN ports — all anchored to canvas via portBodyRef so they stay together */}
+      {inAudio.map((p: any, i: number) => (
+        <NodeHandle key={p.id} nodeId={id} label={p.label} direction="in"
+          colour="var(--audio)" index={i} total={inAudio.length + inMidi.length}
+          anchor="display" portBodyRef={portBodyRef} />
+      ))}
+      {inMidi.map((p: any, i: number) => (
+        <NodeHandle key={p.id} nodeId={id} label={p.label} direction="in"
+          colour="var(--midi)" index={inAudio.length + i} total={inAudio.length + inMidi.length}
+          anchor="display" portBodyRef={portBodyRef} />
+      ))}
+
+      {/* OUT ports — all anchored to canvas via portBodyRef so they stay together */}
+      {outAudio.map((p: any, i: number) => (
+        <NodeHandle key={p.id} nodeId={id} label={p.label} direction="out"
+          colour="var(--audio)" index={i} total={outAudio.length + outMidi.length}
+          anchor="display" portBodyRef={portBodyRef} />
+      ))}
+      {outMidi.map((p: any, i: number) => (
+        <NodeHandle key={p.id} nodeId={id} label={p.label} direction="out"
+          colour="var(--midi)" index={outAudio.length + i} total={outAudio.length + outMidi.length}
+          anchor="display" portBodyRef={portBodyRef} />
+      ))}
+
+      {/* Header */}
+      <div style={{
+        display:'flex', alignItems:'center', padding:'4px 8px', gap:4,
+        background:`${accentHex}18`,
+        borderBottom: collapsed ? 'none' : `1px solid ${accentHex}44`,
+        cursor:'pointer',
+      }} onDoubleClick={toggleCollapsed}>
+
+        <NodeHeaderButton onClick={toggleCollapsed}
+          onHint={{ onMouseEnter:()=>{}, onMouseLeave:()=>{} }}>
+          <NodeCollapseArrow collapsed={collapsed} accent={ACCENT} />
+        </NodeHeaderButton>
+
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {/* Phase 6 in-place rename, 2026-09-25 — pencil on hover */}
+          <EditableTitle display={(data as any)?.customName || label} value={(data as any)?.customName ?? ''} placeholder={label}
+            onCommit={commitModelName (id)}
+            textStyle={{ fontSize:'11px', fontWeight:700, color:ACCENT,
+          letterSpacing:'0.1em', fontFamily:"'Syne', sans-serif",
+          textTransform:'uppercase', userSelect:'none' }} />
+        </div>
+
+        {/* Mode badge */}
+        <div className="nodrag" onClick={e => { e.stopPropagation(); setParam(0, mode === 0 ? 1 : 0); Bridge.commitNodeSettings(id); }}
+          style={{
+            fontSize:8, padding:'2px 5px', borderRadius:2, cursor:'pointer',
+            background: mode === 1 ? ACCENT : 'var(--surface)',
+            color:      mode === 1 ? 'var(--on-accent)' : 'var(--text-muted)',
+            fontWeight:700, userSelect:'none',
+          }}>
+          {mode === 0 ? 'AMP' : 'BAND'}
+        </div>
+
+        <div onDoubleClick={e => e.stopPropagation()}>
+          <NodeHeaderButton onClick={toggleDisabled}
+            active={! disabled} activeAccent={ACCENT}
+            onHint={{ onMouseEnter: () => setHint({title:'Disable / Enable Node',body:'Disables or re-enables this node. A disabled node stops processing — its audio side keeps passing through unchanged, but its MIDI/envelope output stops.'}), onMouseLeave: () => setHint(null) }}>
+            <Power size={11} />
+          </NodeHeaderButton>
+        </div>
+
+
+        <div onDoubleClick={e => e.stopPropagation()}>
+          <NodeHeaderButton onClick={() => setShowSettings(v => { const next = !v; _settingsOpen.set(id, next); return next; })}
+            onHint={{ onMouseEnter: () => setHint({title:'Settings',body:'Configure envelope parameters.'}), onMouseLeave: () => setHint(null) }}>
+            <span style={{
+              display:'flex', alignItems:'center', justifyContent:'center',
+              border: showSettings ? `1px solid ${ACCENT}` : '1px solid transparent',
+              borderRadius:3, padding:'1px',
+            }}>
+              <Settings size={11} color={showSettings ? ACCENT : 'var(--text-muted)'} />
+            </span>
+          </NodeHeaderButton>
+        </div>
+
+        <div onDoubleClick={e => e.stopPropagation()}>
+          <NodeHeaderButton onClick={() => Bridge.removeNode(id)}
+            onHint={{ onMouseEnter: () => setHint({title:'Delete node',body:'Remove this node.'}), onMouseLeave: () => setHint(null) }}>
+            <X size={12} color="var(--text-muted)" />
+          </NodeHeaderButton>
+        </div>
+      </div>
+
+      {/* Body */}
+      {!collapsed && (
+        <div ref={portBodyRef} data-port-anchor-first="display" style={{ padding:'6px 8px 4px' }}>
+          <EnvelopeDisplay ccValue={ccValue} attack={attack} release={release} />
+        </div>
+      )}
+
+      {/* Settings */}
+      {showSettings && !collapsed && (
+        <div style={settingsPanelStyle}>
+          {/* v0.0.945 — Reset lives in the settings panel's header (all nodes) */}
+          <SettingsPanelHeader title="ENVELOPE" onReset={handleReset}
+            onClose={() => { _settingsOpen.set(id, false); setShowSettings(false); }} />
+
+          <SliderRow label="Attack"      value={attack}      min={1}    max={500}  step={1}
+            format={v => `${Math.round(v)}ms`} onChange={v => setParam(3,v)} color={ACCENT}
+            onDoubleClick={() => setParam(3, 10)} onCommit={() => Bridge.commitNodeSettings(id)} />
+          <SliderRow label="Release"     value={release}     min={1}    max={2000} step={1}
+            format={v => `${Math.round(v)}ms`} onChange={v => setParam(4,v)} color={ACCENT}
+            onDoubleClick={() => setParam(4, 200)} onCommit={() => Bridge.commitNodeSettings(id)} />
+          <SliderRow label="Sensitivity" value={sensitivity} min={0.1}  max={4}    step={0}
+            format={v => `×${v.toFixed(2)}`}  onChange={v => setParam(5,v)} color={ACCENT}
+            onDoubleClick={() => setParam(5, 1.0)} onCommit={() => Bridge.commitNodeSettings(id)} />
+
+          <div style={sectionDividerStyle}>
+            <Stepper label="CC Number" value={ccNumber} min={0} max={127} width={30} color={ACCENT} buttons
+              onChange={v => { setParam(1, v); Bridge.commitNodeSettings(id); }} />
+            <Stepper label="MIDI Ch"   value={midiCh}   min={1} max={16} width={30} color={ACCENT} buttons
+              onChange={v => { setParam(2, v); Bridge.commitNodeSettings(id); }} />
+          </div>
+
+          {/* Band filters — only in Spectral mode */}
+          {mode === 1 && (
+            <div style={sectionDividerStyle}>
+              <div style={{ color:'var(--text-muted)', fontSize:8, marginBottom:4 }}>Band Filter</div>
+              {/* v0.0.943 (user) — one two-head band slider, like Audio to DMX's
+                  Freq Band: proportional (Hz), ⌘ + drag moves the whole band */}
+              <FreqBandDual bandLow={bandLow} bandHigh={bandHigh} zoomMin={FREQ_MIN} zoomMax={FREQ_MAX} log
+                color="var(--audio)"
+                onBandChange={(which, v) => {   // one edge pushes the other (≥ 1 Hz apart)
+                  if (which === 'low') { const lo = Math.max(FREQ_MIN, Math.min(v, FREQ_MAX - 1)); setBand(lo, Math.max(bandHigh, lo + 1)); }
+                  else                 { const hi = Math.min(FREQ_MAX, Math.max(v, FREQ_MIN + 1)); setBand(Math.min(bandLow, hi - 1), hi); }
+                }}
+                onBandSet={(lo, hi) => setBand(lo, hi)}
+                onCommit={() => Bridge.commitNodeSettings(id)} />
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

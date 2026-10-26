@@ -1,0 +1,174 @@
+import { createContext, useContext, useState, useEffect, useRef, ReactNode } from 'react';
+
+// ── Hint context ──────────────────────────────────────────────────────────────
+interface HintState { title: string; body: string; }
+export const HintContext = createContext<{
+  hint: HintState | null;
+  setHint: (h: HintState | null) => void;
+}>({ hint: null, setHint: () => {} });
+
+export function HintProvider ({ children }: { children: ReactNode }) {
+  const [hint, setHint] = useState<HintState | null>(null);
+  return (
+    <HintContext.Provider value={{ hint, setHint }}>
+      {children}
+    </HintContext.Provider>
+  );
+}
+
+
+// ── Port hints ────────────────────────────────────────────────────────────────
+export const PORT_HINTS: Record<string, { title: string; body: string }> = {
+  'midi-in':   { title: 'MIDI Input',   body: 'Receives MIDI data — notes, CC, pitch bend, clock etc. Connect from a MIDI source.' },
+  'midi-out':  { title: 'MIDI Output',  body: 'Sends MIDI data downstream. Connect to a device, monitor or another processor.' },
+  'audio-in':  { title: 'Audio Input',  body: 'Receives multichannel 32-bit float audio. Connect from an audio source.' },
+  'audio-out': { title: 'Audio Output', body: 'Sends an audio signal downstream. Connect to a device, monitor or another processor.' },
+};
+
+export const EDGE_HINTS: Record<string, { title: string; body: string }> = {
+  'midi':  { title: 'MIDI Connection',  body: 'Carries MIDI data between nodes. Flashes on activity.' },
+  'audio': { title: 'Audio Connection', body: 'Carries the connected signal channels between nodes (up to 64). Colour shows signal level.' },
+  'av':    { title: 'Hybrid Connection',body: 'Carries both MIDI and audio signals between nodes.' },
+  'value': { title: 'Value Connection', body: 'Carries a generic numeric value between nodes (a Pax adapter/converter port).' },
+  'osc':   { title: 'OSC Connection',   body: 'Carries OSC (Open Sound Control) messages between nodes. Flashes on activity.' },
+  'dmx':   { title: 'DMX Connection',   body: 'Carries DMX512 (or ArtNet) lighting data between nodes. Colour shows channel intensity.' },
+  'mqtt':  { title: 'MQTT Connection',  body: 'Carries MQTT messages between nodes. Flashes on activity.' },
+  'udp':   { title: 'UDP Connection',   body: 'Carries raw UDP datagrams between nodes. Flashes on activity.' },
+};
+
+// ── HintPanel — renders at bottom of sidebar ─────────────────────────────────
+// v0.0.921 (2026-10-02) — fixed-height panel; a hint longer than the panel
+// scrolls BY ITSELF (user's choice): a manual scrollbar is useless, since
+// moving the cursor to the panel changes the hint, and growing the panel over
+// the node list got in the way of grabbing nodes. Waits HINT_START_MS, scrolls
+// at HINT_PX_PER_S (~1 line/s), pauses HINT_END_MS at the end, back to the
+// top, loops. Restarts from the top for every new hint (a new title — a live
+// hint updating its values keeps scrolling); short hints never move.
+const HINT_START_MS = 1500;
+const HINT_END_MS   = 2000;
+const HINT_PX_PER_S = 15;
+
+export function HintPanel () {
+  const { hint } = useContext(HintContext);
+  const boxRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const box = boxRef.current;
+    if (!box) return;
+    box.scrollTop = 0;
+    // Position kept here, not read back from scrollTop: ~0.25 px per frame,
+    // and WebKit may round scrollTop to whole pixels — it would never advance.
+    let raf = 0, timer = 0, last = 0, pos = 0;
+    const max = () => box.scrollHeight - box.clientHeight;
+    const start = () => {
+      if (max() <= 1) return;   // fits: nothing to do
+      timer = window.setTimeout(() => { last = performance.now(); raf = requestAnimationFrame(step); }, HINT_START_MS);
+    };
+    const step = (now: number) => {
+      pos = Math.min(max(), pos + (now - last) * HINT_PX_PER_S / 1000);
+      last = now;
+      box.scrollTop = Math.round(pos);
+      if (pos >= max())
+        timer = window.setTimeout(() => { pos = 0; box.scrollTop = 0; start(); }, HINT_END_MS);
+      else
+        raf = requestAnimationFrame(step);
+    };
+    start();
+    return () => { cancelAnimationFrame(raf); clearTimeout(timer); };
+  // v0.0.931 — keyed on the TITLE, not the hint object: a live hint (wrap
+  // summary, Value-edge readout) is re-sent many times a second with new
+  // values; restarting on each one kept it at the top for ever.
+  }, [hint?.title, hint == null]);
+
+  return (
+    <div ref={boxRef} style={{
+      borderTop:   '1px solid var(--border)',
+      padding:     '10px 12px',
+      height:      110,
+      flexShrink:  0,
+      overflowY:   'hidden',
+      boxSizing:   'border-box',
+      transition:  'opacity 0.15s',
+      opacity:     1,
+    }}>
+      {hint ? (
+        <>
+          <div style={{
+            fontSize:      9,
+            fontWeight:    700,
+            letterSpacing: '0.1em',
+            color:         'var(--accent)',
+            marginBottom:  4,
+            fontFamily:    "'Syne', sans-serif",
+            textTransform: 'uppercase',
+          }}>
+            {hint.title}
+          </div>
+          <div style={{
+            fontSize:    10,
+            color:       'var(--text-dim)',
+            lineHeight:  1.5,
+            fontFamily:  "'JetBrains Mono', monospace",
+            whiteSpace:  'pre-line',
+          }}>
+            {hint.body}
+          </div>
+        </>
+      ) : (
+        <div style={{
+          fontSize:   10,
+          color:      'var(--text-dim)',
+          fontFamily: "'JetBrains Mono', monospace",
+          lineHeight: 1.5,
+        }}>
+          Hover any node, button or<br/>parameter to see a hint here.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Node hint descriptions ────────────────────────────────────────────────────
+export const NODE_HINTS: Record<string, { title: string; body: string }> = {
+  // Built-in nodes
+  'MIDI IN DEVICE':   { title: 'MIDI In Device',   body: 'Receives MIDI from an external device or virtual port. Select your controller or DAW output from the dropdown.' },
+  'MIDI OUT DEVICE':  { title: 'MIDI Out Device',  body: 'Sends MIDI to an external device or virtual port. Select your synth, DAW input or other destination.' },
+  'MIDI MORPHER':     { title: 'MIDI Morpher',     body: 'Turns MIDI events matching one rule (channel, message, Data1/Data2 ranges) into another: change channel or message type, rescale or invert values, swap Data1/Data2. Events outside the rule pass through or are blocked (funnel button). Cog or double-click the table to edit.' },
+  'AUDIO IN DEVICE':  { title: 'Audio In Device',  body: 'At 44.1/48 kHz, select a detected soundcard and its input channels. Other rates run internal simulation only.' },
+  'AUDIO OUT DEVICE': { title: 'Audio Out Device', body: 'Sends audio to a hardware output or system destination. Select your speakers or interface.' },
+  'MIDI MONITOR':     { title: 'MIDI Monitor',     body: 'Displays incoming MIDI events in real time. Filter by channel or event type. Double-click header to fold.' },
+  'SOURCE': { title: 'Source', body: 'Load a multichannel audio file or generate sine, square, triangle, saw and noise signals at the simulation sample rate.' },
+  'Audio File': { title: 'Audio File', body: 'Load an audio file. Channel order is preserved; the file is converted to the simulation sample rate without using a soundcard.' },
+  'Waveform Generator': { title: 'Waveform Generator', body: 'Generate signals on the configured simulation channels. Frequency is limited by the simulation sample rate.' },
+  'AUDIO MONITOR':    { title: 'Audio Monitor',    body: 'Displays actual connected input channels. Overlay selected channels in one plot or show one subplot per channel. Includes trigger, zoom and clip detection.' },
+  'MIDI KEYBOARD':    { title: 'MIDI Keyboard',    body: 'On-screen MIDI keyboard. Click or drag to play notes. Supports pitch bend, mod wheel and configurable velocity.' },
+  'UDP IN DEVICE':       { title: 'UDP In Device',       body: 'Listens for UDP datagrams on a configured port. Supports unicast, multicast and broadcast. Set the port in the node settings to activate.' },
+  'UDP OUT DEVICE':      { title: 'UDP Out Device',      body: 'Sends incoming graph values as UDP datagrams to a configured target. Supports unicast (host:port), multicast and broadcast.' },
+  'ARTNET IN DEVICE':   { title: 'ArtNet In Device',    body: 'Listens for Art-Net ArtDmx packets on UDP port 6454. Outputs the DMX universe blob as a PAX_Value. Configure the universe number to filter.' },
+  'ARTNET OUT DEVICE':  { title: 'ArtNet Out Device',   body: 'Sends incoming DMX blobs as Art-Net ArtDmx packets to a configured target host on port 6454. Set universe and target host in settings.' },
+  'DMX IN DEVICE':      { title: 'DMX In Device',       body: 'Receives DMX512 from an Enttec DMX USB Pro interface. Select your serial port in settings. Outputs a DMX universe blob as a PAX_Value.' },
+  'DMX OUT DEVICE':     { title: 'DMX Out Device',      body: 'Sends DMX512 to an Enttec DMX USB Pro interface. Select your serial port in settings. Takes a DMX universe blob from the graph.' },
+  'DMX MONITOR':        { title: 'DMX Monitor',         body: 'Displays all 512 DMX channel values in real time. Pass-through — incoming DMX flows unchanged to the output port. Page through channels with ◀ ▶.' },
+  'DMX CONSOLE':        { title: 'DMX Console',         body: 'Control up to 512 DMX channels with interactive faders. Drag faders or click values to edit. BO = Blackout (all channels to 0). Upstream DMX overrides faders when connected.' },
+  'OSC IN DEVICE':    { title: 'OSC In Device',    body: 'Listens for OSC 1.0 messages on a UDP port. Parses address pattern and typed arguments (f, i, s, b, T, F). Set the port in the node settings to activate.' },
+  'OSC OUT DEVICE':   { title: 'OSC Out Device',   body: 'Sends incoming graph values as OSC messages to a configured host:port. The OSC address is configurable (default /patchy).' },
+  // Pax
+  'AudioLevel':  { title: 'Audio Level',    body: 'Controls signal level from -60dB (silence) to +6dB. Use before outputs or between processing nodes.' },
+  'Level':       { title: 'Audio Level',    body: 'Controls signal level from -60dB (silence) to +6dB. Use before outputs or between processing nodes.' },
+  'Amp':         { title: 'Amp',            body: 'Boosts the signal from 0dB (unity) to +24dB. Use to drive weak signals or compensate for low levels.' },
+  'Transpose':   { title: 'Transpose',      body: 'Shifts MIDI pitch by -24 to +24 semitones. Useful for transposing keyboards or creating harmonies.' },
+  'Envelope':    { title: 'Envelope',       body: 'Converts audio amplitude or a frequency band level into a MIDI CC stream. Ideal for driving LED controllers or DAW automation.' },
+  'Splitter':    { title: 'Stereo Splitter',body: 'Splits a stereo signal into separate Left and Right mono outputs. Balance control adjusts the L/R ratio.' },
+};
+
+// ── Button hints ──────────────────────────────────────────────────────────────
+export const BUTTON_HINTS = {
+  foldAll:     { title: 'Fold / Unfold All',  body: 'Collapses all nodes to their header bar for a clean overview. Press again to expand all. Shortcut: F' },
+  preferences: { title: 'Graph Preferences',  body: 'Open the preferences panel to configure graph behaviour and appearance.' },
+  settings:    { title: 'Node Settings',      body: 'Open the settings panel for this node to configure its options.' },
+  reset:       { title: 'Reset to Defaults',  body: 'Resets all settings or parameters to their default values.' },
+  close:       { title: 'Close Panel',        body: 'Closes this settings panel.' },
+  deleteNode:  { title: 'Delete Node',        body: 'Permanently removes this node and all its connections from the graph.' },
+  fold:        { title: 'Fold / Unfold Node', body: 'Collapses or expands this node. Double-click the header to toggle. Shortcut: F (all nodes).' },
+  toggleDisabled: { title: 'Disable / Enable Node', body: 'Disables or re-enables this node. A disabled node stops processing — most nodes go silent, while a few (Monitors, MIDI Keyboard, and some Pax) keep passing their signal through unchanged.' },
+};

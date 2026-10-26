@@ -1,0 +1,1167 @@
+import { useCallback, useEffect, useRef, useState, useContext } from 'react';
+import { HintContext, NODE_HINTS, BUTTON_HINTS } from './HintPanel';
+import { DawContext } from './DawContext';
+import { X, Settings, Power } from 'lucide-react';
+import { NodeProps } from '@xyflow/react';
+import { Bridge, PaxParamInfo } from './Bridge';
+import { useNodeDelete, useNodeDisabled, NodeHeaderButton, useNodeCollapsed, useNodeSettings, NodeHandle, nodeContainerStyle, portColour, _paxInfoMap, detectPaxTheme, detectPaxTagPrefix, EditableTitle, commitModelName, niceStep, readoutBoxStyle, SettingsPanelHeader } from './NodeUtils';
+import ValueBox from './ValueBox';   // v0.0.943
+
+import { DeviceSelector, AudioDeviceSettingsPanel, ChannelSummary } from './AudioDeviceUI';
+import { MidiChannelSummary, MidiOutChannelFilterPanel } from './MidiDeviceUI';
+import { UdpPortSummary, UdpDeviceSettingsPanel } from './UdpDeviceUI';
+import { OscDeviceSettingsPanel, OscPortSummary } from './OscDeviceUI';
+import { MqttSubscribeSettingsPanel, MqttSubscribeSummary, MqttPublishSettingsPanel, MqttPublishSummary } from './MqttDeviceUI';
+import { ArtNetDeviceSettingsPanel, ArtNetPortSummary } from './ArtNetDeviceUI';
+import { DmxDeviceSelector, DmxSettingsPanel, DmxByteRateLabel, DmxStatusLine } from './DmxDeviceUI';
+
+export interface NodeData {
+  label: string;
+  nodeType: 1 | 2 | 3 | 4 | number;  // 1-4 built-in, higher = Pax
+  paxName?: string;
+  selectedDeviceId?: string;
+  ports: {
+    id: string;
+    label: string;
+    type: 'midi' | 'audio' | 'osc' | 'dmx' | 'mqtt' | 'udp' | 'value';
+    direction: 'input' | 'output';
+  }[];
+  paxParams?: PaxParamInfo[];
+  settingsJson?: string;
+  [key: string]: unknown;
+}
+
+// ── Colour theme per node type ────────────────────────────────────────────────
+const THEME: Record<number, { accent: string; dim: string; glow: string; tag: string }> = {
+  1:  { accent: 'var(--midi)',  dim: 'var(--midi-dim)',  glow: 'var(--midi-glow)',  tag: 'MIDI IN DEVICE'   },
+  2:  { accent: 'var(--midi)',  dim: 'var(--midi-dim)',  glow: 'var(--midi-glow)',  tag: 'MIDI OUT DEVICE'  },
+  3:  { accent: 'var(--audio)', dim: 'var(--audio-dim)', glow: 'var(--audio-glow)', tag: 'AUDIO IN DEVICE'  },
+  4:  { accent: 'var(--audio)', dim: 'var(--audio-dim)', glow: 'var(--audio-glow)', tag: 'AUDIO OUT DEVICE' },
+  8:  { accent: 'var(--udp)',   dim: 'var(--udp-dim)',   glow: 'var(--udp-glow)',   tag: 'UDP IN DEVICE'    },
+  9:  { accent: 'var(--udp)',   dim: 'var(--udp-dim)',   glow: 'var(--udp-glow)',   tag: 'UDP OUT DEVICE'   },
+  10: { accent: 'var(--osc)',    dim: 'var(--osc-dim)',    glow: 'var(--osc-glow)',    tag: 'OSC IN DEVICE'     },
+  11: { accent: 'var(--osc)',    dim: 'var(--osc-dim)',    glow: 'var(--osc-glow)',    tag: 'OSC OUT DEVICE'    },
+  12: { accent: 'var(--artnet)', dim: 'var(--artnet-dim)', glow: 'var(--artnet-glow)', tag: 'ARTNET IN DEVICE'  },
+  13: { accent: 'var(--artnet)', dim: 'var(--artnet-dim)', glow: 'var(--artnet-glow)', tag: 'ARTNET OUT DEVICE' },
+  14: { accent: 'var(--dmx)',    dim: 'var(--dmx-dim)',    glow: 'var(--dmx-glow)',    tag: 'DMX IN DEVICE'     },
+  15: { accent: 'var(--dmx)',    dim: 'var(--dmx-dim)',    glow: 'var(--dmx-glow)',    tag: 'DMX OUT DEVICE'    },
+  16: { accent: 'var(--dmx)',    dim: 'var(--dmx-dim)',    glow: 'var(--dmx-glow)',    tag: 'DMX MONITOR'       },
+  17: { accent: 'var(--dmx)',    dim: 'var(--dmx-dim)',    glow: 'var(--dmx-glow)',    tag: 'DMX CONSOLE'       },
+  18: { accent: 'var(--artnet)', dim: 'var(--artnet-dim)', glow: 'var(--artnet-glow)', tag: 'ARTNET MONITOR'    },
+  19: { accent: 'var(--artnet)', dim: 'var(--artnet-dim)', glow: 'var(--artnet-glow)', tag: 'ARTNET CONSOLE'    },
+  22: { accent: 'var(--mqtt)',   dim: 'var(--mqtt-dim)',   glow: 'var(--mqtt-glow)',   tag: 'MQTT SUBSCRIBE'   },
+  23: { accent: 'var(--mqtt)',   dim: 'var(--mqtt-dim)',   glow: 'var(--mqtt-glow)',   tag: 'MQTT PUBLISH'     },
+};
+// Default theme for Pax nodes
+const PAX_THEME = { accent: 'var(--av)', dim: 'var(--av-dim)', glow: 'var(--av-glow)', tag: 'PAX' };
+
+// ── Main node ─────────────────────────────────────────────────────────────────
+// Per-Pax vertical port offset overrides, per side (see inPortOffset /
+// outPortOffset in GenericNode). A side left out keeps the Pax default (6).
+// anchor (v0.0.918, replaces 914's alignToRail): the Pax's ports sit on the
+// element marked data-port-anchor="<anchor>" in the JSX below (see NodeUtils'
+// "Port anchors") — a single port on it, two ports 7 px above/below.
+const PAX_PORT_OFFSET_OVERRIDES: Record<string, { in?: number; out?: number; anchor?: string }> = {
+  // out: -4 = the value found by eye on 2026-09-15. in: -4 + 7 — its single
+  // MIDI input centred between its 2 outputs (ports are 14 px apart), i.e.
+  // on the body/label area rather than level with the first output
+  // (user's request, 2026-09-25).
+  'MIDI to DMX': { in: 3, out: -4 },
+  // Same 1-in/2-out shape, and a single Balance slider: all its ports are
+  // aligned with the slider rail (user's request, 2026-09-25).
+  'Splitter':    { anchor: 'rail' },
+};
+function GenericNode({ id, data, selected }: NodeProps) {
+  const nodeData = data as NodeData;
+  // nodeType>=100 means Pax
+  const paxType  = nodeData.nodeType >= 100 ? nodeData.nodeType - 100 : null;
+  const paxColourCategory = nodeData.paxName ? _paxInfoMap.get(nodeData.paxName)?.colourCategory : undefined;
+  const paxTag = (() => {
+    if (paxType === null) return null;
+    const prefix = detectPaxTagPrefix (nodeData.ports, paxColourCategory);
+    const labelUp = nodeData.label.toUpperCase();
+    // Skip prepending the category if it already appears anywhere in the
+    // label — not just as a strict prefix. "AV Passthrough" already
+    // avoided "AV AV PASSTHROUGH" via startsWith, but "MQTT to Value"
+    // has "Value" at the end, not the start, so a plain startsWith check
+    // missed it and produced "VALUE MQTT TO VALUE".
+    return labelUp.includes(prefix) ? labelUp : prefix + ' ' + labelUp;
+  })();
+  const theme    = paxType !== null
+    ? { ...detectPaxTheme (nodeData.ports, paxColourCategory), tag: paxTag! }
+    : (THEME[nodeData.nodeType] ?? PAX_THEME);
+
+  const inputs  = nodeData.ports.filter(p => p.direction === 'input');
+  const outputs = nodeData.ports.filter(p => p.direction === 'output');
+
+  const { handleDelete } = useNodeDelete(id);
+  const { disabled, toggleDisabled } = useNodeDisabled(id, (data as any).disabled);
+  const { collapsed, toggleCollapsed } = useNodeCollapsed(id, (data as any)._forceCollapsed);
+  const isPax = paxType !== null;
+  const isAudioDevice = nodeData.nodeType === 3 || nodeData.nodeType === 4;
+  const isMidiOutDevice = nodeData.nodeType === 2;
+  const isUdpDevice    = nodeData.nodeType === 8  || nodeData.nodeType === 9;
+  const isOscDevice    = nodeData.nodeType === 10 || nodeData.nodeType === 11;
+  const isMqttSubscribeDevice = nodeData.nodeType === 22;
+  const isMqttPublishDevice = nodeData.nodeType === 23;
+  const isArtNetDevice = nodeData.nodeType === 12 || nodeData.nodeType === 13;
+  const isDmxDevice    = nodeData.nodeType === 14 || nodeData.nodeType === 15;
+  const { setHint } = useContext(HintContext);
+  const portBodyRef = useRef<HTMLDivElement>(null);
+  // Vertical port offset (NodeHandle: top = headerHeight + 12 + 14*index + offset).
+  // Shared default for every Pax (6) and every other node (8), plus explicit
+  // per-Pax, per-side overrides — Phase 6, 2026-09-25 (see
+  // PAX_PORT_OFFSET_OVERRIDES above). Keyed by the Pax registry name
+  // (nodeData.paxName).
+  const paxPortOverride = isPax ? PAX_PORT_OFFSET_OVERRIDES[nodeData.paxName as string] : undefined;
+  const inPortOffset  = isPax ? (paxPortOverride?.anchor ? 0 : paxPortOverride?.in  ?? 6) : 0;   // non-Pax: anchored (v0.0.918)
+  const outPortOffset = isPax ? (paxPortOverride?.anchor ? 0 : paxPortOverride?.out ?? 6) : 0;
+  // v0.0.918 — anchor per node: Pax with an override anchor (Splitter's rail);
+  // device nodes on their first row, several ports going down from it.
+  const portAnchor   = isPax ? paxPortOverride?.anchor : 'first';
+  const portSpread   = isPax ? 'centre' as const : 'down' as const;
+
+  // ── Audio device channel state ──────────────────────────────────────────────
+  const { showSettings, toggleSettings, closeSettings } = useNodeSettings(id);
+  const [selectedChannels, setSelectedChannels] = useState<number[]>(() => {
+    if (!isAudioDevice) return [];
+    try {
+      const parsed = nodeData.settingsJson ? JSON.parse(nodeData.settingsJson) : null;
+      return Array.isArray(parsed?.selectedChannels) ? parsed.selectedChannels
+        : Array.from({ length: Math.min(64, parsed?.deviceChannelCount ?? 0) }, (_, i) => i);
+    } catch { return []; }
+  });
+  const [deviceChannelCount, setDeviceChannelCount] = useState<number>(() => {
+    if (!isAudioDevice) return 0;
+    try {
+      const parsed = nodeData.settingsJson ? JSON.parse(nodeData.settingsJson) : null;
+      return parsed?.deviceChannelCount ?? 0;
+    } catch { return 0; }
+  });
+
+  // Sync selectedChannels and deviceChannelCount when settingsJson changes (device open / undo / redo)
+  useEffect(() => {
+    if (!isAudioDevice) return;
+    try {
+      const parsed = nodeData.settingsJson ? JSON.parse(nodeData.settingsJson as string) : null;
+      setSelectedChannels(Array.isArray(parsed?.selectedChannels) ? parsed.selectedChannels
+        : Array.from({ length: Math.min(64, parsed?.deviceChannelCount ?? 0) }, (_, i) => i));
+      setDeviceChannelCount(parsed?.deviceChannelCount ?? 0);
+    } catch {
+      setSelectedChannels([]);
+      setDeviceChannelCount(0);
+    }
+  }, [nodeData.settingsJson, isAudioDevice]);
+
+  // ── MIDI Out device channel filter state ────────────────────────────────────
+  const [midiOutChannels, setMidiOutChannels] = useState<number[]>(() => {
+    if (!isMidiOutDevice) return [];
+    try {
+      const parsed = nodeData.settingsJson ? JSON.parse(nodeData.settingsJson) : null;
+      return Array.isArray(parsed?.channels) ? parsed.channels : [];
+    } catch { return []; }
+  });
+
+  // Sync midiOutChannels when settingsJson changes (undo / redo / reload)
+  useEffect(() => {
+    if (!isMidiOutDevice) return;
+    try {
+      const parsed = nodeData.settingsJson ? JSON.parse(nodeData.settingsJson as string) : null;
+      setMidiOutChannels(Array.isArray(parsed?.channels) ? parsed.channels : []);
+    } catch {
+      setMidiOutChannels([]);
+    }
+  }, [nodeData.settingsJson, isMidiOutDevice]);
+
+  // Optimistic local update (fixes the same stale-visual bug already found
+  // once for MIDI CH. MATRIX — settingsJson only refreshes on a structural
+  // graph change/undo/redo, never on a live dispatch alone) alongside the
+  // actual backend dispatch.
+  const handleMidiOutChannelsChange = useCallback((next: number[]) => {
+    setMidiOutChannels(next);
+    Bridge.setNodeParam(id, 'midiOutChannelFilter', JSON.stringify(next));
+  }, [id]);
+
+  // ── UDP IN/OUT settings state ───────────────────────────────────────────────
+  const [udpPort, setUdpPort] = useState<number>(0);
+  const [udpMode, setUdpMode] = useState<0 | 1 | 2>(0); // 0=Unicast 1=Multicast 2=Broadcast
+  const [udpTargetHost, setUdpTargetHost] = useState('');
+  const [udpMulticastAddr, setUdpMulticastAddr] = useState('');
+
+  useEffect(() => {
+    if (!isUdpDevice) return;
+    try {
+      const parsed = nodeData.settingsJson ? JSON.parse(nodeData.settingsJson as string) : null;
+      setUdpPort(parsed?.udpPort ?? 0);
+      setUdpMode((parsed?.udpMode ?? 0) as 0 | 1 | 2);
+      setUdpTargetHost(parsed?.udpTargetHost ?? '');
+      setUdpMulticastAddr(parsed?.udpMulticastAddr ?? '');
+    } catch {}
+  }, [nodeData.settingsJson, isUdpDevice]);
+
+  // Byte-rate label for UDP In nodes — subscribe to 30Hz port activity, compute B/s
+  const [udpByteRate, setUdpByteRate] = useState<string>('');
+  const [udpPortInUse, setUdpPortInUse] = useState<number>(0);   // v0.0.916
+  useEffect(() => {
+    if (nodeData.nodeType !== 8) return;  // UDP In only
+    const unsub = Bridge.onPortActivity((entries) => {
+      const entry = entries.find(e => e.id === id);
+      if (!entry) return;
+      setUdpPortInUse(entry.portInUse ?? 0);   // v0.0.916
+      const bps = (entry.bytes ?? 0) * 30;  // 30Hz poll → bytes/sec
+      if (bps === 0) { setUdpByteRate(''); return; }
+      setUdpByteRate(bps >= 1024
+        ? `${(bps / 1024).toFixed(1)} kB/s`
+        : `${bps} B/s`);
+    });
+    return unsub;
+  }, [id, nodeData.nodeType]);
+
+  // ── OSC IN/OUT settings state ───────────────────────────────────────────────
+  const [oscPort, setOscPort] = useState<number>(0);
+  const [oscTargetHost, setOscTargetHost] = useState('');
+  const [oscAddress, setOscAddress] = useState('/patchy');
+
+  useEffect(() => {
+    if (!isOscDevice) return;
+    try {
+      const parsed = nodeData.settingsJson ? JSON.parse(nodeData.settingsJson as string) : null;
+      setOscPort(parsed?.oscPort ?? 0);
+      setOscTargetHost(parsed?.oscTargetHost ?? '');
+      setOscAddress(parsed?.oscAddress ?? '/patchy');
+    } catch {}
+  }, [nodeData.settingsJson, isOscDevice]);
+
+  // Byte-rate label for OSC In nodes
+  const [oscByteRate, setOscByteRate] = useState<string>('');
+  const [oscPortInUse, setOscPortInUse] = useState<number>(0);   // v0.0.916
+  useEffect(() => {
+    if (nodeData.nodeType !== 10) return;  // OSC In only
+    const unsub = Bridge.onPortActivity((entries) => {
+      const entry = entries.find(e => e.id === id);
+      if (!entry) return;
+      setOscPortInUse(entry.portInUse ?? 0);   // v0.0.916
+      const bps = (entry.bytes ?? 0) * 30;
+      if (bps === 0) { setOscByteRate(''); return; }
+      setOscByteRate(bps >= 1024
+        ? `${(bps / 1024).toFixed(1)} kB/s`
+        : `${bps} B/s`);
+    });
+    return unsub;
+  }, [id, nodeData.nodeType]);
+
+  // ── MQTT Subscribe settings state ───────────────────────────────────────────
+  const [mqttHost, setMqttHost] = useState('');
+  const [mqttPort, setMqttPort] = useState<number>(1883);
+  const [mqttTopic, setMqttTopic] = useState('');
+  const [mqttQos, setMqttQos] = useState<0 | 1 | 2>(1);
+  const [mqttUsername, setMqttUsername] = useState('');
+  const [mqttPassword, setMqttPassword] = useState('');
+
+  useEffect(() => {
+    if (!isMqttSubscribeDevice) return;
+    try {
+      const parsed = nodeData.settingsJson ? JSON.parse(nodeData.settingsJson as string) : null;
+      setMqttHost(parsed?.mqttHost ?? '');
+      setMqttPort(parsed?.mqttPort ?? 1883);
+      setMqttTopic(parsed?.mqttTopic ?? '');
+      setMqttQos((parsed?.mqttQos ?? 1) as 0 | 1 | 2);
+      setMqttUsername(parsed?.mqttUsername ?? '');
+      setMqttPassword(parsed?.mqttPassword ?? '');
+    } catch {}
+  }, [nodeData.settingsJson, isMqttSubscribeDevice]);
+
+  // ── MQTT Publish settings state ─────────────────────────────────────────────
+  const [mqttPubHost, setMqttPubHost] = useState('');
+  const [mqttPubPort, setMqttPubPort] = useState<number>(1883);
+  const [mqttPubTopic, setMqttPubTopic] = useState('');
+  const [mqttPubQos, setMqttPubQos] = useState<0 | 1 | 2>(1);
+  const [mqttPubRetain, setMqttPubRetain] = useState(false);
+  const [mqttPubUsername, setMqttPubUsername] = useState('');
+  const [mqttPubPassword, setMqttPubPassword] = useState('');
+
+  useEffect(() => {
+    if (!isMqttPublishDevice) return;
+    try {
+      const parsed = nodeData.settingsJson ? JSON.parse(nodeData.settingsJson as string) : null;
+      setMqttPubHost(parsed?.mqttHost ?? '');
+      setMqttPubPort(parsed?.mqttPort ?? 1883);
+      setMqttPubTopic(parsed?.mqttTopic ?? '');
+      setMqttPubQos((parsed?.mqttQos ?? 1) as 0 | 1 | 2);
+      setMqttPubRetain(parsed?.mqttRetain ?? false);
+      setMqttPubUsername(parsed?.mqttUsername ?? '');
+      setMqttPubPassword(parsed?.mqttPassword ?? '');
+    } catch {}
+  }, [nodeData.settingsJson, isMqttPublishDevice]);
+
+  // ArtNet state
+  const [artNetUniverse,   setArtNetUniverse]   = useState<number>(0);
+  const [artNetTargetHost, setArtNetTargetHost] = useState('');
+
+  useEffect(() => {
+    if (!isArtNetDevice) return;
+    try {
+      const parsed = nodeData.settingsJson ? JSON.parse(nodeData.settingsJson as string) : null;
+      setArtNetUniverse(parsed?.artNetUniverse ?? 0);
+      setArtNetTargetHost(parsed?.artNetTargetHost ?? '');
+    } catch {}
+  }, [nodeData.settingsJson, isArtNetDevice]);
+
+  // Byte-rate label for ArtNet In nodes
+  const [artNetByteRate, setArtNetByteRate] = useState<string>('');
+  const [artNetPortInUse, setArtNetPortInUse] = useState<number>(0);   // v0.0.916
+  useEffect(() => {
+    if (nodeData.nodeType !== 12) return;  // ArtNet In only
+    const unsub = Bridge.onPortActivity((entries) => {
+      const entry = entries.find(e => e.id === id);
+      if (!entry) return;
+      setArtNetPortInUse(entry.portInUse ?? 0);   // v0.0.916
+      const bps = (entry.bytes ?? 0) * 30;
+      if (bps === 0) { setArtNetByteRate(''); return; }
+      setArtNetByteRate(bps >= 1024
+        ? `${(bps / 1024).toFixed(1)} kB/s`
+        : `${bps} B/s`);
+    });
+    return unsub;
+  }, [id, nodeData.nodeType]);
+
+  // DMX state
+  const [dmxDevicePath, setDmxDevicePath] = useState('');
+  const [dmxUniverse,   setDmxUniverse]   = useState(0);
+  const [serialPorts,   setSerialPorts]   = useState<string[]>([]);
+
+  useEffect(() => {
+    if (!isDmxDevice) return;
+    try {
+      const parsed = nodeData.settingsJson ? JSON.parse(nodeData.settingsJson as string) : null;
+      setDmxDevicePath(parsed?.dmxDevicePath ?? '');
+      setDmxUniverse(parsed?.dmxUniverse ?? 0);
+    } catch {}
+  }, [nodeData.settingsJson, isDmxDevice]);
+
+  // Subscribe to serial port list (shared across all DMX nodes)
+  useEffect(() => {
+    if (!isDmxDevice) return;
+    const unsub = Bridge.onSerialPorts(setSerialPorts);
+    return unsub;
+  }, [isDmxDevice]);
+
+  // Byte-rate label for DMX In nodes
+  const [dmxByteRate, setDmxByteRate] = useState<string>('');
+  const [dmxIsMk2,    setDmxIsMk2]    = useState(false);
+  const [dmxStatus,   setDmxStatus]   = useState<number>(0);   // v0.0.916
+  useEffect(() => {
+    if (!isDmxDevice) return;
+    const unsub = Bridge.onPortActivity((entries) => {
+      const entry = entries.find(e => e.id === id);
+      if (!entry) return;
+      // isMk2 reported by both In and Out nodes
+      if (entry.isMk2 !== undefined) setDmxIsMk2(entry.isMk2);
+      setDmxStatus(entry.dmxStatus ?? 0);   // v0.0.916 — In and Out
+      if (nodeData.nodeType !== 14) return;  // byte-rate for In only
+      const bps = (entry.bytes ?? 0) * 30;
+      if (bps === 0) { setDmxByteRate(''); return; }
+      setDmxByteRate(bps >= 1024
+        ? `${(bps / 1024).toFixed(1)} kB/s`
+        : `${bps} B/s`);
+    });
+    return unsub;
+  }, [id, nodeData.nodeType, isDmxDevice]);
+
+  // Track device channel count from the device list (fallback)
+  const selectedDeviceIdRef = useRef(nodeData.selectedDeviceId);
+  selectedDeviceIdRef.current = nodeData.selectedDeviceId;
+  const nodeTypeRef = useRef(nodeData.nodeType);
+  nodeTypeRef.current = nodeData.nodeType;
+
+  // Warn + reset when device changes and current channel selection is out of range
+  const [channelWarning, setChannelWarning] = useState(false);
+  const selectedChannelsRef = useRef(selectedChannels);
+  selectedChannelsRef.current = selectedChannels;
+
+  useEffect(() => {
+    if (!isAudioDevice) return;
+    return Bridge.onAudioDevices(list => {
+      if (!list.hardwareEnabled) return;
+      const devs = nodeTypeRef.current === 4 ? list.audioOutDevices : list.audioInDevices;
+      const selected = selectedDeviceIdRef.current;
+      const dev = devs.find(d => d.id === selected || d.id.endsWith(`::${selected}`));
+      if (dev?.channelCount == null || dev.channelCount <= 0) return;
+      const count = dev.channelCount;
+      setDeviceChannelCount(count);
+      let explicitSelection = false;
+      try { explicitSelection = Array.isArray(JSON.parse(nodeData.settingsJson as string)?.selectedChannels); } catch {}
+      if (!explicitSelection) {
+        setSelectedChannels(Array.from({ length: Math.min(64, count) }, (_, i) => i));
+        return;
+      }
+      if (selectedChannelsRef.current.some(c => c < 0 || c >= count)) {
+        setChannelWarning(true);
+        const reset = Array.from({ length: Math.min(64, count) }, (_, i) => i);
+        setSelectedChannels(reset);
+        Bridge.setNodeParam(id, 'audioDeviceChannels', JSON.stringify(reset), nodeTypeRef.current as 3 | 4);
+      }
+    });
+  }, [isAudioDevice, id, nodeData.selectedDeviceId, nodeData.settingsJson]);
+  const paxParams = (data.paxParams ?? []) as PaxParamInfo[];
+  const [paramValues, setParamValues] = useState<number[]>([]);
+
+  // Live values for this node's read-only parameters (see PaxAPI.h's
+  // PAX_isParameterReadOnly) — keyed by parameter index. Separate
+  // subscription from paramValues above, deliberately: those sync from
+  // settingsJson (the user's own saved settings), this reads live off
+  // Bridge.onPortActivity's 30fps poll instead, since a read-only
+  // parameter's value is never something settingsJson holds — it's
+  // whatever the Pax is currently reporting, moment to moment. Gated on
+  // the settings panel actually being open — no need for every node on
+  // the canvas to process this 30fps stream when its own panel is closed
+  // and nothing would even be shown.
+  const [readOnlyValues, setReadOnlyValues] = useState<Map<number, number>>(new Map());
+  const hasReadOnlyParams = paxParams.some(p => p.readOnly);
+  useEffect(() => {
+    // ROOT CAUSE FOUND AND FIXED (2026-08-19): this used to also gate on
+    // showSettings, on the assumption the read-only display only renders
+    // when a node's settings panel is open — that assumption was wrong.
+    // The parameter list (including this display) actually renders
+    // unconditionally whenever a Pax has any parameters at all, gated
+    // only on `isPax && paxParams.length > 0` — a completely separate
+    // condition, nothing to do with showSettings. For a Pax with no
+    // separate settings-gear toggle at all (like this one), showSettings
+    // never becomes true, so the subscription never activated — while
+    // the display itself sat there visible the whole time, showing only
+    // whatever the separate settingsJson-sync effect last set. Gating
+    // only on hasReadOnlyParams now, matching what the display itself
+    // actually depends on.
+    if (!hasReadOnlyParams) return;
+    return Bridge.onPortActivity((entries) => {
+      const entry = entries.find(e => e.id === id);
+      if (!entry || !entry.paxReadOnly || entry.paxReadOnly.length === 0) return;
+      setReadOnlyValues(prev => {
+        const next = new Map(prev);
+        entry.paxReadOnly.forEach(({ index, value }) => next.set(index, value));
+        return next;
+      });
+      // Persisting the value into settingsJson (so it survives a graph
+      // rebuild) now happens on the backend itself, unconditionally, in
+      // PatchyProcessor::getPortActivity() — not here. An earlier version
+      // of this did it from here instead, syncing paramValues and calling
+      // Bridge.setNodeSettings whenever a live value arrived — but that
+      // only ran while this specific node's settings panel happened to be
+      // open, which real testing showed doesn't reliably keep the
+      // persisted value current: a rebuild can happen at any moment,
+      // almost certainly while nobody has this panel open at all. This
+      // effect now only needs to update the live display.
+    });
+  }, [hasReadOnlyParams, id]);
+
+  // Sync paramValues when paxParams arrive (may come after mount)
+  // Also restore saved values from settingsJson if available
+  useEffect(() => {
+    if (paxParams.length > 0 && paramValues.length === 0) {
+      const saved = nodeData.settingsJson ? JSON.parse(nodeData.settingsJson) as number[] : null;
+      // Was: all-or-nothing on saved.length === paxParams.length — any
+      // mismatch (e.g. a param added/removed since this settingsJson was
+      // last written) silently discarded EVERY saved value, not just the
+      // new one. Now maps per-index so existing values survive and only
+      // genuinely-missing indices fall back to their own default.
+      const vals = paxParams.map((p, i) => (saved && saved[i] !== undefined) ? saved[i] : p.defaultValue);
+      setParamValues(vals);
+      // Restore param values to C++ Pax
+      vals.forEach((v, i) => Bridge.setPaxParameter(id, i, v));
+    }
+  }, [paxParams.length]);
+
+  // Sync paramValues when settingsJson changes externally (e.g. undo/redo).
+  useEffect(() => {
+    if (paxParams.length === 0) return;
+    const raw = nodeData.settingsJson
+      ? (() => { try { return JSON.parse(nodeData.settingsJson) as number[]; } catch { return null; } })()
+      : null;
+    // Was: `if (!vals || vals.length !== paxParams.length) return;` — a
+    // settingsJson snapshot with a different length than the Pax's
+    // CURRENT param count (e.g. an older undo entry from before a
+    // parameter was added) silently no-op'd this entire sync, leaving
+    // paramValues — and therefore every displayed control, not just the
+    // new one — stuck out of sync with the graph's actual restored state.
+    // Same per-index defaulting as the mount-time effect above instead.
+    const vals = paxParams.map((p, i) => (raw && raw[i] !== undefined) ? raw[i] : p.defaultValue);
+    setParamValues(prev => {
+      if (prev.length === vals.length && prev.every((v, i) => v === vals[i])) return prev;
+      // Skip read-only parameters here — the backend is already the
+      // source of truth for those (it's the one writing settingsJson in
+      // the first place, from PatchyProcessor::getPortActivity()), so
+      // reading a value back out of settingsJson and sending it straight
+      // back via setPaxParameter is pure round-trip noise for those
+      // specifically. Matters more than it sounds: since the backend now
+      // updates settingsJson on every live value change, this effect
+      // fires continuously for a node with a read-only parameter — with
+      // every editable parameter still round-tripped normally (needed
+      // for undo/redo to actually restore them), just not this one.
+      vals.forEach((v, i) => { if (!paxParams[i]?.readOnly) Bridge.setPaxParameter(id, i, v); });
+      return vals;
+    });
+  }, [nodeData.settingsJson, paxParams.length]);
+
+  const onParamChange = useCallback((index: number, value: number) => {
+    setParamValues(prev => {
+      const next = [...prev]; next[index] = value;
+      Bridge.setNodeSettings(id, next);
+      return next;
+    });
+    Bridge.setPaxParameter(id, index, value);
+  }, [id]);
+  const resetParams = useCallback(() => {
+    const defaults = paxParams.map(p => p.defaultValue);
+    setParamValues(defaults);
+    Bridge.setNodeSettings(id, defaults);
+    defaults.forEach((v, i) => Bridge.setPaxParameter(id, i, v));
+    Bridge.commitNodeSettings(id);
+  }, [id, paxParams]);
+  // Layout rule (see SessionLog.md, 2026-08-19, for the full design):
+  // a Pax with exactly one parameter that's also read-only (a pure
+  // display, nothing to drag) shows compactly in the header, no cog —
+  // e.g. OscToValuePax. A Pax with more than one parameter gets a cog
+  // and a fold — collapsed shows a summary of every parameter except any
+  // with its own dedicated special-case rendering (currently just "DMX
+  // Channel", which already gets its own number-input treatment below),
+  // expanded shows the full list. A Pax with exactly one *editable*
+  // parameter (LevelPax, AmpPax, etc.) is unaffected by any of this —
+  // matches its long-standing existing behaviour exactly.
+  const isSingleReadOnlyPax = isPax && paxParams.length === 1 && paxParams[0].readOnly;
+  const isMultiParamPax = isPax && paxParams.length > 1;
+  const foldedSummaryParams = paxParams
+    .map((p, i) => ({ p, i }))
+    .filter(({ p }) => p.name !== 'DMX Channel');
+  // Phase 6 persistent rename, 2026-09-25 — was a standalone useState('')
+  // (lost on every reload/undo); now read from the graph model's own
+  // customName, edited in place in the header (EditableTitle).
+  const customName: string = (nodeData as any).customName ?? '';
+
+  return (
+    <div
+      style={{
+        minWidth:   (isUdpDevice || isOscDevice || isMqttSubscribeDevice || isMqttPublishDevice || isArtNetDevice || isDmxDevice) ? 310 : Math.max(theme.tag.length * 10 + 80, 220),
+        userSelect: 'none',
+        ...nodeContainerStyle(theme.accent, !!selected, { bg: 'var(--surface)', glow: theme.glow, disabled }),
+      }}
+    >
+      {/* Header */}
+      <div
+        onDoubleClick={toggleCollapsed}
+        onMouseEnter={e => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+            const paxName = nodeData.paxName as string | undefined;
+            const h = (paxName ? NODE_HINTS[paxName] : null) ?? NODE_HINTS[String(theme.tag ?? '')] ?? null;
+            if (h) setHint(h);
+          }
+        }}
+        onMouseLeave={e => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node)) setHint(null);
+        }}
+        style={{
+          padding:        '8px 10px 6px',
+          borderBottom:   collapsed ? 'none' : '1px solid var(--border)',
+          display:        'flex',
+          alignItems:     'center',
+          justifyContent: 'space-between',
+          gap:            6,
+          cursor:         'pointer',
+          userSelect:     'none',
+        }}>
+        <div style={{ minWidth: 0, flex: 1, display: 'flex', alignItems: 'center', gap: 4 }}>
+          <span style={{
+            fontSize:   12,
+            color:      theme.accent,
+            opacity:    0.7,
+            display:    'inline-block',
+            transform:  collapsed ? 'rotate(0deg)' : 'rotate(90deg)',
+            transition: 'transform 0.2s',
+          }}>
+              <svg width="8" height="10" viewBox="0 0 8 10" style={{ display:'block' }}>
+                <polygon points="0,0 8,5 0,10" fill="currentColor" />
+              </svg>
+            </span>
+          {/* Phase 6 in-place rename, 2026-09-25 — Pax only (device nodes
+              aren't renamable: their header already shows the device). */}
+          {isPax ? (
+            <EditableTitle display={customName || theme.tag} value={customName} placeholder={theme.tag}
+              onCommit={commitModelName (id)}
+              textStyle={{ fontSize: '11px', fontWeight: 700, color: theme.accent,
+                           letterSpacing: '0.1em', fontFamily: "'Syne', sans-serif", whiteSpace: 'nowrap' }} />
+          ) : (
+            <div style={{
+              fontSize:      '11px',
+              fontWeight:    700,
+              color:         theme.accent,
+              letterSpacing: '0.1em',
+              fontFamily:    "'Syne', sans-serif",
+              whiteSpace:    'nowrap',
+            }}>
+              {theme.tag}
+            </div>
+          )}
+        </div>
+
+
+        {/* Disable/Enable — unconditional, unlike the settings buttons
+            below which are node-type-specific */}
+        <NodeHeaderButton
+          onClick={toggleDisabled}
+          active={! disabled}
+          activeAccent={theme.accent}
+          onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.toggleDisabled), onMouseLeave: () => setHint(null) }}>
+          <Power size={11} />
+        </NodeHeaderButton>
+
+        {/* Pax settings cog — only for a Pax with more than one parameter
+            (unfolds its parameter list). Renaming happens in the header
+            itself (pencil on hover), so no Name panel is needed. */}
+        {isMultiParamPax && (
+          <NodeHeaderButton
+            onClick={toggleSettings}
+            active={showSettings}
+            activeAccent={theme.accent}
+            onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.settings), onMouseLeave: () => setHint(null) }}>
+            <Settings size={11} color={showSettings ? theme.accent : 'var(--text-muted)'} />
+          </NodeHeaderButton>
+        )}
+
+        {/* Audio device settings button */}
+        {isAudioDevice && (
+          <div style={{ position: 'relative', display: 'inline-flex' }}>
+            <NodeHeaderButton
+              onClick={() => { toggleSettings(); setChannelWarning(false); }}
+              active={showSettings}
+              activeAccent="var(--audio)"
+              onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.settings), onMouseLeave: () => setHint(null) }}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              </svg>
+            </NodeHeaderButton>
+            {channelWarning && !showSettings && (
+              <div style={{
+                position: 'absolute', top: -3, right: -3,
+                width: 7, height: 7, borderRadius: '50%',
+                background: 'var(--danger)', pointerEvents: 'none',
+              }} />
+            )}
+          </div>
+        )}
+
+        {/* MIDI Out device channel-filter settings button */}
+        {isMidiOutDevice && (
+          <div style={{ position: 'relative', display: 'inline-flex' }}>
+            <NodeHeaderButton
+              onClick={toggleSettings}
+              active={showSettings}
+              activeAccent="var(--midi)"
+              onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.settings), onMouseLeave: () => setHint(null) }}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              </svg>
+            </NodeHeaderButton>
+          </div>
+        )}
+
+        {isUdpDevice && (
+          <div style={{ position: 'relative', display: 'inline-flex' }}>
+            <NodeHeaderButton
+              onClick={toggleSettings}
+              active={showSettings}
+              activeAccent="var(--udp)"
+              onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.settings), onMouseLeave: () => setHint(null) }}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              </svg>
+            </NodeHeaderButton>
+            {(!udpPort || udpPortInUse > 0) && !showSettings && (
+              <div style={{
+                position: 'absolute', top: -3, right: -3,
+                width: 7, height: 7, borderRadius: '50%',
+                background: 'var(--danger)', pointerEvents: 'none',
+              }} />
+            )}
+          </div>
+        )}
+
+        {/* OSC device settings button */}
+        {isOscDevice && (
+          <div style={{ position: 'relative', display: 'inline-flex' }}>
+            <NodeHeaderButton
+              onClick={toggleSettings}
+              active={showSettings}
+              activeAccent="var(--osc)"
+              onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.settings), onMouseLeave: () => setHint(null) }}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              </svg>
+            </NodeHeaderButton>
+            {(!oscPort || oscPortInUse > 0) && !showSettings && (
+              <div style={{
+                position: 'absolute', top: -3, right: -3,
+                width: 7, height: 7, borderRadius: '50%',
+                background: 'var(--danger)', pointerEvents: 'none',
+              }} />
+            )}
+          </div>
+        )}
+
+        {/* MQTT Subscribe settings button */}
+        {isMqttSubscribeDevice && (
+          <div style={{ position: 'relative', display: 'inline-flex' }}>
+            <NodeHeaderButton
+              onClick={toggleSettings}
+              active={showSettings}
+              activeAccent="var(--mqtt)"
+              onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.settings), onMouseLeave: () => setHint(null) }}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              </svg>
+            </NodeHeaderButton>
+            {(!mqttHost || !mqttTopic) && !showSettings && (
+              <div style={{
+                position: 'absolute', top: -3, right: -3,
+                width: 7, height: 7, borderRadius: '50%',
+                background: 'var(--danger)', pointerEvents: 'none',
+              }} />
+            )}
+          </div>
+        )}
+        {/* MQTT Publish settings button */}
+        {isMqttPublishDevice && (
+          <div style={{ position: 'relative', display: 'inline-flex' }}>
+            <NodeHeaderButton
+              onClick={toggleSettings}
+              active={showSettings}
+              activeAccent="var(--mqtt)"
+              onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.settings), onMouseLeave: () => setHint(null) }}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              </svg>
+            </NodeHeaderButton>
+            {(!mqttPubHost || !mqttPubTopic) && !showSettings && (
+              <div style={{
+                position: 'absolute', top: -3, right: -3,
+                width: 7, height: 7, borderRadius: '50%',
+                background: 'var(--danger)', pointerEvents: 'none',
+              }} />
+            )}
+          </div>
+        )}
+        {/* ArtNet device settings button */}
+        {isArtNetDevice && (
+          <div style={{ position: 'relative', display: 'inline-flex' }}>
+            <NodeHeaderButton
+              onClick={toggleSettings}
+              active={showSettings}
+              activeAccent="var(--artnet)"
+              onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.settings), onMouseLeave: () => setHint(null) }}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              </svg>
+            </NodeHeaderButton>
+            {((!artNetTargetHost && nodeData.nodeType === 13) || artNetPortInUse > 0) && !showSettings && (
+              <div style={{
+                position: 'absolute', top: -3, right: -3,
+                width: 7, height: 7, borderRadius: '50%',
+                background: 'var(--danger)', pointerEvents: 'none',
+              }} />
+            )}
+          </div>
+        )}
+
+        {/* DMX device settings button */}
+        {isDmxDevice && (
+          <div style={{ position: 'relative', display: 'inline-flex' }}>
+            <NodeHeaderButton
+              onClick={toggleSettings}
+              active={showSettings}
+              activeAccent="var(--dmx)"
+              onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.settings), onMouseLeave: () => setHint(null) }}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+              </svg>
+            </NodeHeaderButton>
+            {dmxStatus > 0 && !showSettings && (
+              <div style={{
+                position: 'absolute', top: -3, right: -3,
+                width: 7, height: 7, borderRadius: '50%',
+                background: 'var(--danger)', pointerEvents: 'none',
+              }} />
+            )}
+          </div>
+        )}
+
+        {/* Delete button */}
+        <NodeHeaderButton onClick={handleDelete} danger
+          onHint={{ onMouseEnter: () => setHint(BUTTON_HINTS.deleteNode), onMouseLeave: () => setHint(null) }}><X size={14} /></NodeHeaderButton>
+      </div>
+
+      {!collapsed && <>
+      {/* Device selector — only renders for device nodes, provides portBodyRef anchor */}
+      {/* v0.0.918 — non-Pax (device) nodes: ports line up with the body's
+          first row, whatever it currently is (summary / selector). */}
+      <div ref={portBodyRef} data-port-anchor-first={!isPax ? 'first' : undefined}
+           style={{ padding: !isPax ? '8px 10px' : '0',
+                                         minHeight: isPax && paxParams.length === 0 ? 32 : undefined,
+                                         position: 'relative' }}>
+        {nodeData.nodeType === 1 && (
+          <DeviceSelector
+            nodeId={id}
+            nodeType={1}
+            selectedDeviceId={nodeData.selectedDeviceId}
+          />
+        )}
+        {isMidiOutDevice && (<>
+          <MidiChannelSummary channels={midiOutChannels} />
+          <DeviceSelector
+            nodeId={id}
+            nodeType={2}
+            selectedDeviceId={nodeData.selectedDeviceId}
+          />
+          {showSettings && (
+            <MidiOutChannelFilterPanel
+              channels={midiOutChannels}
+              onChannelsChange={handleMidiOutChannelsChange}
+              onClose={closeSettings}
+            />
+          )}
+        </>)}
+        {(nodeData.nodeType === 3 || nodeData.nodeType === 4) && (<>
+          {nodeData.selectedDeviceId && <ChannelSummary channels={selectedChannels} />}
+          <DeviceSelector
+            nodeId={id}
+            nodeType={nodeData.nodeType as 3 | 4}
+            selectedDeviceId={nodeData.selectedDeviceId}
+          />
+          {showSettings && (
+            <AudioDeviceSettingsPanel
+              nodeId={id}
+              nodeType={nodeData.nodeType as 3 | 4}
+              selectedChannels={selectedChannels}
+              deviceChannelCount={deviceChannelCount}
+              selectedDeviceId={nodeData.selectedDeviceId}
+              warning={channelWarning}
+              onClose={closeSettings}
+            />
+          )}
+        </>)}
+        {isUdpDevice && (<>
+          <UdpPortSummary port={udpPort} mode={udpMode} targetHost={udpTargetHost} multicastAddr={udpMulticastAddr} byteRate={udpByteRate} portInUse={udpPortInUse} onClick={toggleSettings} />
+          {showSettings && (
+            <UdpDeviceSettingsPanel
+              nodeId={id}
+              nodeType={nodeData.nodeType as 8 | 9}
+              port={udpPort}
+              mode={udpMode}
+              targetHost={udpTargetHost}
+              multicastAddr={udpMulticastAddr}
+              portInUse={udpPortInUse}
+              onClose={closeSettings}
+            />
+          )}
+        </>)}
+        {isOscDevice && (<>
+          <OscPortSummary port={oscPort} targetHost={oscTargetHost} oscAddress={oscAddress} byteRate={oscByteRate} portInUse={oscPortInUse} onClick={toggleSettings} />
+          {showSettings && (
+            <OscDeviceSettingsPanel
+              nodeId={id}
+              nodeType={nodeData.nodeType as 10 | 11}
+              port={oscPort}
+              targetHost={oscTargetHost}
+              oscAddress={oscAddress}
+              portInUse={oscPortInUse}
+              onClose={closeSettings}
+            />
+          )}
+        </>)}
+        {isMqttSubscribeDevice && (<>
+          <MqttSubscribeSummary host={mqttHost} port={mqttPort} topic={mqttTopic} onClick={toggleSettings} />
+          {showSettings && (
+            <MqttSubscribeSettingsPanel
+              nodeId={id}
+              host={mqttHost}
+              port={mqttPort}
+              topic={mqttTopic}
+              qos={mqttQos}
+              username={mqttUsername}
+              password={mqttPassword}
+              onClose={closeSettings}
+            />
+          )}
+        </>)}
+        {isMqttPublishDevice && (<>
+          <MqttPublishSummary host={mqttPubHost} port={mqttPubPort} topic={mqttPubTopic} onClick={toggleSettings} />
+          {showSettings && (
+            <MqttPublishSettingsPanel
+              nodeId={id}
+              host={mqttPubHost}
+              port={mqttPubPort}
+              topic={mqttPubTopic}
+              qos={mqttPubQos}
+              retain={mqttPubRetain}
+              username={mqttPubUsername}
+              password={mqttPubPassword}
+              onClose={closeSettings}
+            />
+          )}
+        </>)}
+        {isArtNetDevice && (<>
+          <ArtNetPortSummary universe={artNetUniverse} targetHost={artNetTargetHost} byteRate={artNetByteRate} portInUse={artNetPortInUse} onClick={toggleSettings} />
+          {showSettings && (
+            <ArtNetDeviceSettingsPanel
+              nodeId={id}
+              nodeType={nodeData.nodeType as 12 | 13}
+              universe={artNetUniverse}
+              targetHost={artNetTargetHost}
+              portInUse={artNetPortInUse}
+              onClose={closeSettings}
+            />
+          )}
+        </>)}
+        {isDmxDevice && (<>
+          <DmxByteRateLabel byteRate={dmxByteRate} />
+          <DmxDeviceSelector
+            nodeId={id}
+            devicePath={dmxDevicePath}
+            universe={dmxUniverse}
+            serialPorts={serialPorts}
+          />
+          <DmxStatusLine status={dmxStatus} />
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 3 }}>
+            <span style={{ fontSize: 9, color: 'var(--text-muted)', opacity: 0.6 }}>
+              uni {dmxUniverse}
+            </span>
+            <span
+              onClick={() => Bridge.listSerialPorts()}
+              className="nodrag"
+              style={{ fontSize: 9, color: 'var(--text-muted)', cursor: 'pointer', opacity: 0.6 }}
+              onMouseEnter={e => { (e.currentTarget as HTMLSpanElement).style.opacity = '1'; }}
+              onMouseLeave={e => { (e.currentTarget as HTMLSpanElement).style.opacity = '0.6'; }}
+            >
+              ↺ refresh
+            </span>
+          </div>
+          {showSettings && (
+            <DmxSettingsPanel
+              nodeId={id}
+              nodeType={nodeData.nodeType as 14 | 15}
+              devicePath={dmxDevicePath}
+              universe={dmxUniverse}
+              isMk2={dmxIsMk2}
+              status={dmxStatus}
+              onClose={closeSettings}
+            />
+          )}
+        </>)}
+
+        {/* Compact header content — single-read-only Pax (no cog at all)
+            or a multi-param Pax while folded (cog present, settings
+            closed). Centred, vertically aligned with the ports since
+            they're absolutely positioned within this same div. */}
+        {(isSingleReadOnlyPax || (isMultiParamPax && !showSettings)) && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        gap: 8, minHeight: 32, padding: '0 8px' }}>
+            {isSingleReadOnlyPax && (() => {
+              const p = paxParams[0];
+              const v = readOnlyValues.get(0) ?? paramValues[0] ?? p.defaultValue;
+              // Short label derived from the parameter's own name (its
+              // last word, lowercased) — "Current Value" -> "value" — so
+              // this stays generic rather than hardcoded per Pax, while
+              // still matching the compact style the folded summary uses.
+              const label = p.name.split(' ').pop()!.toLowerCase();
+              return (
+                <span style={{ fontSize: 9, fontVariantNumeric: 'tabular-nums' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>{label}: </span>
+                  <span style={{ color: theme.accent }}>{p.step >= 1 ? Math.round(v).toString() : v.toFixed(3)}</span>
+                </span>
+              );
+            })()}
+            {isMultiParamPax && !showSettings && (<>
+              {foldedSummaryParams.map(({ p, i }, idx) => {
+                const v = p.readOnly ? (readOnlyValues.get(i) ?? paramValues[i] ?? p.defaultValue) : (paramValues[i] ?? p.defaultValue);
+                const label = p.name.split(' ').pop()!.toLowerCase();
+                return (
+                  <span key={i} style={{ fontSize: 9, fontVariantNumeric: 'tabular-nums' }}>
+                    {idx > 0 && <span style={{ color: 'var(--text-muted)' }}>- </span>}
+                    <span style={{ color: 'var(--text-muted)' }}>{label}: </span>
+                    <span style={{ color: p.readOnly ? theme.accent : 'var(--text-muted)' }}>
+                      {p.step >= 1 ? Math.round(v).toString() : v.toFixed(3)}
+                    </span>
+                  </span>
+                );
+              })}
+            </>)}
+          </div>
+        )}
+      </div>
+
+      {/* Pax parameter sliders — outside port body so padding works correctly.
+          Single-read-only Pax never reaches here at all (fully handled by
+          the compact header above); a single-editable-param Pax (LevelPax,
+          AmpPax, etc.) renders here exactly as it always has; a multi-param
+          Pax only renders here while unfolded (showSettings true) — folded,
+          its compact header above covers it instead. */}
+
+      {isPax && paxParams.length > 0 && !isSingleReadOnlyPax && (!isMultiParamPax || showSettings) && (
+        <div className="nodrag" style={{ padding: '8px 10px 6px',
+                                         borderTop: '1px solid var(--border)' }}>
+          {/* v0.0.945 — Reset in the settings panel's header (multi-parameter
+              Pax: this is their panel); a one-slider Pax has no panel and no
+              R — double-clicking its slider resets it */}
+          {isMultiParamPax && (
+            <SettingsPanelHeader title={(nodeData.paxName as string) || 'Parameters'} onReset={resetParams} onClose={closeSettings} />
+          )}
+          {paxParams.map((p, i) => (
+            <div key={i} style={{ marginBottom: 0, paddingTop: 8 }}>
+              {/* Read-only params (see PaxAPI.h's PAX_isParameterReadOnly) —
+                  live display, never an editable control. Checked first,
+                  ahead of binary-toggle/DMX-Channel below, since a
+                  read-only parameter should never fall into either of
+                  those editable treatments even if it happens to share
+                  their shape (e.g. a 0/1 range). */}
+              {p.readOnly ? (
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{p.name}</span>
+                  <span style={{ fontSize: 9, color: theme.accent, fontVariantNumeric: 'tabular-nums' }}>
+                    {(() => {
+                      const v = readOnlyValues.get(i) ?? paramValues[i] ?? p.defaultValue;
+                      return p.step >= 1 ? Math.round(v).toString() : v.toFixed(3);
+                    })()}
+                  </span>
+                </div>
+              ) : /* Binary toggle for 0/1 integer params */ p.step >= 1 && p.min === 0 && p.max === 1 ? (
+                <div style={{ display: 'flex', justifyContent: 'space-between',
+                              alignItems: 'center' }}>
+                  <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{p.name}</span>
+                  <div style={{ display: 'flex', gap: 4 }}>
+                    {['Off', 'On'].map((label, val) => (
+                      <div key={val}
+                        onClick={() => { onParamChange(i, val); Bridge.commitNodeSettings(id); }}
+                        style={{
+                          fontSize:     9,
+                          padding:      '2px 6px',
+                          borderRadius: 3,
+                          cursor:       'pointer',
+                          border:       `1px solid ${(paramValues[i] ?? p.defaultValue) === val ? 'var(--av)' : 'var(--border)'}`,
+                          color:        (paramValues[i] ?? p.defaultValue) === val ? 'var(--av)' : 'var(--text-muted)',
+                          background:   (paramValues[i] ?? p.defaultValue) === val ? 'rgba(251,146,60,0.15)' : 'transparent',
+                        }}>
+                        {label}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : p.name === 'DMX Channel' ? (
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{p.name}</span>
+                <ValueBox value={Math.round(paramValues[i] !== undefined ? paramValues[i] : p.defaultValue)}
+                  min={p.min} max={p.max} accent={theme.accent} width={44}
+                  title={`1-based DMX channel this node's output writes to (1-${p.max}). Drag up/down (⇧ fine) • double-click to type`}
+                  onLive={v => onParamChange(i, v)}
+                  onCommit={v => { onParamChange(i, v); Bridge.commitNodeSettings(id); }}
+                  style={{ fontSize: 9, color: theme.accent, textAlign: 'right' }} />
+              </div>
+              ) : (
+              <div style={{ position: 'relative' }}>
+                <input type="range"
+                  data-port-anchor={i === paxParams.findIndex(q => !q.readOnly && !(q.step >= 1 && q.min === 0 && q.max === 1) && q.name !== 'DMX Channel') ? 'rail' : undefined}
+                  min={p.min} max={p.max}
+                  step={(p.max - p.min) / 1000}
+                  value={paramValues[i] !== undefined ? paramValues[i] : p.defaultValue}
+                  onChange={e => {
+                    let v = parseFloat(e.target.value);
+                    if (p.step >= 1) v = Math.round(v);
+                    onParamChange(i, v);
+                  }}
+                  onMouseUp={() => Bridge.commitNodeSettings(id)}
+                  onKeyUp={() => Bridge.commitNodeSettings(id)}
+                  onDoubleClick={() => { onParamChange(i, p.defaultValue); Bridge.commitNodeSettings(id); }}
+                  onMouseEnter={() => setHint({ title: p.name, body: `Range: ${p.min} to ${p.max}${p.step >= 1 ? ' (integer)' : ''}.
+Double-click to reset to default (${p.defaultValue}).` })}
+                  onMouseLeave={() => setHint(null)}
+                 
+                  style={{ width: '100%', display: 'block', ['--thumb-color' as any]: theme.accent }}
+                />
+                {p.defaultValue > p.min && p.defaultValue < p.max && (() => {
+                  const thumbW = 10;
+                  const pct    = (p.defaultValue - p.min) / (p.max - p.min);
+                  const left   = `calc(${pct * 100}% - ${pct * thumbW - thumbW / 2}px)`;
+                  return (
+                    <div style={{
+                      position:      'absolute',
+                      bottom:        -4,
+                      left,
+                      transform:     'translateX(-50%)',
+                      width:         2,
+                      height:        5,
+                      background:    theme.accent,
+                      borderRadius:  1,
+                      pointerEvents: 'none',
+                      opacity:       0.7,
+                    }} />
+                  );
+                })()}
+              </div>
+              )}
+              {/* label + value - only for non-binary, non-DMX-Channel, non-read-only params (each of those renders its own label) */}
+              {!p.readOnly && !(p.step >= 1 && p.min === 0 && p.max === 1) && p.name !== 'DMX Channel' && (
+              <div style={{ display: 'flex', justifyContent: 'space-between',
+                            fontSize: 9, marginTop: 9 }}>
+                <span style={{ color: 'var(--text-muted)' }}>{p.name}</span>
+                {/* v0.0.943 — the value is a value box (drag, ⇧ fine, double-click to type) */}
+                {(() => {
+                  const v = paramValues[i] !== undefined ? paramValues[i] : p.defaultValue;
+                  const isDb = p.name.toLowerCase().includes('db');
+                  const fmt = (x: number) =>
+                    p.step >= 1 ? (x > 0 ? '+' : '') + Math.round(x).toString() + (isDb ? ' dB' : '')
+                    : isDb ? (x >= 0 ? '+' : '') + x.toFixed(1) + ' dB'
+                    : x.toFixed(2);
+                  return (
+                    <ValueBox value={v} min={p.min} max={p.max} step={p.step >= 1 ? 1 : niceStep(p.max - p.min)}
+                      format={fmt} accent={theme.accent} width={52}
+                      onLive={x => onParamChange(i, x)}
+                      onCommit={x => { onParamChange(i, x); Bridge.commitNodeSettings(id); }}
+                      style={{ ...readoutBoxStyle('var(--text-dim)'), fontSize: 9 }} />
+                  );
+                })()}
+              </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      </>}
+
+      {/* Input handles */}
+      {inputs.map((p, i) => (
+        <NodeHandle key={p.id}
+          nodeId={id} label={p.label} direction="in"
+          colour={isUdpDevice ? 'var(--udp)' : isOscDevice ? 'var(--osc)' : isMqttSubscribeDevice ? 'var(--mqtt)' : isMqttPublishDevice ? 'var(--mqtt)' : isArtNetDevice ? 'var(--artnet)' : isDmxDevice ? 'var(--dmx)' : portColour(p.type)}
+          index={i} total={inputs.length}
+          offset={inPortOffset}
+          anchor={portAnchor}
+          anchorSpread={portSpread}
+          portBodyRef={portBodyRef}
+          portId={p.id}
+        />
+      ))}
+
+      {/* Output handles */}
+      {outputs.map((p, i) => (
+        <NodeHandle key={p.id}
+          nodeId={id} label={p.label} direction="out"
+          colour={isUdpDevice ? 'var(--udp)' : isOscDevice ? 'var(--osc)' : isMqttSubscribeDevice ? 'var(--mqtt)' : isMqttPublishDevice ? 'var(--mqtt)' : isArtNetDevice ? 'var(--artnet)' : isDmxDevice ? 'var(--dmx)' : portColour(p.type)}
+          index={i} total={outputs.length}
+          offset={outPortOffset}
+          anchor={portAnchor}
+          anchorSpread={portSpread}
+          portBodyRef={portBodyRef}
+          portId={p.id}
+        />
+      ))}
+    </div>
+  );
+}
+
+export default GenericNode;

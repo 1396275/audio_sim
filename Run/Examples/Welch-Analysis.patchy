@@ -1,0 +1,23 @@
+{
+  "nodes": [
+    {
+      "id": "welch_source", "label": "Source", "nodeType": 26,
+      "paxName": "", "selectedDeviceId": "", "customName": "",
+      "settingsJson": "{\"customName\":\"1 kHz source\",\"mode\":\"sine\",\"sineFrequency\":1000,\"level\":0.5,\"outputChannels\":1,\"loop\":true}",
+      "disabled": false, "x": 60, "y": 100
+    },
+    {
+      "id": "welch_analysis", "label": "Frequency Analysis", "nodeType": 29,
+      "paxName": "", "selectedDeviceId": "", "customName": "",
+      "settingsJson": "{\"fftSize\":4096,\"window\":\"hann\",\"averages\":8,\"channel\":0,\"freqMin\":20,\"freqMax\":20000,\"scale\":\"log\",\"dbMin\":-140,\"dbMax\":0}",
+      "disabled": false, "x": 430, "y": 100
+    }
+  ],
+  "connections": [
+    {
+      "id": "welch_connection", "sourceNodeId": "welch_source", "sourcePortId": "welch_source_Audio Out_out",
+      "targetNodeId": "welch_analysis", "targetPortId": "welch_analysis_Audio In_in"
+    }
+  ],
+  "wraps": [], "viewportX": 20, "viewportY": 40, "viewportZoom": 0.9
+}

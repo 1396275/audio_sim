@@ -1,0 +1,72 @@
+# ── Build outputs ─────────────────────────────────────────────────────────────
+build/
+Builds/
+cmake-build-*/
+CMakeUserPresets.json
+*.exe
+*.dll
+*.obj
+*.o
+*.lib
+*.a
+*.pdb
+*.ilk
+*.exp
+*.pch
+*.idb
+*.tlog
+*.log
+
+# ── React / Node ──────────────────────────────────────────────────────────────
+UI/node_modules/
+UI/dist/
+UI/.vite/
+UI/*.tsbuildinfo
+
+# Local toolchain/dependencies and packaged application
+dependencies/
+Run/AudioSim.exe
+Run/AudioSimPax/
+Run/Licenses/
+
+# ── IDEs ──────────────────────────────────────────────────────────────────────
+.idea/
+.vs/
+.vscode/
+*.iml
+*.xcworkspace/
+*.xcodeproj/
+
+# ── Development helpers ───────────────────────────────────────────────────────
+bump_and_pack.sh
+
+# ── Private notes and research ────────────────────────────────────────────────
+FYI/
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+*.dSYM/
+**/*.dSYM/
+
+# ── Windows ───────────────────────────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+
+# ── JUCE ──────────────────────────────────────────────────────────────────────
+JuceLibraryCode/
+*.textClipping
+
+# ── Pax binaries (built separately) ─────────────────────────────────────────
+Pax/**/*.dylib
+Pax/**/*.so
+Pax/**/*.dll
+
+# ── Patchy patch files (user data) ────────────────────────────────────────────
+*.patchy
+!Run/Examples/*.patchy
+
+# Shared development tasks for this framework.
+!.vscode/
+.vscode/*
+!.vscode/tasks.json
+!.vscode/launch.json

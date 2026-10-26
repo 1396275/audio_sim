@@ -1,0 +1,496 @@
+import { DragEvent, useEffect, useState, useContext, useRef } from 'react';
+import { Pin, PinOff, Pencil, Trash2 } from 'lucide-react';
+import { DawContext } from './DawContext';
+import { HintPanel, NODE_HINTS, HintContext } from './HintPanel';
+import { Bridge, PaxInfo, WrapLibraryItem } from './Bridge';
+import { detectPaxTheme, detectPaxCategoryKey, useThemeColor } from './NodeUtils';
+
+import { BUILTIN_GROUPS } from './BuiltinNodes';
+
+// Maps the backend's value-type tag strings (from PaxInfo.valueInputTypes/
+// valueOutputTypes — "generic"/"mqtt"/"osc"/"dmx"/"udp"/"artnet"/"midi") to
+// the {type, label} shape detectPaxTheme's portGroupKey expects, so the
+// sidebar can build a "ports-like" array from a PaxInfo entry's raw counts
+// and call the exact same auto-detection algorithm a placed node uses —
+// found this was needed after noticing the sidebar was colouring by a
+// fixed per-paxType lookup, producing a real mismatch against placed
+// nodes' genuinely auto-detected colour.
+const VALUE_TAG_TO_PORT: Record<string, { type: string; label: string }> = {
+  generic: { type: 'value', label: 'Value' },
+  mqtt:    { type: 'mqtt',  label: 'MQTT' },
+  osc:     { type: 'osc',   label: 'OSC' },
+  dmx:     { type: 'dmx',  label: 'DMX' },
+  udp:     { type: 'udp',   label: 'UDP' },
+  artnet:  { type: 'dmx',  label: 'ArtDMX' },
+  midi:    { type: 'midi', label: 'MIDI' },
+};
+
+function paxInfoToPorts (p: PaxInfo): { type: string; label: string; direction: string }[] {
+  const ports: { type: string; label: string; direction: string }[] = [];
+  if (p.audioInputs  > 0) ports.push({ type: 'audio', label: 'Audio', direction: 'input' });
+  if (p.audioOutputs > 0) ports.push({ type: 'audio', label: 'Audio', direction: 'output' });
+  if (p.midiInputs   > 0) ports.push({ type: 'midi',  label: 'MIDI',  direction: 'input' });
+  if (p.midiOutputs  > 0) ports.push({ type: 'midi',  label: 'MIDI',  direction: 'output' });
+  (p.valueInputTypes  ?? []).forEach(tag => {
+    const m = VALUE_TAG_TO_PORT[tag] ?? VALUE_TAG_TO_PORT.generic;
+    ports.push({ ...m, direction: 'input' });
+  });
+  (p.valueOutputTypes ?? []).forEach(tag => {
+    const m = VALUE_TAG_TO_PORT[tag] ?? VALUE_TAG_TO_PORT.generic;
+    ports.push({ ...m, direction: 'output' });
+  });
+  return ports;
+}
+
+// Grouped by detected category (via detectPaxCategoryKey), not raw
+// paxType — a Pax's declared descriptor nodeType (1-4) is just a rough
+// starting point for its default port layout, not what it actually does;
+// grouping by that instead of the real auto-detected category put e.g. a
+// pure-sink Pax with mixed input types (falling back to Hybrid/orange)
+// in the same section as genuine Converters, purely because both happen
+// to have nodeType=4. category key must match detectPaxCategoryKey's
+// return values exactly.
+const PLUGIN_GROUPS = [
+  { label: 'MIDI',      category: 'midi',      accent: 'var(--midi)',    dim: 'var(--midi-dim)'    },
+  { label: 'Audio',     category: 'audio',     accent: 'var(--audio)',   dim: 'var(--audio-dim)'   },
+  { label: 'Hybrid',    category: 'hybrid',    accent: 'var(--av)',      dim: 'var(--av-dim)'      },
+  { label: 'Converter', category: 'converter', accent: 'var(--value)',  dim: 'var(--value-dim)'  },
+  { label: 'OSC',       category: 'osc',       accent: 'var(--osc)',     dim: 'var(--osc-dim)'     },
+  { label: 'DMX',       category: 'dmx',       accent: 'var(--dmx)',     dim: 'var(--dmx-dim)'     },
+  { label: 'ArtNet',    category: 'artnet',    accent: 'var(--artnet)',  dim: 'var(--artnet-dim)'  },
+  { label: 'MQTT',      category: 'mqtt',      accent: 'var(--mqtt)',    dim: 'var(--mqtt-dim)'    },
+  { label: 'UDP',       category: 'udp',       accent: 'var(--udp)',     dim: 'var(--udp-dim)'     },
+  { label: 'Generic',   category: 'generic',   accent: 'var(--generic)', dim: 'var(--generic-dim)' },
+];
+
+// v0.0.938 — a saved wrap: drag it onto the canvas (lands folded there)
+// v0.0.939 — hover: ✎ rename (inline, Enter keeps, Esc cancels), 🗑 delete
+// (asks, moves the file to the Trash)
+function WrapItem({ item }: { item: WrapLibraryItem }) {
+  const { setHint } = useContext(HintContext);
+  const [hover, setHover]     = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft]     = useState(item.name);
+  const commit = () => {
+    setEditing(false);
+    const v = draft.trim();
+    if (v && v !== item.name) Bridge.wrapLibraryRename(item.file, v);
+  };
+  const iconBtn: React.CSSProperties = { display: 'inline-flex', cursor: 'pointer', color: 'var(--text-muted)', padding: 2, borderRadius: 3 };
+  return (
+    <div draggable={!editing}
+      onDragStart={e => { e.dataTransfer.setData('text/plain', JSON.stringify({ wrapFile: item.file })); e.dataTransfer.effectAllowed = 'copy'; }}
+      onMouseEnter={e => {
+        const el = e.currentTarget as HTMLDivElement;
+        el.style.borderColor = 'var(--generic)';
+        setHover(true);
+        setHint({ title: item.name, body: `A saved wrap${item.nodes ? ` (${item.nodes} nodes)` : ''}. Drag it onto the canvas: an independent copy lands there, folded — its nodes, inner wires, settings and pins. ✎ renames it, 🗑 moves it to the Trash.` });
+      }}
+      onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.borderColor = 'var(--border)'; setHover(false); setHint(null); }}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px', borderRadius: 'var(--radius)',
+        border: '1px solid var(--border)', background: 'var(--surface)', cursor: 'grab', userSelect: 'none',
+        transition: 'border-color .15s',
+      }}>
+      <span style={{ color: 'var(--generic)', fontSize: 12, width: 14, textAlign: 'center' }}>▣</span>
+      <div style={{ minWidth: 0, flex: 1 }}>
+        {editing ? (
+          <input autoFocus value={draft} spellCheck={false} autoComplete="off"
+            onChange={e => setDraft(e.target.value)}
+            onBlur={commit}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { e.preventDefault(); (e.target as HTMLInputElement).blur(); }
+              if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setDraft(item.name); setEditing(false); }
+            }}
+            style={{ width: '100%', fontSize: 11, background: 'var(--surface2)', color: 'var(--text)',
+                     border: '1px solid var(--border-hi)', borderRadius: 3, padding: '1px 4px', outline: 'none' }} />
+        ) : (
+          <div style={{ fontSize: 11, color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.name}</div>
+        )}
+        <div style={{ fontSize: 9, color: 'var(--text-muted)' }}>{item.nodes ? `${item.nodes} nodes` : 'Wrap'}</div>
+      </div>
+      {hover && !editing && (
+        <div style={{ display: 'flex', gap: 2, flexShrink: 0 }}>
+          <span style={iconBtn} title="Rename"
+            onClick={e => { e.stopPropagation(); setDraft(item.name); setEditing(true); }}><Pencil size={11} /></span>
+          <span style={iconBtn} title="Move to Trash"
+            onClick={e => { e.stopPropagation(); Bridge.wrapLibraryDelete(item.file); }}><Trash2 size={11} /></span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DragItem({ nodeType, label, desc, accent, dim, icon, paxName = '', paxInfo, initialSettings }: {
+  nodeType:   number;
+  label:      string;
+  desc:       string;
+  accent:     string;
+  dim:        string;
+  icon:       string;
+  paxName?: string;
+  paxInfo?: PaxInfo;
+  initialSettings?: Record<string, unknown>;
+}) {
+  // FIXED (2026-08-12): resolved once per render, used only where a
+  // hex-alpha suffix gets concatenated below (the hover glow) — same bug
+  // class as NodeSelect.tsx. accent arrives as a raw CSS var() string
+  // from every caller (the protocol group definitions above, and
+  // detectPaxTheme for Pax items).
+  const accentHex = useThemeColor(accent);
+
+  const onDragStart = (e: DragEvent<HTMLDivElement>) => {
+    e.dataTransfer.setData('text/plain', JSON.stringify({
+      nodeType:  paxName ? 0 : nodeType,
+      paxName,
+      initialSettings,
+      paxType:   paxName ? nodeType : 0,
+    }));
+    e.dataTransfer.effectAllowed = 'copy';
+  };
+
+  const { setHint } = useContext(HintContext);
+  const nodeHint = NODE_HINTS[paxName ?? ''] ?? NODE_HINTS[label] ?? NODE_HINTS[label.toUpperCase()] ?? null;
+  const buildHint = () => {
+    if (paxInfo) {
+      const categoryKey = detectPaxCategoryKey(paxInfoToPorts(paxInfo), paxInfo.colourCategory);
+      const CATEGORY_DISPLAY: Record<string,string> = {
+        midi:'MIDI', audio:'Audio', hybrid:'Hybrid', converter:'Converter',
+        osc:'OSC', dmx:'DMX', artnet:'ArtNet', mqtt:'MQTT', udp:'UDP', generic:'Generic',
+      };
+      const typeLabel = CATEGORY_DISPLAY[categoryKey] ?? 'Plugin';
+      const ports = [];
+      if (paxInfo.audioInputs)  ports.push(`${paxInfo.audioInputs} audio in`);
+      if (paxInfo.audioOutputs) ports.push(`${paxInfo.audioOutputs} audio out`);
+      if (paxInfo.midiInputs)   ports.push(`${paxInfo.midiInputs} MIDI in`);
+      if (paxInfo.midiOutputs)  ports.push(`${paxInfo.midiOutputs} MIDI out`);
+      if (paxInfo.valueInputs)  ports.push(`${paxInfo.valueInputs} value in`);
+      if (paxInfo.valueOutputs) ports.push(`${paxInfo.valueOutputs} value out`);
+      return {
+        title: label,
+        body: (nodeHint?.body ?? '') +
+              `
+
+v${paxInfo.version} · ${paxInfo.vendor}
+Type: ${typeLabel} · ${ports.join(', ')}`
+      };
+    }
+    return nodeHint;
+  };
+
+  return (
+    <div
+      draggable onDragStart={onDragStart}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 10,
+        padding: '7px 10px', borderRadius: 'var(--radius)',
+        border: '1px solid var(--border)', background: 'var(--surface)',
+        cursor: 'grab', userSelect: 'none',
+        transition: 'border-color .15s, background .15s, box-shadow .15s',
+      }}
+      onMouseEnter={e => {
+        const el = e.currentTarget as HTMLDivElement;
+        el.style.borderColor = accent; el.style.background = dim;
+        el.style.boxShadow = `0 0 12px ${accentHex}44`;
+        const h = buildHint(); if (h) setHint(h);
+      }}
+      onMouseLeave={e => {
+        const el = e.currentTarget as HTMLDivElement;
+        el.style.borderColor = 'var(--border)'; el.style.background = 'var(--surface)';
+        el.style.boxShadow = 'none';
+        setHint(null);
+      }}
+    >
+      <div style={{
+        width: 28, height: 28, borderRadius: 4, flexShrink: 0,
+        background: dim, border: `1px solid ${accent}`,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        fontSize: 14, color: accent,
+      }}>
+        {icon}
+      </div>
+      <div style={{ overflow: 'hidden' }}>
+        <div style={{
+          fontFamily: "'Syne', sans-serif", fontWeight: 600, fontSize: 10,
+          color: accent, letterSpacing: '0.06em',
+          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+        }}>
+          {label}
+        </div>
+        <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 1 }}>{desc}</div>
+      </div>
+    </div>
+  );
+}
+
+function Section({ label, accent, children, defaultOpen = true }: {
+  label: string; accent: string; children: React.ReactNode; defaultOpen?: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div style={{ borderTop: '1px solid var(--border)' }}>
+      <button onClick={() => setOpen(v => !v)} style={{
+        width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        padding: '7px 12px', background: 'none', border: 'none', cursor: 'pointer',
+      }}>
+        <span style={{
+          fontSize: 9, fontWeight: 700, letterSpacing: '0.12em',
+          textTransform: 'uppercase', color: accent,
+        }}>
+          {label}
+        </span>
+        <span style={{
+          fontSize: 8, color: 'var(--text-muted)', display: 'inline-block',
+          transition: 'transform 0.2s', transform: open ? 'rotate(180deg)' : 'none',
+        }}>▼</span>
+      </button>
+      {open && (
+        <div style={{ padding: '0 8px 8px', display: 'flex', flexDirection: 'column', gap: 5 }}>
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Sidebar modes — v0.0.921 (2026-10-02) ───────────────────────────────────
+// Pinned (default, as before): always open, takes its own column.
+// Auto: hidden; slides out FLOATING over the canvas (nodes never move) when
+// the cursor reaches the window's left edge, slides back AUTO_HIDE_MS after
+// the cursor leaves it (also after a drag from it ends). Pin button in the
+// header; per-install, like the other UI preferences (localStorage).
+const PIN_KEY      = 'patchy.sidebarPinned';
+const AUTO_HIDE_MS = 3000;
+const EDGE_PX      = 20;  // hot zone at the left edge that reveals it (was 8: too narrow, user)
+
+function loadPinned (): boolean {
+  try { return localStorage.getItem(PIN_KEY) !== 'false'; } catch { return true; }
+}
+
+export default function Sidebar() {
+  const { isStandalone } = useContext(DawContext);
+  const { hint, setHint } = useContext(HintContext);
+  const [paxItems, setPaxItems] = useState<PaxInfo[]>([]);
+  useEffect(() => { Bridge.onPaxList(list => setPaxItems(list)); }, []);
+  // v0.0.938 — the wrap library
+  const [wrapLib, setWrapLib] = useState<WrapLibraryItem[]>([]);
+  useEffect(() => Bridge.onWrapLibrary(lib => setWrapLib(lib.items)), []);
+  const hasPax = paxItems.length > 0;
+
+  const [pinned, setPinned] = useState<boolean>(loadPinned);
+  // Auto mode: starts OUT (v0.0.922) — a hidden sidebar at launch left only
+  // the empty dark canvas, which looked like Patchy was broken (user). It
+  // then slides away on the usual countdown unless the cursor moves onto it.
+  const [open,   setOpen]   = useState(true);   // Auto mode only
+  const hideTimer = useRef<number | null>(null);
+  const cancelHide   = () => { if (hideTimer.current !== null) { clearTimeout(hideTimer.current); hideTimer.current = null; } };
+  const scheduleHide = () => { cancelHide(); hideTimer.current = window.setTimeout(() => { hideTimer.current = null; setOpen(false); }, AUTO_HIDE_MS); };
+  const togglePinned = () => {
+    const next = !pinned;
+    setPinned(next);
+    try { localStorage.setItem(PIN_KEY, String(next)); } catch {}
+    cancelHide();
+    setOpen(!next);   // just unpinned with the cursor on it: stay out until it leaves
+  };
+  // v0.0.928 — two ways the auto-hide sidebar used to stay out:
+  //  • it only hid on mouseleave; opened by the edge zone on the cursor's way
+  //    OUT of the window (or the window losing focus), no mouseleave ever came
+  //    (WebKit doesn't send one once the cursor is in another app). Now the
+  //    countdown also starts when the edge opens it, when the cursor leaves
+  //    the page, when the window loses focus and when it gets it back while
+  //    the cursor isn't on the sidebar; entering the sidebar cancels it.
+  //  • a click anywhere outside it (graph, nodes, header) now hides it at once.
+  const asideRef = useRef<HTMLElement | null>(null);
+  const hovered  = useRef(false);
+  useEffect(() => {
+    if (pinned) return;
+    const away = () => { if (! hovered.current) scheduleHide(); };
+    const onLeavePage = () => { hovered.current = false; scheduleHide(); };
+    const onPointerDown = (e: PointerEvent) => {
+      if (asideRef.current && asideRef.current.contains(e.target as Node)) return;
+      cancelHide(); hovered.current = false; setOpen(false);
+    };
+    window.addEventListener('blur', onLeavePage);
+    window.addEventListener('focus', away);
+    document.documentElement.addEventListener('mouseleave', onLeavePage);
+    window.addEventListener('pointerdown', onPointerDown, true);
+    return () => {
+      window.removeEventListener('blur', onLeavePage);
+      window.removeEventListener('focus', away);
+      document.documentElement.removeEventListener('mouseleave', onLeavePage);
+      window.removeEventListener('pointerdown', onPointerDown, true);
+    };
+  }, [pinned]);
+
+  // v0.0.928 (user) — the hint panel lives at the bottom of this sidebar: while
+  // any hint is showing (node header, button, port…), don't slide away before
+  // it can be read. The countdown restarts when the hint goes away. A click
+  // in the graph still hides it at once (handler above).
+  useEffect(() => {
+    if (pinned || ! open) return;
+    if (hint) cancelHide();
+    else if (! hovered.current) scheduleHide();
+  }, [hint, pinned, open]);
+
+  // A drag from the sidebar swallows mouseleave: start the countdown when it ends.
+  useEffect(() => {
+    if (pinned) return;
+    const onDragEnd = () => scheduleHide();
+    window.addEventListener('dragend', onDragEnd);
+    return () => window.removeEventListener('dragend', onDragEnd);
+  }, [pinned]);
+  useEffect(() => {
+    if (!loadPinned()) scheduleHide();   // launch "peek" in Auto mode, see `open` above
+    return () => cancelHide();
+  }, []);
+
+  const floating = !pinned;
+  return (
+    <>
+    {floating && !open && (
+      <div
+        onMouseEnter={() => { setOpen(true); scheduleHide(); }}   // hides unless the cursor moves onto it
+        style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: EDGE_PX, zIndex: 39 }}
+      />
+    )}
+    <aside
+      ref={asideRef}
+      onMouseEnter={floating ? () => { hovered.current = true; cancelHide(); setOpen(true); } : undefined}
+      onMouseLeave={floating ? () => { hovered.current = false; scheduleHide(); } : undefined}
+      style={{
+      width: 210, background: 'var(--surface2)', borderRight: '1px solid var(--border)',
+      display: 'flex', flexDirection: 'column', flexShrink: 0, overflow: 'hidden',
+      ...(floating ? {
+        position: 'absolute', left: 0, top: 0, bottom: 0, zIndex: 40,
+        transform: open ? 'translateX(0)' : 'translateX(-100%)',
+        transition: 'transform 0.25s ease, box-shadow 0.25s ease',
+        boxShadow: open ? '4px 0 18px rgba(0,0,0,0.45)' : 'none',
+      } : {}),
+    }}>
+      {/* Header — fixed (v0.0.921), with the pin button */}
+      <div style={{ padding: '16px 14px 12px', borderBottom: '1px solid var(--border)', flexShrink: 0, position: 'relative' }}>
+        <div style={{
+          fontFamily: "'Syne', sans-serif", fontWeight: 800,
+          fontSize: 15, color: 'var(--text)', letterSpacing: '0.06em',
+        }}>AUDIO SIM</div>
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>Drag nodes onto canvas</div>
+        <button
+          onClick={togglePinned}
+          onMouseEnter={() => setHint({ title: pinned ? 'Sidebar pinned' : 'Sidebar auto-hide',
+            body: pinned ? 'Click to auto-hide: the sidebar then slides out when the cursor reaches the left edge, and back a few seconds after it leaves.'
+                         : 'Click to pin the sidebar open.' })}
+          onMouseLeave={() => setHint(null)}
+          style={{
+            position: 'absolute', top: 12, right: 10, width: 22, height: 22,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            background: 'transparent', border: '1px solid var(--border)', borderRadius: 'var(--radius)',
+            color: pinned ? 'var(--text-dim)' : 'var(--accent)', cursor: 'pointer',
+          }}
+        >{pinned ? <Pin size={12} /> : <PinOff size={12} />}</button>
+      </div>
+
+      {/* Scrollable node list — the only part that scrolls (v0.0.921) */}
+      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', display: 'flex', flexDirection: 'column' }}>
+
+      {/* Built-in label */}
+      <div style={{ padding: '8px 12px 0' }}>
+        <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
+          Built-in
+        </div>
+      </div>
+
+      {/* Built-in groups */}
+      {BUILTIN_GROUPS.map(group => (
+        <Section key={group.label} label={group.label} accent={group.accent}>
+          {group.nodes.map(n => (
+            <DragItem key={n.label} nodeType={n.type} label={n.label} desc={n.desc}
+              accent={group.accent} dim={group.dim} icon={n.icon} initialSettings={n.initialSettings} />
+          ))}
+        </Section>
+      ))}
+
+      {/* Pax */}
+      {hasPax && (
+        <>
+          <div style={{ padding: '10px 12px 0', borderTop: '1px solid var(--border)', marginTop: 4 }}>
+            <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
+              Pax
+            </div>
+          </div>
+          {PLUGIN_GROUPS.map(group => {
+            const items = paxItems.filter(p => detectPaxCategoryKey(paxInfoToPorts(p), p.colourCategory) === group.category);
+            if (items.length === 0) return null;
+            return (
+              <Section key={group.label} label={group.label} accent={group.accent}>
+                {items.map(p => {
+                  const itemTheme = detectPaxTheme(paxInfoToPorts(p), p.colourCategory);
+                  return (
+                    <DragItem key={p.name} nodeType={p.nodeType} label={p.name}
+                      desc={p.vendor || 'Pax'} accent={itemTheme.accent} dim={itemTheme.dim}
+                      icon="⬡" paxName={p.name} paxInfo={p} />
+                  );
+                })}
+              </Section>
+            );
+          })}
+        </>
+      )}
+
+      {/* No Pax hint */}
+      {!hasPax && (
+        <div style={{
+          padding: '8px 14px', fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.6,
+          borderTop: '1px solid var(--border)', marginTop: 4,
+        }}>
+          No Pax found.<br />
+          Drop <span style={{ color: 'var(--text-dim)' }}>.dylib / .so / .dll</span><br />
+          into the Pax folder.
+        </div>
+      )}
+
+      {/* Wrap library (v0.0.938) */}
+      <div style={{ padding: '10px 12px 0', borderTop: '1px solid var(--border)', marginTop: 4 }}>
+        <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
+          Wraps
+        </div>
+      </div>
+      {wrapLib.length > 0 ? (
+        <Section label="Library" accent="var(--generic)">
+          {wrapLib.map(w => <WrapItem key={w.file} item={w} />)}
+        </Section>
+      ) : (
+        <div style={{ padding: '6px 14px 8px', fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+          No saved wraps yet.<br />
+          Save one with its <span style={{ color: 'var(--text-dim)' }}>🔖 Save to library</span> button.
+        </div>
+      )}
+
+      {/* Port legend */}
+      <div style={{ marginTop: 'auto', padding: '12px 14px', borderTop: '1px solid var(--border)' }}>
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, letterSpacing: '0.08em' }}>
+          PORT TYPES
+        </div>
+        {[
+          { color: 'var(--audio)',   label: 'Audio' },
+          { color: 'var(--generic)', label: 'Value' },
+        ].map(({ color, label }) => (
+          <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+            <div style={{
+              width: 10, height: 10, borderRadius: '50%', background: color,
+              border: '2px solid var(--bg)', boxShadow: `0 0 6px ${color}`,
+            }} />
+            <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>{label}</span>
+          </div>
+        ))}
+        <div style={{ marginTop: 10, fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+          Connect ○ out → in ○<br />Same port type only
+        </div>
+      </div>
+
+      </div>
+      {/* Fixed hint panel — fixed height, scrolls internally (v0.0.921) */}
+      <HintPanel />
+    </aside>
+    </>
+  );
+}

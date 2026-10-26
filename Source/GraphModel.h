@@ -1,0 +1,274 @@
+#pragma once
+#include <juce_core/juce_core.h>
+#include <functional>
+#include <vector>
+#include <algorithm>
+#include <deque>
+
+enum class PortType      { Midi, Audio, OSC, DMX, MQTT, UDP, Value };
+enum class PortDirection { Input, Output };
+
+struct Port
+{
+    juce::String  id, label;
+    PortType      type      = PortType::Midi;
+    PortDirection direction = PortDirection::Input;
+};
+
+/** Value port type tag for a Pax-declared port — deliberately its own
+ *  enum, not PortType directly. ArtNet and plain DMX share the same
+ *  PortType::DMX internally (see the built-in ArtNet/DMX nodes) and are
+ *  only distinguished by label text ("ArtDMX" vs "DMX") — the frontend's
+ *  own connection-type classifier works off that label text, not this
+ *  backend enum, so PaxValueType needs to keep ArtNet and DMX distinct
+ *  even though they'll resolve to the same PortType once a port is
+ *  actually created. Mirrors PAX_VALUETYPE_* in PaxAPI.h 1:1. */
+enum class PaxValueType { Generic, Mqtt, Osc, Dmx, Udp, ArtNet, Midi };
+
+/** Translates a PaxValueType + port label into the internal PortType plus
+ *  the label prefix that makes the frontend's own (label-text-based)
+ *  connection/edge classifiers recognise it correctly. See PaxValueType's
+ *  comment above for why ArtNet and DMX share PortType::DMX but need
+ *  different label text. */
+void portTypeAndLabelFor (PaxValueType t, PortType& outType, juce::String& outLabelPrefix);
+
+/** Reverse direction — determines a Port's PaxValueType from its actual
+ *  PortType + label (the ArtDMX-vs-DMX distinction again needs the label,
+ *  not just PortType, to tell them apart). Used when serializing a node's
+ *  ports (toVar()) back into per-port type tags for undo/redo and fragment
+ *  export. */
+PaxValueType paxValueTypeFromPort (const Port& p);
+
+/** String tag <-> PaxValueType, used for JSON serialization (toVar()'s
+ *  output, and reading it back in restoreSnapshot()/Fragment Import).
+ *  Deliberately string tags rather than raw ints, for readability in
+ *  saved/exported project JSON. */
+juce::String tagForValueType   (PaxValueType t);
+PaxValueType  parseValueTypeTag (const juce::String& tag);
+
+/** Bundles a Pax node's full port configuration — counts plus, for Value
+ *  ports specifically, each port's individual declared type. Replaces
+ *  the long, ever-growing list of individual int parameters that
+ *  addNode/restoreNode/portsForType used to take (audioIn, audioOut,
+ *  midiIn, midiOut, then valueIn, valueOut added alongside them) — one
+ *  more extension on top of that would have made an already-awkward
+ *  signature worse, so this consolidates it while the per-port-typing
+ *  work is already touching all three functions anyway.
+ *
+ *  valueInTypes/valueOutTypes: PaxValueType per Value port, in the same
+ *  order as the count implies. Empty, or shorter than the count, is
+ *  fine — missing entries default to PaxValueType::Generic, which is
+ *  exactly the pre-per-port-typing behaviour for any Pax that doesn't
+ *  declare per-port types (existing PAX_getValueInputCount/OutputCount-
+ *  only Pax, or an index the author didn't populate). */
+struct PaxPortSpec
+{
+    int audioIn = 0, audioOut = 0;
+    int midiIn  = 0, midiOut  = 0;
+    int valueIn = 0, valueOut = 0;
+    std::vector<PaxValueType> valueInTypes;
+    std::vector<PaxValueType> valueOutTypes;
+
+    PaxValueType valueInTypeAt (int i) const
+    {
+        return (i >= 0 && i < (int) valueInTypes.size()) ? valueInTypes[(size_t) i] : PaxValueType::Generic;
+    }
+    PaxValueType valueOutTypeAt (int i) const
+    {
+        return (i >= 0 && i < (int) valueOutTypes.size()) ? valueOutTypes[(size_t) i] : PaxValueType::Generic;
+    }
+};
+
+struct NodeData
+{
+    juce::String      id, label;
+    int               nodeType        = 1;
+    juce::String      paxName;        // empty = built-in, non-empty = dynamic Pax
+    juce::String      selectedDeviceId;  // for nodeType 4 and 5
+    juce::String      settingsJson;      // UI settings blob (JSON string)
+    // User-given display name, 2026-09-25 — Phase 6 "universal, persistent
+    // node rename". Separate from `label` on purpose: GenericNode.tsx derives
+    // a Pax's own header title FROM `label` (e.g. "MIDI TRANSPOSE"), and a
+    // Pax's settingsJson is a plain array of parameter values, so neither
+    // could carry a name without breaking something. Empty = no custom
+    // name (the node shows its default title). Saved to .patchy files and
+    // carried in undo snapshots via toVar()/fromVar(); set through
+    // WebBridge's setNodeCustomName (one undoable step, no graph rebuild).
+    juce::String      customName;
+    float             x = 100.f, y = 100.f;
+    bool              disabled = false;  // Disable/Enable toggle, 2026-09-11 — see ProcessingGraph's own process() for what this actually does at runtime
+    std::vector<Port> ports;
+};
+
+/** A wrap (v0.0.930) — several nodes shown as one box on the canvas.
+ *  Purely a UI / project-file concept: the processing graph never looks at
+ *  wraps (members stay ordinary nodes with ordinary connections), so wrapping
+ *  can't affect audio/MIDI. One level only (no wraps inside wraps). */
+/** A Pax control pinned onto a folded wrap's box (v0.0.932): parameter
+ *  `index` of member node `nodeId`, shown as `label` (empty = default). */
+struct WrapPin
+{
+    juce::String nodeId;
+    int          index = 0;
+    juce::String label;
+    bool operator== (const WrapPin& o) const { return nodeId == o.nodeId && index == o.index && label == o.label; }
+};
+
+struct WrapData
+{
+    juce::String      id, name;
+    juce::StringArray nodeIds;   // members
+    juce::StringArray ports;     // inner handle ids shown on the folded face (stable list)
+    float             x = 0.f, y = 0.f;   // folded box position
+    bool              open = false;       // opened in place (members shown in a frame)
+    std::vector<WrapPin> pins;            // v0.0.932 — controls pinned on the box, in order
+
+    /** Drops pins whose node is no longer a member. */
+    void prunePins()
+    {
+        pins.erase (std::remove_if (pins.begin(), pins.end(),
+                                    [this] (const WrapPin& q) { return ! nodeIds.contains (q.nodeId); }),
+                    pins.end());
+    }
+};
+
+struct Connection
+{
+    juce::String id;
+    juce::String sourceNodeId, sourcePortId;
+    juce::String targetNodeId, targetPortId;
+};
+
+class GraphModel
+{
+public:
+    std::function<void()> onChange;
+    /** Called after undo/redo restores a snapshot — allows the processor to
+     *  resync device managers from the restored GraphModel state. */
+    std::function<void()> onAfterRestore;
+
+    // Viewport state (pan + zoom) — saved/restored with the graph
+    float viewportX    = 0.0f;
+    float viewportY    = 0.0f;
+    float viewportZoom = 1.0f;
+
+    NodeData&   addNode       (int nodeType, float x, float y,
+                              const juce::String& paxName = {},
+                              const PaxPortSpec& portSpec = {});
+
+    /** Restore a node with its original saved ID (used by setStateInformation).
+     *  Does NOT fire onChange — caller must do that once all nodes+connections
+     *  are restored. */
+    NodeData&   restoreNode   (const juce::String& savedId,
+                               int nodeType, float x, float y,
+                               const juce::String& paxName = {},
+                               const PaxPortSpec& portSpec = {});
+
+    /** Temporarily disable onChange notifications (for batch restores). */
+    void clear()
+    {
+        nodes.clear();
+        connections.clear();
+        wraps.clear();
+        viewportX = viewportY = 0.0f;
+        viewportZoom = 1.0f;
+    }
+
+    void        suspendNotifications()       { notificationsSuspended = true; }
+    void        resumeNotifications()            { normalizeLegacyMonitorConnections(); notificationsSuspended = false; if (onChange) onChange(); }
+    void        resumeNotificationsQuiet()       { normalizeLegacyMonitorConnections(); notificationsSuspended = false; }  // resumes without firing onChange
+    /** Convert legacy inline monitors to input-only observer branches once all
+     *  nodes and connections have been restored. Keeps node settings intact. */
+    void        normalizeLegacyMonitorConnections();
+    bool        removeNode    (const juce::String& nodeId);
+    NodeData*   findNode      (const juce::String& nodeId);
+
+    Connection* addConnection (const juce::String& srcNode, const juce::String& srcPort,
+                                const juce::String& dstNode, const juce::String& dstPort);
+    bool        removeConnection (const juce::String& connId);
+    bool        hasConnection   (const juce::String& connId) const;
+    void        renameNode       (const juce::String& nodeId, const juce::String& newLabel);
+    void        updateNodeAudioOutputCount (const juce::String& nodeId, int newAudioOut);
+    void        setNodeSettings  (const juce::String& nodeId, const juce::String& json);
+
+    juce::var   toVar() const;
+
+    // ── Wraps (v0.0.930) — see WrapData ───────────────────────────────────────
+    // No onChange from these: wraps don't touch processing. Callers push the
+    // graph to the UI (and an undo snapshot where it's an undoable action).
+    WrapData&   addWrap     (const juce::String& name, const juce::StringArray& nodeIds,
+                             const juce::StringArray& ports, float x, float y);
+    WrapData*   findWrap    (const juce::String& wrapId);
+    bool        removeWrap  (const juce::String& wrapId);   // unwrap: members stay
+    /** v0.0.935 — nodes join / leave a wrap (⌥-drag). Joining takes a node out
+     *  of any other wrap (one level) and brings its pins along; `ports`
+     *  replaces the face ports; pins of nodes that left are dropped; a wrap
+     *  left empty is removed.
+     *  Returns false when nothing changed. */
+    bool        changeWrapMembers (const juce::String& wrapId, const juce::StringArray& add,
+                                   const juce::StringArray& remove, const juce::StringArray& ports);
+    /** Rebuild wraps from a saved "wraps" array (snapshot / file); members
+        that no longer exist are dropped, empty wraps skipped. */
+    void        restoreWraps (const juce::var& wrapsArray);
+    /** v0.0.936 — the wraps array of a saved graph: "wraps", or "packs" in
+     *  files / snapshots saved before the Packs → Wraps rename (TEMPORARY
+     *  fallback — drop once old projects have been re-saved). */
+    static juce::var wrapsOf (const juce::DynamicObject& o)
+    {
+        return o.hasProperty ("wraps") ? o.getProperty ("wraps") : o.getProperty ("packs");
+    }
+    const std::vector<WrapData>& getWraps() const { return wraps; }
+
+    // ── Undo / Redo ───────────────────────────────────────────────────────────
+    static constexpr int kMaxUndoSteps = 50;
+
+    /** Call this BEFORE any qualifying mutation to capture the current state. */
+    void pushSnapshot();
+
+    /** Push a pre-captured snapshot onto the undo stack directly.
+     *  Used by commitNodeSettings to push the pre-drag state. */
+    void pushExistingSnapshot (juce::var snapshot)
+    {
+        undoStack.push_back (std::move (snapshot));
+        while ((int) undoStack.size() > kMaxUndoSteps)
+            undoStack.pop_front();
+        redoStack.clear();
+    }
+
+    /** Undo the last action. Returns true if successful. */
+    bool undo();
+
+    /** Redo the last undone action. Returns true if successful. */
+    bool redo();
+
+    bool canUndo() const { return !undoStack.empty(); }
+    bool canRedo() const { return !redoStack.empty(); }
+
+    /** Clear both undo and redo stacks — called on file load. */
+    void clearHistory() { undoStack.clear(); redoStack.clear(); }
+
+    // ── Test / read-only accessors ────────────────────────────────────────────
+    const std::vector<NodeData>&   getNodes()       const { return nodes; }
+    const std::vector<Connection>& getConnections() const { return connections; }
+    int getNodeCount()       const { return static_cast<int>(nodes.size()); }
+    int getConnectionCount() const { return static_cast<int>(connections.size()); }
+
+    static std::vector<Port> portsForType (int t, const juce::String& nodeId,
+                                           const PaxPortSpec& portSpec = {});
+
+private:
+    void notifyChange();
+
+    std::vector<NodeData>   nodes;
+    std::vector<Connection> connections;
+    std::vector<WrapData>   wraps;   // v0.0.930
+
+    bool notificationsSuspended  = false;
+
+    // ── History ───────────────────────────────────────────────────────────────
+    std::deque<juce::var> undoStack;
+    std::deque<juce::var> redoStack;
+
+    void restoreSnapshot (const juce::var& snapshot);
+
+};

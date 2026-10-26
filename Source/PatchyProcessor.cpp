@@ -1,0 +1,1096 @@
+#include "PatchyProcessor.h"
+#include "DiagLog.h"   // timestamped lifecycle / host-idle driver log lines (v0.0.919)
+#include "PatchyEditor.h"
+#include "AudioDeviceNodes.h"
+#include <utility>
+#include <chrono>
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+PatchyProcessor::PatchyProcessor()
+    : AudioProcessor (BusesProperties()
+          .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+          .withOutput ("Output", juce::AudioChannelSet::stereo(), true))
+{
+    // v0.0.919 — session header in the log file (see PatchyLog.h). The home
+    // folder shows whether the host sandboxes us: inside a sandbox it is
+    // the container (~/Library/Containers/<id>/Data), not ~.
+    {
+        // Plugin type and host are NOT known yet here (logged "Undefined in
+        // Unknown" in Logic, 2026-09-30) — they're logged on the first
+        // prepareToPlay() instead.
+        juce::Logger::writeToLog ("===== Patchy " + juce::String (JucePlugin_VersionString)
+                                  + " started, " + juce::Time::getCurrentTime().toString (true, true));
+        juce::Logger::writeToLog ("Patchy: home folder seen by this process: "
+                                  + juce::File::getSpecialLocation (juce::File::userHomeDirectory).getFullPathName());
+        juce::Logger::writeToLog ("Patchy: log file: " + PatchyLog::getLogFile().getFullPathName());
+    }
+
+    // Scan for dynamic Pax at startup
+    auto scanResults = PaxScanner::scan();
+    registry.load (scanResults);
+    juce::Logger::writeToLog (
+        juce::String ("PatchyProcessor: ")
+        + juce::String ((int) registry.getEntries().size())
+        + juce::String (" Pax loaded"));
+
+    // When the graph changes: rebuild processing graph AND push to UI
+    graphModel.onChange = [this]
+    {
+        // Clear any old trashed graph first (safe on message thread)
+        if (graphTrashPending.load())
+        {
+            graphTrashPending.store (false);
+            graphTrash.reset();
+        }
+        rebuildProcessingGraph();
+        // Notify the editor to push updated graph to the WebView
+        if (auto* ed = dynamic_cast<PatchyEditor*> (getActiveEditor()))
+        {
+            ed->getBridge().pushGraphToUI();
+            ed->getBridge().pushUndoState();
+        }
+    };
+
+    // After undo/redo restores a snapshot, resync device managers so
+    // applyDeviceSelections() uses the restored selectedDeviceId values
+    // rather than the stale pre-undo selections.
+    // onAfterRestore is not needed — rebuildProcessingGraph syncs device
+    // selections directly from graphModel before applying them.
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+void PatchyProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
+{
+    diagLog ("PatchyProcessor: prepareToPlay (" + juce::String (sampleRate) + " Hz, "
+                              + juce::String (samplesPerBlock) + ")");   // v0.0.919 — lifecycle visibility (hosts)
+    // v0.0.919 — the idle driver must not run the graph while it's being
+    // re-prepared; restarted at the end of this function.
+    stopHostIdleDriver();
+
+    // v0.0.919 — once per instance: plugin type + host (see the constructor).
+    if (! hostInfoLogged)
+    {
+        hostInfoLogged = true;
+        juce::PluginHostType host;
+        juce::Logger::writeToLog ("Patchy: running as " + juce::String (juce::AudioProcessor::getWrapperTypeDescription (wrapperType))
+                                  + (wrapperType == wrapperType_Standalone ? juce::String()
+                                                                           : " in " + juce::String (host.getHostDescription())));
+    }
+
+    lastSampleRate = sampleRate;
+    lastBlockSize  = samplesPerBlock;
+    rebuildProcessingGraph();
+
+    startHostIdleDriver (sampleRate, samplesPerBlock);   // v0.0.919 — plugin builds only
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool PatchyProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
+{
+    const int channels = layouts.getMainOutputChannelSet().size();
+    if (channels < 1 || channels > AudioSim::maxAudioChannels) return false;
+
+    if (layouts.getMainInputChannelSet() != layouts.getMainOutputChannelSet())
+        return false;
+
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Host-idle driver — v0.0.919 (2026-10-01)
+//
+//  Why: Logic Pro stops calling processBlock() for an instrument plugin whose
+//  track isn't "live" (idle, Logic in the background, focus in Patchy's own
+//  out-of-process window…), and nothing on the plugin side prevents it — a
+//  24 h tail was tried and made no difference (SessionLog 2026-10-01). Patchy
+//  runs its WHOLE graph in processBlock(), so network, DMX, MIDI-device and
+//  monitor routing all froze while the UI kept running.
+//
+//  How: plugin builds only. The host's processBlock() stamps lastHostCallMs.
+//  This thread ticks at the block rate; when the host hasn't called for
+//  kIdleMs (or 4 block periods, whichever is longer) it runs the graph itself
+//  with a silent input buffer and discards the host-side audio/MIDI output.
+//  The moment the host calls again, processBlock() takes over. processLock
+//  makes the two mutually exclusive: the host's audio thread only ever waits
+//  for the end of the driver's current block (well under a millisecond), and
+//  the driver re-checks the stamp under the lock before each block. Graph
+//  swaps after edits happen inside processGraphBlock(), so they work here too.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct PatchyProcessor::HostIdleDriver : public juce::Thread
+{
+    explicit HostIdleDriver (PatchyProcessor& o) : juce::Thread ("PatchyHostIdle"), owner (o) {}
+
+    void run() override
+    {
+        static constexpr double kIdleMs = 100.0;
+        double next = juce::Time::getMillisecondCounterHiRes();
+
+        while (! threadShouldExit())
+        {
+            const double periodMs = 1000.0 * owner.idleBlockSize / owner.idleSampleRate;
+            const double idleMs   = juce::jmax (kIdleMs, 4.0 * periodMs);
+
+            next += periodMs;
+            const double now = juce::Time::getMillisecondCounterHiRes();
+            if (next < now - 100.0) next = now;            // fell behind (sleep, debugger…) — resync
+            if (next - now >= 1.0) wait ((int) (next - now));
+            if (threadShouldExit()) break;
+
+            bool ran = false;
+            // v0.0.919 — only while Patchy's window is open, unless the
+            // project opted in to "always" (see setEditorOpen()).
+            const bool allowed = owner.editorOpen.load() || owner.keepRunningWhenHostPaused.load();
+            if (allowed && juce::Time::getMillisecondCounterHiRes() - owner.lastHostCallMs.load() > idleMs)
+            {
+                const juce::SpinLock::ScopedLockType sl (owner.processLock);
+                // Re-check under the lock: the host may have resumed meanwhile.
+                if (juce::Time::getMillisecondCounterHiRes() - owner.lastHostCallMs.load() > idleMs)
+                {
+                    owner.idleBuffer.clear();
+                    owner.idleMidi.clear();
+                    owner.processGraphBlock (owner.idleBuffer, owner.idleMidi);
+                    ran = true;
+                }
+            }
+
+            if (! ran && ! allowed && owner.runningIndependently.exchange (false))
+                diagLog ("PatchyProcessor: window closed while host paused - idle until the host calls again");
+            if (ran && ! owner.runningIndependently.exchange (true))
+                diagLog ("PatchyProcessor: host stopped calling - running independently");
+        }
+        owner.runningIndependently.store (false);
+    }
+
+    PatchyProcessor& owner;
+};
+
+PatchyProcessor::~PatchyProcessor()
+{
+    diagLog ("PatchyProcessor: destroyed");   // v0.0.919 — lifecycle visibility (hosts)
+    stopHostIdleDriver();   // before any member it uses goes away
+    // Nodes keep raw manager pointers and DLL function pointers. Destroy all
+    // graphs while managers, registry and shared monitor/source states live.
+    processingGraph.closeAllAudioDevices();
+    if (pendingGraph) pendingGraph->closeAllAudioDevices();
+    if (graphTrash) graphTrash->closeAllAudioDevices();
+    audioDeviceManager.closeAllHardware();
+    pendingGraph.reset();
+    graphTrash.reset();
+    processingGraph = ProcessingGraph{};
+}
+
+void PatchyProcessor::reset()
+{
+    diagLog ("PatchyProcessor: reset()");   // v0.0.919 — lifecycle visibility (hosts); base does nothing
+}
+
+void PatchyProcessor::releaseResources()
+{
+    diagLog ("PatchyProcessor: releaseResources()");   // v0.0.919 — lifecycle visibility (hosts)
+    stopHostIdleDriver();
+    processingGraph.closeAllProtocolDeviceSockets();
+}
+
+void PatchyProcessor::startHostIdleDriver (double sampleRate, int blockSize)
+{
+    stopHostIdleDriver();
+    if (isStandalone || wrapperType == wrapperType_Standalone) return;   // the Standalone always drives itself
+
+    idleSampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
+    idleBlockSize  = blockSize  > 0   ? blockSize  : 512;
+    idleBuffer.setSize (juce::jmax (1, getTotalNumInputChannels(), getTotalNumOutputChannels()), idleBlockSize);
+    idleMidi.ensureSize (2048);
+    lastHostCallMs.store (juce::Time::getMillisecondCounterHiRes());   // don't take over before the host's first call
+
+    hostIdleDriver = std::make_unique<HostIdleDriver> (*this);
+    hostIdleDriver->startThread (juce::Thread::Priority::highest);
+}
+
+void PatchyProcessor::stopHostIdleDriver()
+{
+    if (hostIdleDriver != nullptr)
+    {
+        hostIdleDriver->stopThread (2000);
+        hostIdleDriver.reset();
+    }
+    runningIndependently.store (false);
+}
+
+// v0.0.919 (2026-10-01) — the host's bypass (Logic's power button on the
+// plugin window) keeps the host rendering, but JUCE then calls this instead
+// of processBlock(). Without this override the HostIdleDriver read bypass as
+// "host paused", took over and kept the whole graph running ("Host paused"
+// indicator shown, loop still going). Now bypass counts as the host being
+// present — no takeover — and Patchy's graph simply doesn't run: off is off.
+// Audio is handled by JUCE's default bypass.
+void PatchyProcessor::processBlockBypassed (juce::AudioBuffer<float>& buffer,
+                                            juce::MidiBuffer& midiMessages)
+{
+    lastHostCallMs.store (juce::Time::getMillisecondCounterHiRes());
+    if (runningIndependently.exchange (false))
+        diagLog ("PatchyProcessor: host bypassed Patchy - graph stopped");
+    juce::AudioProcessor::processBlockBypassed (buffer, midiMessages);
+}
+
+void PatchyProcessor::processBlock (juce::AudioBuffer<float>& buffer,
+                                    juce::MidiBuffer& midiMessages)
+{
+    lastHostCallMs.store (juce::Time::getMillisecondCounterHiRes());
+
+    const juce::SpinLock::ScopedLockType sl (processLock);
+    if (runningIndependently.exchange (false))
+        diagLog ("PatchyProcessor: host resumed calling - back under host control");
+    processGraphBlock (buffer, midiMessages);
+}
+
+// v0.0.919 (2026-10-01) — the graph-processing body, formerly processBlock()
+// itself. Called by the host (processBlock() below) or, while the host has
+// stopped calling us, by the HostIdleDriver — never both at once (processLock).
+void PatchyProcessor::processGraphBlock (juce::AudioBuffer<float>& buffer,
+                                         juce::MidiBuffer& midiMessages)
+{
+    juce::ScopedNoDenormals noDenormals;
+
+    // TEMPORARY diagnostic (2026-09-02) — a genuinely different question
+    // from everything measured so far: not how long this function takes
+    // once it's called, but whether it's being called ON TIME at all. The
+    // user's own two rounds of precise timing data now show the swap,
+    // prepare(), and even the very first process() call on fresh node
+    // instances are all comparably fast to ordinary blocks — meaning
+    // nothing measured so far explains a real, audible stutter. If the
+    // audio callback itself is being delayed/starved by something
+    // entirely outside this function (the UI thread, WebView rendering,
+    // OS scheduling) specifically during a graph edit, that would sound
+    // identical to a slow callback but require a completely different
+    // fix — and wouldn't show up in anything timed from inside this
+    // function. This measures the actual gap between consecutive calls
+    // to this exact function, flagging it whenever it significantly
+    // exceeds the expected block period for the current sample
+    // rate/block size.
+    {
+        auto now = std::chrono::high_resolution_clock::now();
+        if (lastCallbackTime.time_since_epoch().count() != 0)
+        {
+            auto gapMicros = std::chrono::duration_cast<std::chrono::microseconds> (now - lastCallbackTime).count();
+            double expectedMicros = (lastSampleRate > 0.0)
+                                     ? (1'000'000.0 * (double) buffer.getNumSamples() / lastSampleRate)
+                                     : 11600.0;
+            if ((double) gapMicros > expectedMicros * 1.5)
+                diagLog ("PatchyProcessor: callback gap " + juce::String ((int) gapMicros)
+                                          + " microseconds (expected ~" + juce::String ((int) expectedMicros) + ")");
+        }
+        lastCallbackTime = now;
+    }
+
+    // Swap in a newly built graph if one is pending
+    if (graphPending.exchange (false))
+    {
+        // TEMPORARY diagnostic (2026-09-02), remove once resolved — 4
+        // targeted fixes so far (the two documented below, plus a
+        // MidiOutDeviceNode data race fix and making 3 per-block
+        // containers persistent instead of reconstructed, both
+        // elsewhere) have not conclusively resolved a real,
+        // user-reported audio-stream glitch specifically on graph
+        // edits. Rather than keep reasoning about what SHOULD be fast,
+        // this measures exactly how long this whole swap block
+        // genuinely takes, in microseconds, every single time it runs —
+        // direct, empirical evidence rather than further speculation.
+        auto timingStart = std::chrono::high_resolution_clock::now();
+
+        // Real bug found and fixed 2026-09-02 — the previous version of
+        // this swap called std::make_unique<ProcessingGraph>(...) directly
+        // here, on the audio thread, every single time a graph rebuild's
+        // own swap happened — a genuine, classic real-time-audio
+        // anti-pattern: heap allocation is not guaranteed lock-free/
+        // wait-free by the underlying allocator, and its timing can be
+        // genuinely, unpredictably variable depending on the allocator's
+        // own internal state and contention with other threads at that
+        // exact moment. std::swap on two already-existing ProcessingGraph
+        // objects (this member itself, and the one pendingGraph already
+        // points to, both already fully constructed beforehand) only
+        // needs a single stack-allocated temporary internally — genuinely
+        // predictable, real-time-safe stack allocation, not a heap
+        // allocation at all — since ProcessingGraph's own members are all
+        // cheaply-movable standard containers (see its own defaulted move
+        // constructor/assignment). pendingGraph itself, now correctly
+        // holding the OLD graph's own contents after the swap, is moved
+        // directly into graphTrash — no new allocation there either, just
+        // a transfer of an already-existing unique_ptr's own ownership.
+        std::swap (processingGraph, *pendingGraph);
+
+        // Shared-fifo fix, 2026-09-24 — the swap-time fifo copy that used
+        // to live here (transferFifoFrom(), 2026-09-03 3rd revision) is
+        // gone. It allocated on the audio thread, and processingGraph.
+        // prepare() just below immediately reset the fifo it had filled,
+        // so it never actually carried any audio across. Old and new
+        // device nodes now share one fifo from the moment the device's
+        // callback is handed over (see AudioOutDeviceNode::
+        // transferCallbackTo()), and prepare() no longer resets a fifo
+        // whose audio config hasn't changed (AudioFifo::prepareFor()).
+
+        graphTrash = std::move (pendingGraph);
+        graphTrashPending.store (true);
+
+        processingGraph.isStandaloneMode = isStandalone;
+        processingGraph.graphModel        = &graphModel;
+        // The pending graph is fully prepared on the message thread.
+        // Route resolution and buffer allocation must never run here.
+
+        auto timingEnd = std::chrono::high_resolution_clock::now();
+        auto timingMicros = std::chrono::duration_cast<std::chrono::microseconds> (timingEnd - timingStart).count();
+        diagLog ("PatchyProcessor: graph swap took " + juce::String ((int) timingMicros) + " microseconds");
+
+        // TEMPORARY diagnostic (2026-09-02) — flags that the very next
+        // process() call below is the FIRST one on freshly swapped-in
+        // node instances, so it can be timed and logged specifically,
+        // separately from the regular, randomly-sampled baseline. The
+        // swap logic above is now confirmed fast (comparable to or
+        // faster than ordinary blocks), but that alone doesn't confirm
+        // whether these brand-new node instances' own very first
+        // process() call — cold in CPU cache, potentially doing
+        // something their own subsequent calls don't — behaves any
+        // differently from a typical, already-warm, steady-state block.
+        firstProcessAfterSwap = true;
+    }
+
+    // Clear any output channels that aren't used by inputs
+    auto totalNumInputChannels  = getTotalNumInputChannels();
+    auto totalNumOutputChannels = getTotalNumOutputChannels();
+    for (int i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
+        buffer.clear (i, 0, buffer.getNumSamples());
+
+    if (processingGraph.isEmpty())
+    {
+        // No nodes — pass audio through silently, pass MIDI through
+        firstProcessAfterSwap = false;   // TEMPORARY diagnostic (2026-09-02) — avoid mislabeling a later block
+        return;
+    }
+
+    // TEMPORARY diagnostic (2026-09-02), remove once resolved — same
+    // investigation as the swap-block timing above; logs a baseline,
+    // normal (non-swap) block's own processing time for direct
+    // comparison, throttled to roughly once every few seconds to avoid
+    // flooding the log. Also separately, always logs the very first
+    // process() call specifically on the block right after a swap (see
+    // firstProcessAfterSwap's own comment above), regardless of the
+    // throttle — this is the one measurement not yet taken.
+    bool logThisBaseline = firstProcessAfterSwap;
+    auto baselineStart = logThisBaseline ? std::chrono::high_resolution_clock::now()
+                                          : std::chrono::high_resolution_clock::time_point{};
+
+    processingGraph.process (buffer, midiMessages);
+
+    if (logThisBaseline)
+    {
+        auto baselineEnd = std::chrono::high_resolution_clock::now();
+        auto baselineMicros = std::chrono::duration_cast<std::chrono::microseconds> (baselineEnd - baselineStart).count();
+        diagLog ("PatchyProcessor: FIRST process() after swap took " + juce::String ((int) baselineMicros) + " microseconds");
+    }
+
+    // Reset regardless of whether this block's own timing was logged —
+    // this flag must only ever describe the ONE block immediately
+    // following a swap, never any block after that.
+    firstProcessAfterSwap = false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+void PatchyProcessor::rebuildProcessingGraph()
+{
+    ScopedUiTiming timing ("Rebuild graph");
+
+    // Pre-create monitor buffers for type-5 (MIDI) and type-6 (Audio) nodes.
+    auto snapshot = graphModel.toVar();
+    if (auto* root = snapshot.getDynamicObject())
+    {
+        if (auto* nodesArr = root->getProperty ("nodes").getArray())
+        {
+            for (const auto& nv : *nodesArr)
+            {
+                if (auto* nd = nv.getDynamicObject())
+                {
+                    int t = (int) nd->getProperty ("nodeType");
+                    juce::String nid = nd->getProperty ("id").toString();
+                    if (t == 5) getOrCreateMidiMonitorBuffer      (nid);
+                    if (t == 6 || t == 29) getOrCreateAudioMonitorBuffer (nid);
+                    if (t == 20) getOrCreateOscMonitorBuffer  (nid);
+                    if (t == 21) getOrCreateUdpMonitorBuffer  (nid);
+                    if (t == 24) getOrCreateMqttMonitorBuffer (nid);
+                }
+            }
+        }
+    }
+
+    // Clear any previously trashed graph now (message thread — safe for destructors)
+    if (graphTrashPending.load()) { graphTrashPending.store(false); graphTrash.reset(); }
+
+    // Fix, v0.0.915 (2026-09-28) — claim a not-yet-swapped pendingGraph
+    // before touching it: once graphPending is cleared, processBlock() won't
+    // swap it in (it only swaps after its own exchange() returns true), so
+    // this rebuild can safely read it (device transfer below, and the
+    // existing MIDI/ArtNet/DMX/console reads) and then replace it. The flag
+    // is set again at the end, with the new graph. The audio thread keeps
+    // playing the current live graph meanwhile — the claimed pending graph
+    // is being superseded anyway. (Only an already-running swap, a window of
+    // a few microseconds, remains unprotected — as before.)
+    graphPending.store (false);
+
+    // A pendingGraph that was never swapped in: close its UDP/OSC sockets
+    // before newGraph binds the same ports.
+    //
+    // Fix, v0.0.915 (2026-09-28) — its AUDIO devices are no longer closed
+    // here. Two rebuilds before the audio thread swaps (seen on a host
+    // sample-rate change, where the host is stopped for ~0.5 s) used to
+    // close the pending graph's devices here, then transfer from
+    // processingGraph, whose devices had already been handed to that pending
+    // graph — nothing left to transfer, so every hardware device was
+    // reopened FRESH (new fifo, ~0.5 s gap, FCA1616 startup pop). The
+    // transfer below now takes them from pendingGraph instead, and
+    // transferAudioDevicesFrom() still closes whatever it didn't transfer.
+    if (pendingGraph != nullptr)
+        pendingGraph->closeUdpBasedProtocolDeviceSockets();
+
+    // Close the CURRENT graph's UDP-based protocol device sockets (UDP/OSC)
+    // before newGraph binds its own — prevents a bind race where the new
+    // graph's socket loses to this graph's still-open one on the same port
+    // and silently goes dead. See ProcessingGraph::closeAllProtocolDeviceSockets().
+    //
+    // Real bug found and fixed 2026-09-02 — this used to call the FULL
+    // closeAllProtocolDeviceSockets(), which also closed ArtNet and DMX
+    // devices here, unconditionally, on every single graph rebuild — but
+    // both gained their own genuine connection-transfer mechanism the same
+    // week (see DmxIn/OutDeviceNode's own transferOrConfigure()), and this
+    // early, unconditional close was silently defeating it every time,
+    // before the transfer ever got a chance to run. Confirmed as the exact
+    // cause via precise diagnostic logging showing "old node's serial not
+    // open" on every single graph edit without exception — the very
+    // connection the transfer was trying to reuse had already been closed
+    // moments earlier, right here. Switched to the narrower,
+    // UDP/OSC-only version — see its own declaration in ProcessingGraph.h
+    // for the full reasoning on why ArtNet/DMX genuinely don't need this
+    // pre-emptive close the way UDP/OSC still do.
+    processingGraph.closeUdpBasedProtocolDeviceSockets();
+
+    auto newGraph = std::make_unique<ProcessingGraph>();
+    newGraph->rebuild (graphModel, &registry,
+                       [this](const juce::String& nid) { return getOrCreateMidiMonitorBuffer(nid); },
+                       [this](const juce::String& nid) { return getOrCreateAudioMonitorBuffer(nid); },
+                       [this](const juce::String& nid) { return getOrCreateKeyboardMonitorBuffer(nid); },
+                       [this](const juce::String& nid) { return getOrCreateDmxMonitorBuffer(nid); },
+                       [this](const juce::String& nid) { return getOrCreateDmxConsoleBuffer(nid); },
+                       [this](const juce::String& nid) { return getOrCreateArtNetMonitorBuffer(nid); },
+                       [this](const juce::String& nid) { return getOrCreateArtNetConsoleBuffer(nid); },
+                       [this](const juce::String& nid) { return getOrCreateOscMonitorBuffer(nid); },
+                       [this](const juce::String& nid) { return getOrCreateUdpMonitorBuffer(nid); },
+                       [this](const juce::String& nid) { return getOrCreateMqttMonitorBuffer(nid); },
+                       [this](const juce::String& nid) { return getOrCreateAudioPlayerState(nid); });
+
+    // Transfer existing open audio device connections to the new graph nodes
+    // rather than closing and reopening — this avoids the ~1 second audio gap.
+    // Only nodes that exist in both graphs get their callback transferred.
+    // Fix, v0.0.915 (2026-09-28) — from the not-yet-swapped pendingGraph when
+    // there is one (it holds the devices by now; see the comment above), the
+    // same pattern MIDI/ArtNet/DMX already use below.
+    newGraph->transferAudioDevicesFrom (pendingGraph != nullptr ? *pendingGraph : processingGraph);
+
+    // Sync device manager selections from current graphModel state.
+    // This ensures undo/redo restores correctly — the model has already been
+    // updated before rebuildProcessingGraph runs, so we always apply the
+    // right selections including empty ones (which trigger closeDevice).
+    // v0.0.940 — the nodes whose audio device really changed (only those
+    // are closed below; a newly added node isn't transferred anyway).
+    juce::StringArray changedAudioNodes;
+    struct ChannelRestore { juce::String nodeId, settingsJson; int nodeType = 17; };
+    std::vector<ChannelRestore> channelRestores;
+    for (const auto& n : graphModel.getNodes())
+    {
+        if (n.nodeType == 1 || n.nodeType == 2)
+        {
+            midiDeviceManager.storeSelection (n.id, n.selectedDeviceId);
+            // Restore MidiOutDeviceNode's own channel filter from
+            // settingsJson — same "survive a rebuild" reasoning as the
+            // others below. MidiInDeviceNode (nodeType 1) has no channel
+            // filter at all, so this only ever applies to nodeType 2.
+            if (n.nodeType == 2 && n.settingsJson.isNotEmpty())
+                channelRestores.push_back ({ n.id, n.settingsJson, 2 });
+        }
+        else if (n.nodeType == 3 || n.nodeType == 4)
+        {
+            juce::String devName = n.selectedDeviceId;
+            if (! isStandalone && devName.isNotEmpty()) devName = "DAW";
+            juce::String prev = audioDeviceManager.getSelection (n.id);
+            if (prev != devName)
+            {
+                audioDeviceManager.storeSelection (n.id, devName);
+                changedAudioNodes.add (n.id);
+            }
+
+            // Restore selectedChannels from settingsJson (undo/redo safe)
+            if (n.settingsJson.isNotEmpty())
+            {
+                try
+                {
+                    auto parsed = juce::JSON::parse (n.settingsJson);
+                    if (auto* arr = parsed["selectedChannels"].getArray())
+                    {
+                        std::vector<int> channels;
+                        channels.reserve (static_cast<size_t>(arr->size()));
+                        for (auto& v : *arr)
+                            channels.push_back ((int) v);
+                        audioDeviceManager.storeChannelSelection (n.id, channels);
+                    }
+                }
+                catch (...) {}
+            }
+        }
+        else if (n.nodeType == 8 || n.nodeType == 9)
+        {
+            // Restore UDP settings from settingsJson (undo/redo safe)
+            if (n.settingsJson.isNotEmpty())
+            {
+                try
+                {
+                    auto parsed = juce::JSON::parse (n.settingsJson);
+                    UdpDeviceManager::Settings s;
+                    s.port          = (int) parsed["udpPort"];
+                    s.mode          = static_cast<UdpMode> ((int) parsed["udpMode"]);
+                    s.targetHost    = parsed["udpTargetHost"].toString();
+                    s.multicastAddr = parsed["udpMulticastAddr"].toString();
+                    if (s.port > 0)
+                        udpDeviceManager.storeSettings (n.id, s);
+                }
+                catch (...) {}
+            }
+        }
+        else if (n.nodeType == 10 || n.nodeType == 11)
+        {
+            // Restore OSC settings from settingsJson (undo/redo safe)
+            if (n.settingsJson.isNotEmpty())
+            {
+                try
+                {
+                    auto parsed = juce::JSON::parse (n.settingsJson);
+                    OscDeviceManager::Settings s;
+                    s.port       = (int) parsed["oscPort"];
+                    s.targetHost = parsed["oscTargetHost"].toString();
+                    s.oscAddress = parsed["oscAddress"].toString();
+                    if (s.oscAddress.isEmpty()) s.oscAddress = "/patchy";
+                    if (s.port > 0)
+                        oscDeviceManager.storeSettings (n.id, s);
+                }
+                catch (...) {}
+            }
+        }
+        else if (n.nodeType == 22)
+        {
+            // Restore MQTT Subscribe settings from settingsJson (undo/redo safe)
+            if (n.settingsJson.isNotEmpty())
+            {
+                try
+                {
+                    auto parsed = juce::JSON::parse (n.settingsJson);
+                    MqttDeviceManager::Settings s;
+                    s.host     = parsed["mqttHost"].toString();
+                    s.port     = (int) parsed["mqttPort"];
+                    s.topic    = parsed["mqttTopic"].toString();
+                    s.qos      = (int) parsed["mqttQos"];
+                    s.username = parsed["mqttUsername"].toString();
+                    s.password = parsed["mqttPassword"].toString();
+                    if (s.port <= 0) s.port = 1883;
+                    if (s.host.isNotEmpty() && s.topic.isNotEmpty())
+                        mqttDeviceManager.storeSettings (n.id, s);
+                }
+                catch (...) {}
+            }
+        }
+        else if (n.nodeType == 23)
+        {
+            // Restore MQTT Publish settings from settingsJson (undo/redo safe)
+            if (n.settingsJson.isNotEmpty())
+            {
+                try
+                {
+                    auto parsed = juce::JSON::parse (n.settingsJson);
+                    MqttDeviceManager::Settings s;
+                    s.host     = parsed["mqttHost"].toString();
+                    s.port     = (int) parsed["mqttPort"];
+                    s.topic    = parsed["mqttTopic"].toString();
+                    s.qos      = (int) parsed["mqttQos"];
+                    s.retain   = (bool) parsed["mqttRetain"];
+                    s.username = parsed["mqttUsername"].toString();
+                    s.password = parsed["mqttPassword"].toString();
+                    if (s.port <= 0) s.port = 1883;
+                    if (s.host.isNotEmpty() && s.topic.isNotEmpty())
+                        mqttDeviceManager.storeSettings (n.id, s);
+                }
+                catch (...) {}
+            }
+        }
+        else if (n.nodeType == 12 || n.nodeType == 13)
+        {
+            // Restore ArtNet settings from settingsJson (undo/redo safe)
+            if (n.settingsJson.isNotEmpty())
+            {
+                try
+                {
+                    auto parsed = juce::JSON::parse (n.settingsJson);
+                    ArtNetDeviceManager::Settings s;
+                    s.universe   = (int) parsed["artNetUniverse"];
+                    s.targetHost = parsed["artNetTargetHost"].toString();
+                    artNetDeviceManager.storeSettings (n.id, s);
+                }
+                catch (...) {}
+            }
+        }
+        else if (n.nodeType == 14 || n.nodeType == 15)
+        {
+            // Restore DMX settings from settingsJson (undo/redo safe)
+            if (n.settingsJson.isNotEmpty())
+            {
+                try
+                {
+                    auto parsed = juce::JSON::parse (n.settingsJson);
+                    DmxDeviceManager::Settings s;
+                    s.devicePath = parsed["dmxDevicePath"].toString();
+                    s.universe   = (int) parsed["dmxUniverse"];
+                    if (s.devicePath.isNotEmpty())
+                        dmxDeviceManager.storeSettings (n.id, s);
+                }
+                catch (...) {}
+            }
+        }
+        else if (n.nodeType == 17)
+        {
+            // Restore DMX Console channel values from settingsJson (undo/redo safe)
+            if (n.settingsJson.isNotEmpty() && n.settingsJson.contains ("dmxChannels"))
+                channelRestores.push_back ({ n.id, n.settingsJson, 17 });
+        }
+        else if (n.nodeType == 19)
+        {
+            // Restore ArtNet Console channel values from settingsJson (undo/redo safe)
+            if (n.settingsJson.isNotEmpty() && n.settingsJson.contains ("artNetChannels"))
+                channelRestores.push_back ({ n.id, n.settingsJson, 19 });
+        }
+        else if (n.nodeType == 26)
+        {
+            // Restore AudioPlayerNode's own small, discrete settings (mode,
+            // sine frequency, noise type, level, loop, file path) from
+            // settingsJson — same "survive a rebuild" reasoning as DMX/
+            // ArtNet Console's own channel restoration above, but simpler:
+            // a handful of scalar values, not a base64-encoded channel
+            // array, so no dedicated encoding needed.
+            if (n.settingsJson.isNotEmpty())
+                channelRestores.push_back ({ n.id, n.settingsJson, 26 });
+        }
+        else if (n.nodeType == 27)
+        {
+            // Restore MidiChMatrixNode's own grid size, drop/pass-through
+            // mode, and lit-cell list from settingsJson — same "survive a
+            // rebuild" reasoning as the others above.
+            if (n.settingsJson.isNotEmpty())
+                channelRestores.push_back ({ n.id, n.settingsJson, 27 });
+        }
+        else if (n.nodeType == 28)
+        {
+            // v0.0.925 — MIDI Morpher's rule lives entirely in settingsJson;
+            // a fresh node starts at the default rule (copy everything).
+            if (n.settingsJson.isNotEmpty())
+                channelRestores.push_back ({ n.id, n.settingsJson, 28 });
+        }
+        else if (n.nodeType == 18)
+        {
+            // Fix, v0.0.916 (2026-09-28) — ArtNet Monitor's universe filter
+            // lives in the backend node (universeFilter, default -1 = all),
+            // but the UI only sends it when the user CHANGES it. Every
+            // rebuild (any graph edit, file load, undo/redo) creates a fresh
+            // node at -1, so the monitor silently went back to showing all
+            // universes while its panel still showed the filter as active.
+            // Restored from the UI's own settingsJson keys instead.
+            if (n.settingsJson.isNotEmpty())
+                channelRestores.push_back ({ n.id, n.settingsJson, 18 });
+        }
+    }
+
+    // If a node's selection changed (e.g. after undo), close that node's
+    // transferred device so applyDeviceSelections can open the right one.
+    // Fix, v0.0.940 (2026-10-17) — this used to close ALL transferred audio
+    // devices whenever any selection changed, so dropping a wrap / fragment
+    // holding an Audio In or Out node (a new selection) reopened every
+    // device in the graph: ~0.5-1 s of silence on audio already playing.
+    if (! changedAudioNodes.isEmpty())
+        newGraph->closeTransferredAudioDevices (changedAudioNodes);
+
+    // Apply selections to new graph (opens/closes devices as needed)
+    midiDeviceManager.applyDeviceSelections  (*newGraph, pendingGraph ? pendingGraph.get() : &processingGraph);
+    // v0.0.915 (Side finding 1, 2026-09-27) — hardware audio devices open
+    // at, and transferred ones follow, the host's current rate/block. Must
+    // come before applyDeviceSelections(), which runs before newGraph->
+    // prepare() below (so the nodes' own config is still the defaults).
+    audioDeviceManager.setTargetAudioConfig (isStandalone && ! simulationConfigured ? 0.0 : lastSampleRate, lastBlockSize);
+    audioDeviceManager.applyDeviceSelections (*newGraph);
+    audioDeviceManager.pruneDeletedNodeManagers  (*newGraph);
+    audioDeviceManager.applyAllChannelSelections (*newGraph);
+    udpDeviceManager.applyAllSettings            (*newGraph);
+    oscDeviceManager.applyAllSettings            (*newGraph);
+    mqttDeviceManager.applyAllSettings           (*newGraph, pendingGraph ? pendingGraph.get() : &processingGraph);   // v0.0.919 — connection handover
+    artNetDeviceManager.applyAllSettings         (*newGraph, pendingGraph ? pendingGraph.get() : &processingGraph);
+    dmxDeviceManager.applyAllSettings            (*newGraph, pendingGraph ? pendingGraph.get() : &processingGraph);
+
+    // Transfer lastSent from most recent graph to ALL DMX/ArtNet Console nodes
+    for (const auto& n : graphModel.getNodes())
+    {
+        if (n.nodeType == 17)
+        {
+            auto* oldNode = pendingGraph ? pendingGraph->findDmxConsoleNode (n.id)
+                                         : processingGraph.findDmxConsoleNode (n.id);
+            if (!oldNode) oldNode = processingGraph.findDmxConsoleNode (n.id);
+            if (auto* newNode = newGraph->findDmxConsoleNode (n.id))
+                if (oldNode)
+                {
+                    newNode->transferLastSent (oldNode->getLastSent());
+                    // Read blackout from settingsJson (always up to date) not from node atomic
+                    bool bo = false;
+                    try { bo = (bool) juce::JSON::parse (n.settingsJson)["blackout"]; } catch (...) {}
+                    newNode->transferBlackout (bo);
+
+                    // Real bug found 2026-08-30, first fix attempt found
+                    // NOT to work by the user's own direct testing, real
+                    // root cause found and properly fixed 2026-08-31 —
+                    // reconnecting a console after changing its value
+                    // while disconnected left the monitor stuck at the
+                    // OLD value; only a further, genuinely new change
+                    // (a nudge) fixed it. First attempt directly
+                    // transferred outputDmxFrame/outputDmxFrameValid here
+                    // (reasoning: a fresh instance starts those at their
+                    // own defaults, since only lastSent above was ever
+                    // transferred) — that reasoning was correct as far as
+                    // it went, but missed that ProcessingGraph::process()'s
+                    // own resetBuffers() unconditionally clears
+                    // outputDmxFrameValid at the START of every single
+                    // block, for every node — including the very next
+                    // block after this transfer runs, before anything
+                    // downstream ever gets to read it. Since this
+                    // console's own lastSent now already matches its
+                    // current fader state (transferred above), process()'s
+                    // own change-detection correctly, silently sees
+                    // "nothing changed" and never re-sets the flag back to
+                    // true — so the direct transfer got wiped before it
+                    // could ever matter.
+                    //
+                    // The real fix uses the mechanism this project already
+                    // built for exactly this situation: pendingOutput,
+                    // which restoreChannels() below already sets when ITS
+                    // OWN comparison detects a genuine settingsJson-vs-
+                    // lastSent difference — process()'s own change-
+                    // detection already checks this flag and forces a
+                    // re-emission even when current==lastSent. The gap was
+                    // that lastSent gets transferred to already match the
+                    // restored value in this exact reconnection scenario,
+                    // so restoreChannels()'s own comparison also correctly
+                    // sees "no difference" and never sets pendingOutput
+                    // either — nothing in the whole chain realises a fresh
+                    // re-population is needed regardless, since any
+                    // reconnection means a downstream node's own source
+                    // cache was pruned to empty during the disconnection.
+                    // Forcing it unconditionally on every reconnection
+                    // closes that gap directly, verified against the
+                    // user's own exact diagnostic with a standalone
+                    // simulation before considering this correct.
+                    newNode->forceReEmit();
+                }
+        }
+        else if (n.nodeType == 19)
+        {
+            auto* oldNode = pendingGraph ? pendingGraph->findArtNetConsoleNode (n.id)
+                                         : processingGraph.findArtNetConsoleNode (n.id);
+            if (!oldNode) oldNode = processingGraph.findArtNetConsoleNode (n.id);
+            if (auto* newNode = newGraph->findArtNetConsoleNode (n.id))
+                if (oldNode)
+                {
+                    newNode->transferLastSent (oldNode->getLastSent());
+                    bool bo = false;
+                    try { bo = (bool) juce::JSON::parse (n.settingsJson)["blackout"]; } catch (...) {}
+                    newNode->transferBlackout (bo);
+
+                    // Same real bug and same fix as DmxConsoleNode's own
+                    // above (see that block's own comment for the full
+                    // story).
+                    newNode->forceReEmit();
+                }
+        }
+    }
+
+    // Restore Console channel values AFTER rebuild
+    for (const auto& r : channelRestores)
+    {
+        if (r.nodeType == 17)
+            restoreDmxConsoleChannels (r.nodeId, r.settingsJson, newGraph.get());
+        else if (r.nodeType == 19)
+            restoreArtNetConsoleChannels (r.nodeId, r.settingsJson, newGraph.get());
+        else if (r.nodeType == 26)
+            restoreAudioPlayerSettings (r.nodeId, r.settingsJson, newGraph.get());
+        else if (r.nodeType == 27)
+            restoreMidiChMatrixState (r.nodeId, r.settingsJson, newGraph.get());
+        else if (r.nodeType == 28)
+            applyMidiMorpherSettings (r.nodeId, r.settingsJson, newGraph.get());
+        else if (r.nodeType == 18)
+        {
+            // Fix, v0.0.916 — see the nodeType 18 branch above. Same keys and
+            // -1 sentinel as ArtNetMonitorNode.tsx's commitPatch().
+            if (auto* mon = newGraph->findArtNetMonitorNode (r.nodeId))
+            {
+                try
+                {
+                    auto parsed = juce::JSON::parse (r.settingsJson);
+                    const bool on = (bool) parsed["filterUniverse"];
+                    mon->setUniverseFilter (on ? (int) parsed["filterUniverseValue"] : -1);
+                }
+                catch (...) {}
+            }
+        }
+        else if (r.nodeType == 2)
+            restoreMidiOutDeviceChannelFilter (r.nodeId, r.settingsJson, newGraph.get());
+    }
+
+    // Real bug found and fixed 2026-09-02 — prepare() calls
+    // juce::AudioBuffer::setSize() on every node's own input/output audio
+    // buffers, for every single node in the graph. Every node instance is
+    // freshly constructed on every single rebuild (this project's own
+    // established, unavoidable pattern — see ProcessingGraph::rebuild()'s
+    // own "destroys and recreates every node" behaviour), meaning each
+    // one's own audio buffers start completely empty — confirmed directly
+    // against JUCE's own real source: setSize() only skips its own
+    // allocation when the requested size already exactly matches the
+    // buffer's current size, which can never be true for a buffer that
+    // starts at zero. This meant every node's own prepare() call was
+    // GENUINELY, unavoidably allocating memory — and this whole sequence
+    // used to run entirely on the audio thread, right after the graph
+    // swap in processBlock() — for potentially dozens of nodes, every
+    // single graph edit. Investigated while chasing a user report of a
+    // longstanding, general, variable-severity audio-stream glitch
+    // specifically and ONLY on graph edits (drop/remove/connect/
+    // disconnect), confirmed via the user's own precise, methodical
+    // testing to never happen on purely visual actions (moving nodes,
+    // zooming, opening settings) that don't trigger a rebuild at all —
+    // exactly the signature this mechanism would produce, and a stronger,
+    // more complete match than either of this same day's two earlier
+    // fixes. Doing this real allocation work here instead — on the
+    // message thread, before this graph is ever handed to the audio
+    // thread at all — means the identical prepare() call that still runs
+    // on the audio thread afterwards (see processBlock()'s own swap
+    // logic) finds every buffer already the exact right size, and
+    // setSize()'s own check correctly, genuinely skips any further
+    // allocation entirely.
+    newGraph->isStandaloneMode = isStandalone;
+    newGraph->graphModel        = &graphModel;
+    newGraph->prepare (lastSampleRate, lastBlockSize, getTotalNumInputChannels());
+
+    pendingGraph = std::move (newGraph);
+    graphPending.store (true);
+}
+juce::AudioProcessorEditor* PatchyProcessor::createEditor()
+{
+    auto* ed = new PatchyEditor (*this);
+    ed->getBridge().isStandalone = isStandalone;
+    return ed;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+void PatchyProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    // Serialise the graph model to JSON and store it
+    // v0.0.919 — plus the per-project "keep running when the host pauses"
+    // option: a top-level property next to the graph, NOT inside the graph
+    // model (undo snapshots restore the whole model and would flip it back).
+    auto stateVar = graphModel.toVar();
+    if (auto* o = stateVar.getDynamicObject())
+        o->setProperty ("keepRunningWhenHostPaused", keepRunningWhenHostPaused.load());
+    if (auto* o = stateVar.getDynamicObject())   // v0.0.920 — plugin window size
+    {
+        o->setProperty ("editorWidth",  editorWidth.load());
+        o->setProperty ("editorHeight", editorHeight.load());
+    }
+    auto json = juce::JSON::toString (stateVar, true);
+    destData.replaceAll (json.toRawUTF8(), static_cast<size_t>(json.getNumBytesAsUTF8()));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+/** Migrates a legacy port ID that used the old generic "Value In"/"Value Out"
+ *  label to the new protocol-specific label (e.g. "UDP Out", "MQTT In"),
+ *  based on the owning node's current nodeType.
+ *
+ *  Needed because Port::id embeds the label text directly (see
+ *  GraphModel::portsForType's mk() helper: `id = nodeId + "_" + label + "_"
+ *  + dir`) — a saved connection referencing the old "..._Value Out_out"
+ *  string would otherwise silently fail to reconnect once the label was
+ *  changed to fix the cross-protocol port-typing gap (UDP and MQTT nodes
+ *  used to share the generic PortType::Value, allowing them to be wired
+ *  directly together — see Architecture.md's locked decisions for the full
+ *  story). This keeps existing saved .patchy projects working unchanged. */
+static juce::String migrateLegacyPortId (const juce::String& portId, int nodeType)
+{
+    static const std::unordered_map<int, juce::String> newOutLabel = {
+        { 8,  "UDP Out"  },   // UdpInDeviceNode
+        { 21, "UDP Out"  },   // UdpMonitorNode (also has an In, handled below)
+        { 22, "MQTT Out" },   // MqttSubscribeNode
+    };
+    static const std::unordered_map<int, juce::String> newInLabel = {
+        { 9,  "UDP In"  },    // UdpOutDeviceNode
+        { 21, "UDP In"  },    // UdpMonitorNode
+        { 23, "MQTT In" },    // MqttPublishNode
+    };
+
+    if (portId.endsWith ("_Value Out_out"))
+    {
+        auto it = newOutLabel.find (nodeType);
+        if (it != newOutLabel.end())
+            return portId.upToLastOccurrenceOf ("_Value Out_out", false, false) + "_" + it->second + "_out";
+    }
+    else if (portId.endsWith ("_Value In_in"))
+    {
+        auto it = newInLabel.find (nodeType);
+        if (it != newInLabel.end())
+            return portId.upToLastOccurrenceOf ("_Value In_in", false, false) + "_" + it->second + "_in";
+    }
+    return portId;   // unchanged — not a legacy Value port, or node isn't UDP/MQTT
+}
+
+void PatchyProcessor::setStateInformation (const void* data, int sizeInBytes)
+{
+    juce::String json (static_cast<const char*> (data), static_cast<size_t>(sizeInBytes));
+    auto v = juce::JSON::parse (json);
+    if (! v.isObject()) return;
+
+    auto* root = v.getDynamicObject();
+    if (root != nullptr)   // v0.0.919 — see getStateInformation(); absent = off
+    {
+        keepRunningWhenHostPaused.store ((bool) root->getProperty ("keepRunningWhenHostPaused"));
+        editorWidth.store  ((int) root->getProperty ("editorWidth"));    // v0.0.920 — absent = 0 = default size
+        editorHeight.store ((int) root->getProperty ("editorHeight"));
+    }
+    if (root == nullptr) return;
+
+    // Suspend onChange — resumeNotifications() MUST be called before any return.
+    // We use a ScopeGuard to guarantee this even on early exit.
+    graphModel.suspendNotifications();
+    struct ResumeGuard {
+        GraphModel& m;
+        ~ResumeGuard() { m.resumeNotifications(); }
+    } guard { graphModel };
+
+    // Clear history — a freshly loaded graph starts with a clean undo stack.
+    graphModel.clearHistory();
+
+    // Restore nodes using their original saved IDs so connections match.
+    const auto& nodesArr = *root->getProperty ("nodes").getArray();
+    for (const auto& nv : nodesArr)
+    {
+        auto* nd = nv.getDynamicObject();
+        if (nd == nullptr) continue;
+        juce::String paxName = nd->getProperty ("paxName").toString();
+        PaxPortSpec portSpec;
+        if (paxName.isNotEmpty())
+        {
+            for (const auto& e : registry.getEntries())
+            {
+                if (e.name == paxName)
+                {
+                    portSpec.audioIn  = e.audioInputs;
+                    portSpec.audioOut = e.audioOutputs;
+                    portSpec.midiIn   = e.midiInputs;
+                    portSpec.midiOut  = e.midiOutputs;
+                    portSpec.valueIn  = e.valueInputs;
+                    portSpec.valueOut = e.valueOutputs;
+                    for (int tag : e.valueInputTypes)  portSpec.valueInTypes.push_back  (paxValueTypeFromTag (tag));
+                    for (int tag : e.valueOutputTypes) portSpec.valueOutTypes.push_back (paxValueTypeFromTag (tag));
+                    break;
+                }
+            }
+        }
+        auto& restoredNode = graphModel.restoreNode (
+            nd->getProperty ("id").toString(),
+            (int)   nd->getProperty ("nodeType"),
+            (float) nd->getProperty ("x"),
+            (float) nd->getProperty ("y"),
+            paxName, portSpec);
+        restoredNode.selectedDeviceId = nd->getProperty ("selectedDeviceId").toString();
+        restoredNode.settingsJson     = nd->getProperty ("settingsJson").toString();
+        restoredNode.disabled         = (bool) nd->getProperty ("disabled");
+        // Phase 6 rename fix, 2026-09-25 — this is the file-open / plugin-
+        // state restore path (onLoadGraph, setStateInformation), separate
+        // from GraphModel::fromVar() and WebBridge's own loader; it was
+        // missed in the first pass, so names didn't survive save/reload.
+        restoredNode.customName       = nd->getProperty ("customName").toString();
+    }
+
+    // Restore connections (IDs now match because we used restoreNode)
+    const auto& connsArr = *root->getProperty ("connections").getArray();
+    for (const auto& cv : connsArr)
+    {
+        auto* cd = cv.getDynamicObject();
+        if (cd == nullptr) continue;
+
+        juce::String srcNodeId = cd->getProperty ("sourceNodeId").toString();
+        juce::String srcPortId = cd->getProperty ("sourcePortId").toString();
+        juce::String tgtNodeId = cd->getProperty ("targetNodeId").toString();
+        juce::String tgtPortId = cd->getProperty ("targetPortId").toString();
+
+        if (auto* srcNode = graphModel.findNode (srcNodeId))
+            srcPortId = migrateLegacyPortId (srcPortId, srcNode->nodeType);
+        if (auto* tgtNode = graphModel.findNode (tgtNodeId))
+            tgtPortId = migrateLegacyPortId (tgtPortId, tgtNode->nodeType);
+
+        graphModel.addConnection (srcNodeId, srcPortId, tgtNodeId, tgtPortId);
+    }
+
+    graphModel.restoreWraps (GraphModel::wrapsOf (*root));   // v0.0.930 — absent in older files → none
+
+    // Restore viewport
+    graphModel.viewportX    = (float) root->getProperty ("viewportX");
+    graphModel.viewportY    = (float) root->getProperty ("viewportY");
+    graphModel.viewportZoom = (float) root->getProperty ("viewportZoom");
+    if (graphModel.viewportZoom <= 0.0f) graphModel.viewportZoom = 1.0f;
+
+    // (resumeNotifications called by ResumeGuard destructor at end of scope)
+
+    // Re-open any saved device selections now that the graph is built
+    const auto& nodesArr2 = *root->getProperty ("nodes").getArray();
+    for (const auto& nv : nodesArr2)
+    {
+        auto* nd = nv.getDynamicObject();
+        if (nd == nullptr) continue;
+        int type = (int) nd->getProperty ("nodeType");
+        if (type == 1 || type == 2)
+        {
+            juce::String devId = nd->getProperty ("selectedDeviceId").toString();
+            if (devId.isNotEmpty())
+                setMidiDevice (nd->getProperty ("id").toString(), devId);
+        }
+        if (type == 3 || type == 4)
+        {
+            juce::String devName = nd->getProperty ("selectedDeviceId").toString();
+            // In DAW mode, always use DAW device (override any saved hardware device)
+            if (! isStandalone)
+                devName = "DAW";
+            const auto nodeId = nd->getProperty ("id").toString();
+            audioDeviceManager.storeSelection (nodeId, devName);
+            if (auto* node = graphModel.findNode (nodeId)) node->selectedDeviceId = devName;
+        }
+        if (type == 6)
+            getOrCreateAudioMonitorBuffer (nd->getProperty ("id").toString());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new PatchyProcessor();
+}
