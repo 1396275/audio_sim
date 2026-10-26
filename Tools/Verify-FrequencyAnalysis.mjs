@@ -151,6 +151,48 @@ try {
   captured = await evaluate(`JSON.parse(window.testMessages.filter(m => m.type === 'commitSettingsChange').at(-1).settings)`);
   assert.equal(captured.heldChannels.find(h => h.channel === 0).decibels[20], -22);
   assert.equal(captured.heldChannels.find(h => h.channel === 1).decibels[80], -23);
+  const setPlotsPerRow = async columns => {
+    await evaluate(`document.querySelector('[data-frequency-columns] .nodrag > div').click()`);
+    await evaluate(`(() => {
+      const option = [...document.querySelectorAll('[data-frequency-columns] .nodrag > div + div > div')]
+        .find(e => e.querySelector('span')?.textContent === ${JSON.stringify(String(columns))});
+      if (!option) throw new Error('Missing plots-per-row option'); option.click();
+    })()`);
+    await waitFor(`!!document.querySelector('[data-spectrum-columns="${columns}"]')`);
+    await evaluate('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+  };
+  for (const columns of [2, 3, 4, 8, 1, 2]) {
+    await setPlotsPerRow(columns);
+    const rectangles = await evaluate(`[...document.querySelectorAll('[data-spectrum-channel]')].map(e => {
+      const r = e.getBoundingClientRect(); return {x: r.x, y: r.y, width: r.width};
+    })`);
+    assert.equal(rectangles.length, 8);
+    for (let i = 0; i < rectangles.length; ++i) {
+      const firstInRow = Math.floor(i / columns) * columns;
+      assert.ok(Math.abs(rectangles[i].y - rectangles[firstInRow].y) < 1, `${columns} plots per row must share a row`);
+      if (i % columns) assert.ok(rectangles[i].x > rectangles[i - 1].x, 'Columns must progress from left to right');
+      if (i >= columns) assert.ok(rectangles[i].y > rectangles[i - columns].y, 'Remaining channels must wrap to subsequent rows');
+    }
+    // Rearranging a stopped capture must retain live data and held references,
+    // without waiting for a fresh native FFT snapshot.
+    assert.ok(await evaluate(`!document.querySelector('[data-spectrum-channel="0"] button').disabled`));
+    captured = await evaluate(`JSON.parse(window.testMessages.filter(m => m.type === 'commitSettingsChange').at(-1).settings)`);
+    assert.equal(captured.plotsPerRow, columns);
+    assert.equal(captured.heldChannels.find(h => h.channel === 1).decibels[80], -23);
+  }
+  await evaluate(`(() => {
+    const canvas = document.querySelector('[data-spectrum-channel="1"] canvas');
+    const r = canvas.getBoundingClientRect();
+    canvas.dispatchEvent(new MouseEvent('mousemove', {clientX: r.left + (48 + (canvas.width - 14 - 48) / 2) * r.width / canvas.width, bubbles: true}));
+  })()`);
+  await waitFor(`document.querySelector('[data-spectrum-channel="1"]').textContent.includes('Hz · Live')`);
+  const cursorReadout = await evaluate(`document.querySelector('[data-spectrum-channel="1"]').textContent`);
+  const cursorFrequency = cursorReadout.match(/([\d.]+) Hz · Live/);
+  // MouseEvent coordinates are integer CSS pixels; allow one plot pixel's
+  // quantisation around the geometric midpoint of the 1–750 Hz log axis.
+  assert.ok(cursorFrequency && Math.abs(Number(cursorFrequency[1]) - Math.sqrt(750)) < 1,
+    `Resized canvas cursor must match its frequency axis: ${cursorReadout}`);
+  await screenshot('welch-grid-two-columns.png');
   const savedSubplots = structuredClone(captured);
   await clickChannel(0, 'Clear held');
   captured = await evaluate(`JSON.parse(window.testMessages.filter(m => m.type === 'commitSettingsChange').at(-1).settings)`);
@@ -168,6 +210,7 @@ try {
   await evaluate(`window.__bridge.onGraphUpdate(${JSON.stringify(JSON.stringify(graph))})`);
   await sendChannels([0, 1]);
   await waitFor('document.querySelectorAll("canvas").length === 2');
+  assert.ok(await evaluate(`!!document.querySelector('[data-spectrum-columns="2"]')`), 'Saved plots-per-row must survive graph reload');
   await waitFor(`document.querySelector('[data-spectrum-channel="1"]').textContent.includes('Held: Ch 2')`);
   await screenshot('welch-subplots-light.png');
   // A shrinking input layout must remove the disconnected channel's old live plot.
@@ -178,7 +221,7 @@ try {
   await click('Single channel');
   await sendSpectrum({ ...snapshot, sr: 1500, inputChannels: 0, averages: 0, decibels: '' });
   assert.deepEqual(errors, [], 'UI must have no runtime exceptions');
-  console.log('PASS: live PSD, hold/replace/clear, subplots, per-channel hold and cursor, channel selection, save/reload, input shrink/disconnect, low-rate range, dark/light rendering');
+  console.log('PASS: live PSD, hold/replace/clear, subplots, 1/2/3/4/8-column grid geometry and cursor, per-channel holds, channel selection, save/reload, input shrink/disconnect, low-rate range, dark/light rendering');
   console.log(`Screenshots: ${output}`);
 } finally {
   if (socket) socket.close();

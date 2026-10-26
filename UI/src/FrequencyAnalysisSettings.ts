@@ -12,12 +12,12 @@ export interface FrequencyAnalysisSettings {
   customName: string; fftSize: number; window: string; averages: number; channel: number;
   freqMin: number; freqMax: number; scale: 'linear' | 'log';
   dbMin: number; dbMax: number; held: SpectrumTrace | null;
-  layout: 'single' | 'stacked'; selectedChannels: number[] | null; heldChannels: SpectrumTrace[];
+  layout: 'single' | 'stacked'; plotsPerRow: number; selectedChannels: number[] | null; heldChannels: SpectrumTrace[];
 }
 export const FREQUENCY_DEFAULTS: FrequencyAnalysisSettings = {
   customName: '', fftSize: 2048, window: 'hann', averages: 8, channel: 0,
   freqMin: 0, freqMax: 24000, scale: 'linear', dbMin: -140, dbMax: 0, held: null,
-  layout: 'single', selectedChannels: null, heldChannels: [],
+  layout: 'single', plotsPerRow: 1, selectedChannels: null, heldChannels: [],
 };
 const finite = (value: unknown, fallback: number) => typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 function readHeld(h: any): SpectrumTrace | null {
@@ -44,6 +44,7 @@ export function readFrequencySettings(json?: string): FrequencyAnalysisSettings 
     s.dbMin = Math.max(-200, Math.min(19, finite(s.dbMin, -140)));
     s.dbMax = Math.max(s.dbMin + 1, Math.min(20, finite(s.dbMax, 0)));
     s.layout = s.layout === 'stacked' ? 'stacked' : 'single';
+    s.plotsPerRow = Math.max(1, Math.min(8, Math.floor(finite(s.plotsPerRow, 1))));
     s.selectedChannels = Array.isArray(s.selectedChannels)
       ? [...new Set<number>(s.selectedChannels.filter((v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < 64))].sort((a, b) => a - b) : null;
     s.held = readHeld(s.held);

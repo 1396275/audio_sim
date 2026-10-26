@@ -42,9 +42,10 @@ test('malformed saved data cannot create an invalid FFT, axis, or held trace', (
 test('subplot selections and independent held references survive save and reload', () => {
   const trace = channel => ({ sr: 48000, fftSize: 256, channel, window: 'hann', averages: 2,
     decibels: Array.from({ length: 129 }, (_, i) => -100 + channel + i / 10), capturedAt: '2026-10-26T00:00:00Z' });
-  const saved = { layout: 'stacked', selectedChannels: [7, 0, 7, 63, -1, 64, '3', 1.5], heldChannels: [trace(0), trace(7)] };
+  const saved = { layout: 'stacked', plotsPerRow: 3, selectedChannels: [7, 0, 7, 63, -1, 64, '3', 1.5], heldChannels: [trace(0), trace(7)] };
   const restored = read(JSON.stringify(saved));
   assert.equal(restored.layout, 'stacked');
+  assert.equal(restored.plotsPerRow, 3);
   assert.deepEqual(restored.selectedChannels, [0, 7, 63]);
   assert.deepEqual(restored.heldChannels, saved.heldChannels);
   assert.deepEqual(visible(restored, 8), [0, 7]);
@@ -59,6 +60,10 @@ test('all channels follows growth, none stays empty, and old settings retain sin
   assert.equal(visible(all, 64).length, 64);
   assert.deepEqual(visible(read('{"layout":"stacked","selectedChannels":[]}'), 8), []);
   assert.deepEqual(visible(read('{"channel":7}'), 8), [7]);
+  assert.equal(read('{"layout":"stacked"}').plotsPerRow, 1);
+  assert.equal(read('{"plotsPerRow":0}').plotsPerRow, 1);
+  assert.equal(read('{"plotsPerRow":100}').plotsPerRow, 8);
+  assert.equal(read('{"plotsPerRow":"invalid"}').plotsPerRow, 1);
   assert.equal(read('{"layout":"unknown","heldChannels":[{}]}').layout, 'single');
   assert.deepEqual(read('{"heldChannels":[{}]}').heldChannels, []);
 });

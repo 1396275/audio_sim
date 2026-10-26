@@ -10,25 +10,27 @@ import { FFT_SIZES, WINDOWS, FREQUENCY_DEFAULTS, FrequencyAnalysisSettings, Spec
   frequencyRange, readFrequencySettings, visibleFrequencyChannels } from './FrequencyAnalysisSettings';
 
 const WIDTH = 500, HEIGHT = 240;
-const PLOT = { left: 48, right: WIDTH - 14, top: 22, bottom: HEIGHT - 28 };
+const plotBounds = (width: number) => ({ left: 48, right: width - 14, top: 22, bottom: HEIGHT - 28 });
+const GRID_GAP = 8, GRID_PLOT_WIDTH = 360;
 const hz = (v: number) => v >= 1000 ? `${Number((v / 1000).toFixed(2))}k` : `${Number(v.toFixed(1))}`;
 const windowLabel = (name: string) => WINDOWS.find(w => w.id === name)?.name ?? name;
 const button: CSSProperties = { fontSize: 10, border: '1px solid var(--border)', borderRadius: 3,
   padding: '4px 8px', background: 'var(--surface2)', color: 'var(--text-dim)', cursor: 'pointer' };
 
 function draw(ctx: CanvasRenderingContext2D, s: FrequencyAnalysisSettings, live: SpectrumTrace | null,
-  sampleRate: number, channels: number, cursor: number | null) {
+  sampleRate: number, channels: number, cursor: number | null, canvasWidth: number) {
+  const PLOT = plotBounds(canvasWidth);
   const range = frequencyRange(s, sampleRate);
   const width = PLOT.right - PLOT.left, height = PLOT.bottom - PLOT.top;
   const xAt = (f: number) => PLOT.left + width * (s.scale === 'log'
     ? Math.log(f / range.minimum) / Math.log(range.maximum / range.minimum)
     : (f - range.minimum) / (range.maximum - range.minimum));
   const yAt = (db: number) => PLOT.bottom - height * (db - s.dbMin) / (s.dbMax - s.dbMin);
-  ctx.clearRect(0, 0, WIDTH, HEIGHT);
-  ctx.fillStyle = themeColor('--scope-bg'); ctx.fillRect(0, 0, WIDTH, HEIGHT);
+  ctx.clearRect(0, 0, canvasWidth, HEIGHT);
+  ctx.fillStyle = themeColor('--scope-bg'); ctx.fillRect(0, 0, canvasWidth, HEIGHT);
   ctx.font = '10px monospace'; ctx.lineWidth = 0.5;
   ctx.fillStyle = themeColor('--plot-label'); ctx.fillText('PSD · dBFS/Hz', 5, 12);
-  ctx.fillText('Hz', WIDTH - 22, HEIGHT - 3);
+  ctx.fillText('Hz', canvasWidth - 22, HEIGHT - 3);
   ctx.strokeStyle = themeColor('--plot-grid'); ctx.beginPath();
   for (let i = 0; i <= 5; ++i) {
     const db = s.dbMin + (s.dbMax - s.dbMin) * i / 5;
@@ -78,33 +80,34 @@ function draw(ctx: CanvasRenderingContext2D, s: FrequencyAnalysisSettings, live:
   }
 }
 
-const SpectrumPlot = memo(function SpectrumPlot({ settings, channel, live, held, sampleRate, inputChannels, onHold, onClear }: {
+const SpectrumPlot = memo(function SpectrumPlot({ settings, channel, live, held, sampleRate, inputChannels, canvasWidth, onHold, onClear }: {
   settings: FrequencyAnalysisSettings; channel: number; live: SpectrumTrace | null; held: SpectrumTrace | null;
-  sampleRate: number; inputChannels: number; onHold: (channel: number) => void; onClear: (channel: number) => void;
+  sampleRate: number; inputChannels: number; canvasWidth: number; onHold: (channel: number) => void; onClear: (channel: number) => void;
 }) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const [cursor, setCursor] = useState<number | null>(null);
   const theme = useTheme();
   const range = frequencyRange(settings, sampleRate);
+  const plot = plotBounds(canvasWidth);
   useEffect(() => {
     const raf = requestAnimationFrame(() => {
       const ctx = canvas.current?.getContext('2d');
-      if (ctx) draw(ctx, { ...settings, channel, held }, live, sampleRate, inputChannels, cursor);
+      if (ctx) draw(ctx, { ...settings, channel, held }, live, sampleRate, inputChannels, cursor, canvasWidth);
     });
     return () => cancelAnimationFrame(raf);
-  }, [settings, channel, live, held, sampleRate, inputChannels, cursor, theme]);
+  }, [settings, channel, live, held, sampleRate, inputChannels, cursor, canvasWidth, theme]);
   const atCursor = (trace: SpectrumTrace | null) => {
     if (!trace || cursor === null || cursor > trace.sr / 2) return '—';
     const value = trace.decibels[Math.round(cursor * trace.fftSize / trace.sr)];
     return value === undefined ? '—' : `${value.toFixed(1)} dBFS/Hz`;
   };
-  return <section data-spectrum-channel={channel} style={{ border: '1px solid var(--border)', borderRadius: 4, marginBottom: 8 }}>
+  return <section data-spectrum-channel={channel} style={{ minWidth: 0, border: '1px solid var(--border)', borderRadius: 4 }}>
     <div style={{ padding: '5px 7px', fontSize: 10, color: 'var(--audio)', background: 'var(--surface2)' }}>Ch {channel + 1}</div>
-    <canvas ref={canvas} width={WIDTH} height={HEIGHT}
+    <canvas ref={canvas} width={canvasWidth} height={HEIGHT}
       aria-label={settings.layout === 'single' ? 'Welch power spectral density' : `Welch power spectral density — Ch ${channel + 1}`}
       onMouseMove={event => {
         const bounds = event.currentTarget.getBoundingClientRect();
-        const position = Math.max(0, Math.min(1, ((event.clientX - bounds.left) * WIDTH / bounds.width - PLOT.left) / (PLOT.right - PLOT.left)));
+        const position = Math.max(0, Math.min(1, ((event.clientX - bounds.left) * canvasWidth / bounds.width - plot.left) / (plot.right - plot.left)));
         setCursor(settings.scale === 'log' ? range.minimum * Math.pow(range.maximum / range.minimum, position) : range.minimum + (range.maximum - range.minimum) * position);
       }} onMouseLeave={() => setCursor(null)} style={{ display: 'block', width: '100%', borderRadius: 3, cursor: 'crosshair' }} />
     <div style={{ display: 'flex', gap: 10, alignItems: 'center', margin: '7px 5px 0', fontSize: 10 }}>
@@ -176,7 +179,9 @@ function FrequencyAnalysisNode({ id, data, selected }: NodeProps) {
   };
   const clear = (channel: number) => settings.layout === 'single' ? patch({ held: null })
     : patch({ heldChannels: settings.heldChannels.filter(h => h.channel !== channel), held: settings.held?.channel === channel ? null : settings.held });
-  return <div style={{ width: WIDTH + 16, position: 'relative', background: 'var(--surface)',
+  const columns = settings.layout === 'stacked' && !collapsed ? settings.plotsPerRow : 1;
+  const plotWidth = columns > 1 ? GRID_PLOT_WIDTH : WIDTH;
+  return <div style={{ width: plotWidth * columns + GRID_GAP * (columns - 1) + 16, position: 'relative', background: 'var(--surface)',
     border: `1px solid ${selected ? 'var(--audio)' : 'var(--border)'}`, borderTop: '3px solid var(--audio)',
     borderRadius: 'var(--radius)', boxShadow: 'var(--shadow-node)', zIndex: showSettings ? 9999 : undefined }}>
     <NodeHandle nodeId={id} label="Audio In" direction="in" colour="var(--audio)" index={0} total={1} anchor="spectrum" portBodyRef={body} />
@@ -198,6 +203,12 @@ function FrequencyAnalysisNode({ id, data, selected }: NodeProps) {
         <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
           <button style={button} aria-pressed={settings.selectedChannels === null} onClick={() => patch({ selectedChannels: null })}>All channels</button>
           <button style={button} onClick={() => patch({ selectedChannels: [] })}>None</button>
+          <div data-frequency-columns style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>Plots per row</span>
+            <div style={{ width: 62 }}>{select(String(settings.plotsPerRow),
+              Array.from({ length: 8 }, (_, i) => ({ id: String(i + 1), name: String(i + 1) })),
+              value => patch({ plotsPerRow: Number(value) }))}</div>
+          </div>
         </div>
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px 10px', maxHeight: 90, overflowY: 'auto' }}>
           {Array.from({ length: inputChannels }, (_, channel) => <div key={channel}>
@@ -207,12 +218,13 @@ function FrequencyAnalysisNode({ id, data, selected }: NodeProps) {
           </div>)}
         </div>
       </div>}
-      <div data-port-anchor="spectrum" style={{ maxHeight: settings.layout === 'stacked' ? 570 : undefined, overflowY: settings.layout === 'stacked' ? 'auto' : undefined }}>
+      <div data-port-anchor="spectrum" data-spectrum-columns={columns} style={{ maxHeight: settings.layout === 'stacked' ? 570 : undefined,
+        overflowY: settings.layout === 'stacked' ? 'auto' : undefined, display: 'grid', gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`, gap: GRID_GAP }}>
         {visible.map(channel => <SpectrumPlot key={channel} settings={settings} channel={channel}
-          live={traces[channel] ?? null} sampleRate={sampleRate} inputChannels={inputChannels}
+          live={traces[channel] ?? null} sampleRate={sampleRate} inputChannels={inputChannels} canvasWidth={plotWidth}
           held={settings.layout === 'single' ? settings.held : settings.heldChannels.find(h => h.channel === channel) ?? (settings.held?.channel === channel ? settings.held : null)}
           onHold={hold} onClear={clear} />)}
-        {!visible.length && <div style={{ padding: 25, fontSize: 11, color: 'var(--text-muted)' }}>{inputChannels ? 'Select channels to view their spectra' : 'Connect an audio signal'}</div>}
+        {!visible.length && <div style={{ gridColumn: '1 / -1', padding: 25, fontSize: 11, color: 'var(--text-muted)' }}>{inputChannels ? 'Select channels to view their spectra' : 'Connect an audio signal'}</div>}
       </div>
       <div style={{ display: 'flex', gap: 8, alignItems: 'end', marginTop: 6 }}>
         {settings.layout === 'single' && field(`Channel (${inputChannels} input)`, select(String(settings.channel), Array.from({ length: Math.max(1, inputChannels, settings.channel + 1) }, (_, i) => ({ id: String(i), name: `Ch ${i + 1}${i >= inputChannels ? ' (unavailable)' : ''}` })), v => patch({ channel: Number(v) })))}
@@ -236,7 +248,7 @@ function FrequencyAnalysisNode({ id, data, selected }: NodeProps) {
         {field('Minimum (dBFS/Hz)', <ValueBox value={settings.dbMin} min={-200} max={settings.dbMax - 1} width={90} onCommit={v => patch({ dbMin: v })} />)}
         {field('Maximum (dBFS/Hz)', <ValueBox value={settings.dbMax} min={settings.dbMin + 1} max={20} width={90} onCommit={v => patch({ dbMax: v })} />)}
       </div>
-      <p style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.6 }}>Subplots gives each selected input channel its own axes, cursor and held reference. All channels follows the input layout. FFT, window, frequency and dB ranges apply to every subplot.</p>
+      <p style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.6 }}>Subplots gives each selected input channel its own axes, cursor and held reference. Plots per row arranges 1–8 charts in each row; the node widens to keep axes readable. All channels follows the input layout. FFT, window, frequency and dB ranges apply to every subplot.</p>
       <p style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.6 }}>The history holds 65,536 samples per channel. At most eight channels refresh per 100 ms cycle; larger selections refresh in rotation. Held spectra preserve their original sample rate and FFT grid and are saved with the project.</p>
     </div>}
   </div>;
