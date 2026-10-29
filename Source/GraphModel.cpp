@@ -114,6 +114,10 @@ std::vector<Port> GraphModel::portsForType (int t, const juce::String& nid,
         mk ("Audio In", PortType::Audio, PortDirection::Input);
         mk ("Value Out", PortType::Value, PortDirection::Output);
     }
+    else if (t == 34)
+    {
+        mk ("Value In", PortType::Value, PortDirection::Input);
+    }
     else if (t == 31 || t == 32 || t == 33)
     {
         const int inputs = t == 31 ? juce::jlimit (1, 64, portSpec.audioIn > 0 ? portSpec.audioIn : 2) : 1;
@@ -352,6 +356,7 @@ static juce::String labelForType (int t, const juce::String& paxName)
         case 31: return "Mux";
         case 32: return "Demux";
         case 33: return "Parametric EQ";
+        case 34: return "Value Display";
         default: return "Pax Node";
     }
 }

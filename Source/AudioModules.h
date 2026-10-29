@@ -93,6 +93,60 @@ private:
     std::atomic<bool> ready { false };
 };
 
+// Value events are routed by the same compiled graph as audio. Fixed slots
+// keep the simulation thread allocation-free; only the message thread builds
+// the sorted display snapshot. Arbitrary uint32 keys (including zero) work.
+class ValueDisplayNode final : public ConfiguredAudioNode
+{
+public:
+    explicit ValueDisplayNode (const juce::String& id) : ConfiguredAudioNode (id) {}
+    void configure (const juce::var&) override {}
+    int getOutputAudioChannels (int = 0) const override { return 0; }
+    void prepare (double rate, int frames) override
+    {
+        ConfiguredAudioNode::prepare (rate, frames);
+        count.store (0); overflow.store (false);
+    }
+    void process (int) override
+    {
+        for (int event = 0; event < inputValueCount; ++event)
+        {
+            const auto& input = inputValues[(size_t) event];
+            if (input.type != PAX_TYPE_GENERIC || input.dataType != PAX_DATA_FLOAT || ! std::isfinite (input.value)) continue;
+            int size = count.load (std::memory_order_relaxed), slot = 0;
+            while (slot < size && keys[(size_t) slot].load (std::memory_order_relaxed) != input.key) ++slot;
+            if (slot == AudioSim::maxAudioChannels) { overflow.store (true, std::memory_order_relaxed); continue; }
+            if (slot == size) keys[(size_t) slot].store (input.key, std::memory_order_relaxed);
+            values[(size_t) slot].store (input.value, std::memory_order_relaxed);
+            if (slot == size) count.store (size + 1, std::memory_order_release);
+        }
+    }
+    juce::var getAudioModuleStatus() const override
+    {
+        auto s = status (0);
+        std::vector<std::pair<uint32_t, float>> snapshot;
+        const int size = disabled ? 0 : count.load (std::memory_order_acquire);
+        for (int slot = 0; slot < size; ++slot)
+            snapshot.emplace_back (keys[(size_t) slot].load (std::memory_order_relaxed), values[(size_t) slot].load (std::memory_order_relaxed));
+        std::sort (snapshot.begin(), snapshot.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        juce::Array<juce::var> entries;
+        for (const auto& [key, value] : snapshot)
+        {
+            auto* entry = new juce::DynamicObject();
+            entry->setProperty ("key", (juce::int64) key); entry->setProperty ("value", value);
+            entries.add (entry);
+        }
+        s->setProperty ("displayValues", entries);
+        s->setProperty ("valueOverflow", overflow.load (std::memory_order_relaxed));
+        return s.release();
+    }
+private:
+    std::array<std::atomic<uint32_t>, AudioSim::maxAudioChannels> keys {};
+    std::array<std::atomic<float>, AudioSim::maxAudioChannels> values {};
+    std::atomic<int> count { 0 };
+    std::atomic<bool> overflow { false };
+};
+
 class MuxNode final : public ConfiguredAudioNode
 {
 public:

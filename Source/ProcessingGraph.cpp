@@ -126,6 +126,7 @@ void ProcessingGraph::rebuild (const GraphModel& model, PaxRegistry* reg,
                 case 31: proc = std::make_unique<MuxNode> (id); break;
                 case 32: proc = std::make_unique<DemuxNode> (id); break;
                 case 33: proc = std::make_unique<EqualizerNode> (id); break;
+                case 34: proc = std::make_unique<ValueDisplayNode> (id); break;
                 default:
                     juce::Logger::writeToLog ("ProcessingGraph: unknown built-in type " + juce::String (type));
                     break;

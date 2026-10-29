@@ -2,6 +2,7 @@ export interface EqBand { type: string; frequency: number; gainDb: number; q: nu
 export interface AudioModuleSettings {
   customName: string; windowMs: number; portCount: number; widths: number[];
   bands: EqBand[]; bypass: boolean; outputGainDb: number;
+  displayFormat: 'linear' | 'scientific' | 'db'; displayDigits: number;
 }
 export const EQ_TYPES = [
   { id: 'peak', name: 'Bell' }, { id: 'lowShelf', name: 'Low shelf' }, { id: 'highShelf', name: 'High shelf' },
@@ -9,6 +10,7 @@ export const EQ_TYPES = [
 ];
 export const moduleDefaults = (): AudioModuleSettings => ({
   customName: '', windowMs: 100, portCount: 2, widths: [1, 1], bypass: false, outputGainDb: 0,
+  displayFormat: 'linear', displayDigits: 6,
   bands: [100, 400, 1000, 4000, 10000].map((frequency, i) => ({
     frequency, type: i === 0 ? 'lowShelf' : i === 4 ? 'highShelf' : 'peak', gainDb: 0, q: 0.70710678, enabled: true,
   })),
@@ -24,6 +26,8 @@ export function readAudioModuleSettings(json?: string): AudioModuleSettings {
       windowMs: number(s.windowMs, 100, 1, 2000), portCount: Math.floor(number(s.portCount, 2, 1, 64)),
       widths: Array.isArray(s.widths) && s.widths.length ? s.widths.slice(0, 64).map((v: unknown) => Math.floor(number(v, 1, 1, 64))) : [1, 1],
       bypass: s.bypass === true, outputGainDb: number(s.outputGainDb, 0, -24, 24),
+      displayFormat: s.displayFormat === 'scientific' || s.displayFormat === 'db' ? s.displayFormat : 'linear',
+      displayDigits: Math.floor(number(s.displayDigits, 6, 1, 10)),
       bands: defaults.bands.map((fallback, i) => {
         const band = Array.isArray(s.bands) ? s.bands[i] ?? {} : {};
         return { type: EQ_TYPES.some(t => t.id === band.type) ? band.type : fallback.type,
@@ -32,4 +36,10 @@ export function readAudioModuleSettings(json?: string): AudioModuleSettings {
       }),
     };
   } catch { return defaults; }
+}
+export function formatDisplayValue(value: number, format: AudioModuleSettings['displayFormat'], digits: number): string {
+  if (!Number.isFinite(value)) return '—';
+  if (format === 'scientific') return value.toExponential(digits - 1);
+  if (format === 'db') return value === 0 ? '−∞ dB' : value < 0 ? '—' : `${Number((20 * Math.log10(value)).toPrecision(digits))} dB`;
+  return value.toPrecision(digits);
 }

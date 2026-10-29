@@ -91,6 +91,7 @@ export interface AudioModuleStatus {
   inputChannels: number; sampleRate: number; inputWidths: number[]; outputWidths: number[];
   rms?: number[]; rmsReady?: boolean; windowSamples?: number;
   valid?: boolean; requiredChannels?: number; response?: number[][]; bypass?: boolean;
+  displayValues?: { key: number; value: number }[]; valueOverflow?: boolean;
 }
 type PortActivityCallback = (entries: PortActivityEntry[]) => void;
 const _portActivitySubscribers: PortActivityCallback[] = [];

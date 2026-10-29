@@ -5,15 +5,16 @@ import { Bridge, AudioModuleStatus, RawPort } from './Bridge';
 import { Checkbox, NodeHandle, NodeHeader, SettingsPanelHeader, useNodeCollapsed, useNodeDelete, useNodeSettings } from './NodeUtils';
 import { NodeSelect } from './NodeSelect';
 import ValueBox from './ValueBox';
-import { AudioModuleSettings, EqBand, EQ_TYPES, moduleDefaults, readAudioModuleSettings } from './AudioModulesSettings';
+import { AudioModuleSettings, EqBand, EQ_TYPES, moduleDefaults, readAudioModuleSettings, formatDisplayValue } from './AudioModulesSettings';
 
-const titles: Record<number, string> = { 30: 'RMS', 31: 'MUX', 32: 'DEMUX', 33: 'PARAMETRIC EQ' };
+const titles: Record<number, string> = { 30: 'RMS', 31: 'MUX', 32: 'DEMUX', 33: 'PARAMETRIC EQ', 34: 'VALUE DISPLAY' };
 const button: CSSProperties = { border: '1px solid var(--border)', background: 'var(--surface2)', color: 'var(--text-dim)',
   borderRadius: 3, padding: '4px 7px', fontSize: 10, cursor: 'pointer' };
 const caption: CSSProperties = { fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.6 };
 
 function AudioModulesNode({ id, data, selected }: NodeProps) {
   const type = Number(data.nodeType), eq = type === 33, mux = type === 31, demux = type === 32;
+  const valueDisplay = type === 34, accent = valueDisplay ? 'var(--value)' : 'var(--audio)';
   const [settings, setSettings] = useState(() => readAudioModuleSettings(data.settingsJson as string));
   const settingsRef = useRef(settings); settingsRef.current = settings;
   const [status, setStatus] = useState<AudioModuleStatus | null>(null);
@@ -38,20 +39,43 @@ function AudioModulesNode({ id, data, selected }: NodeProps) {
   const response = status?.response ?? [];
   const curve = response.map(([f, db]) => `${38 + Math.log(f / 5) / Math.log(maximumFrequency / 5) * 420},${80 - Math.max(-48, Math.min(48, status?.bypass ? 0 : db)) / 48 * 64}`).join(' ');
   const portRows = Math.max(inputs.length, outputs.length);
-  return <div data-audio-module={type} style={{ width: eq ? 500 : 335, position: 'relative', border: `1px solid ${selected ? 'var(--audio)' : 'var(--border)'}`,
-    borderTop: '3px solid var(--audio)', borderRadius: 'var(--radius)', background: 'var(--surface)', boxShadow: 'var(--shadow-node)' }}>
-    {inputs.map((p, i) => <NodeHandle key={p.id} nodeId={id} portId={p.id} label={p.label} direction="in" colour="var(--audio)" index={i} total={inputs.length} portBodyRef={body} anchor={`module-port-${i}`} />)}
+  return <div data-audio-module={type} style={{ width: eq ? 500 : 335, position: 'relative', border: `1px solid ${selected ? accent : 'var(--border)'}`,
+    borderTop: `3px solid ${accent}`, borderRadius: 'var(--radius)', background: 'var(--surface)', boxShadow: 'var(--shadow-node)' }}>
+    {inputs.map((p, i) => <NodeHandle key={p.id} nodeId={id} portId={p.id} label={p.label} direction="in" colour={p.type === 'value' ? 'var(--value)' : 'var(--audio)'} index={i} total={inputs.length} portBodyRef={body} anchor={`module-port-${i}`} />)}
     {outputs.map((p, i) => <NodeHandle key={p.id} nodeId={id} portId={p.id} label={p.label} direction="out" colour={p.type === 'value' ? 'var(--value)' : 'var(--audio)'} index={i} total={outputs.length} portBodyRef={body} anchor={`module-port-${i}`} />)}
-    <NodeHeader title={String(data.customName || settings.customName || titles[type])} accent="var(--audio)" collapsed={collapsed} onToggleCollapsed={toggleCollapsed}
+    <NodeHeader title={String(data.customName || settings.customName || titles[type])} accent={accent} collapsed={collapsed} onToggleCollapsed={toggleCollapsed}
       rename={{ value: settings.customName, placeholder: titles[type], onCommit: customName => patch({ customName }) }}
       showSettings={showSettings} onToggleSettings={toggleSettings} onDelete={handleDelete} />
     {!collapsed && <div ref={body} className="nodrag nowheel" onPointerDown={e => e.stopPropagation()} style={{ padding: 9 }}>
       <div style={{ marginBottom: 9 }}>
-        {Array.from({ length: portRows }, (_, i) => <div key={i} data-port-anchor={`module-port-${i}`} style={{ display: 'flex', justifyContent: 'space-between', minHeight: 23, fontSize: 10, color: 'var(--audio)' }}>
+        {Array.from({ length: portRows }, (_, i) => <div key={i} data-port-anchor={`module-port-${i}`} style={{ display: 'flex', justifyContent: 'space-between', minHeight: 23, fontSize: 10, color: accent }}>
           <span>{inputs[i]?.label}{inputs[i] && mux ? ` · ${status?.inputWidths[i] ?? 0} ch` : ''}</span>
           <span>{outputs[i]?.label}{outputs[i]?.type === 'audio' ? ` · ${status?.outputWidths[i] ?? 0} ch` : type === 30 ? ' · RMS values' : ''}</span>
         </div>)}
       </div>
+      {valueDisplay && <>
+        <div style={{ display: 'flex', alignItems: 'end', gap: 8, marginBottom: 10 }}>
+          <div data-value-format style={{ flex: 1 }}><div style={caption}>Number format</div>
+            <NodeSelect value={settings.displayFormat} options={[{ id: 'linear', name: 'Linear' }, { id: 'scientific', name: 'Scientific' }, { id: 'db', name: 'Amplitude dB' }]}
+              onChange={displayFormat => patch({ displayFormat: displayFormat as AudioModuleSettings['displayFormat'] })} accent={accent} showEmpty={false} />
+          </div>
+          <div><div style={caption}>Significant digits</div><ValueBox value={settings.displayDigits} min={1} max={10} step={1} width={70}
+            onCommit={displayDigits => patch({ displayDigits: Math.floor(displayDigits) })} accent={accent} /></div>
+        </div>
+        <div style={{ maxHeight: 300, overflowY: 'auto' }}>
+          <table style={{ width: '100%', textAlign: 'right', fontSize: 12, color: 'var(--text)', fontVariantNumeric: 'tabular-nums' }}>
+            <thead style={caption}><tr><th>Channel / Key</th><th>Value</th></tr></thead>
+            <tbody>{(status?.displayValues ?? []).map(({ key, value }) => <tr key={key}>
+              <td title={`Value key: ${key}`}>{key >= 1 && key <= 64 ? `Ch ${key}` : `Key ${key}`}</td>
+              <td data-display-key={key} style={{ padding: '5px 2px', color: accent }}>{formatDisplayValue(value, settings.displayFormat, settings.displayDigits)}</td>
+            </tr>)}</tbody>
+          </table>
+        </div>
+        {!status?.displayValues?.length && <p role="status" style={{ ...caption, padding: '10px 0' }}>Waiting for numeric values. Connect Value Out → Value In.</p>}
+        <p style={caption}>Last received values, grouped by channel/key. Connect RMS Value Out to read each channel here.</p>
+        {settings.displayFormat === 'db' && <p style={caption}>20·log₁₀(value), reference 1; RMS amplitudes give dBFS. Zero shows −∞; negative values cannot be converted.</p>}
+        {status?.valueOverflow && <p role="alert" style={{ ...caption, color: 'var(--wave-trigger)' }}>Showing the first 64 unique keys. Additional keys are ignored.</p>}
+      </>}
       {type === 30 && <>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginBottom: 8 }}><span style={caption}>RMS window</span>
           <ValueBox value={settings.windowMs} min={1} max={2000} step={1} width={80} format={v => `${v} ms`} onCommit={windowMs => patch({ windowMs })} accent="var(--audio)" />
@@ -98,7 +122,7 @@ function AudioModulesNode({ id, data, selected }: NodeProps) {
       </>}
       {showSettings && <div style={{ borderTop: '1px solid var(--border)', marginTop: 9, paddingTop: 7 }}>
         <SettingsPanelHeader title={titles[type]} onClose={closeSettings} onReset={() => patch(moduleDefaults())} />
-        <p style={caption}>Settings are saved with the project and support undo/redo. Reducing routing port counts removes connections on deleted ports.</p>
+        <p style={caption}>Settings are saved with the project and support undo/redo.{mux || demux ? ' Reducing routing port counts removes connections on deleted ports.' : ''}</p>
       </div>}
     </div>}
   </div>;

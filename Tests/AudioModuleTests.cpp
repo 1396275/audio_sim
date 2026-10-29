@@ -66,6 +66,10 @@ public:
         const auto a = f.source (2), b = f.source (3, 0.2f);
         const auto mux = f.module (31), demux = f.module (32, R"({"widths":[2,3]})");
         const auto rms = f.module (30, R"({"windowMs":32})");
+        const auto display = f.module (34);
+        const auto* valueConnection = f.model.addConnection (rms, rms + "_Value Out_out", display, display + "_Value In_in");
+        expect (valueConnection != nullptr);
+        const auto valueConnectionId = valueConnection ? valueConnection->id : juce::String();
         expect (f.connect (a, mux, 0, 0)); expect (f.connect (b, mux, 0, 1));
         expect (f.connect (mux, demux)); expect (f.connect (mux, rms));
         f.rebuild(); f.process();
@@ -82,12 +86,19 @@ public:
         expect (! (bool) f.graph.findNode (rms)->getAudioModuleStatus()["rmsReady"]);
         f.process();
         const auto levels = f.graph.findNode (rms)->getAudioModuleStatus();
+        const auto displayed = f.graph.findNode (display)->getAudioModuleStatus()["displayValues"];
+        expectEquals (displayed.size(), 5);
         expect ((bool) levels["rmsReady"]); expectEquals ((int) levels["windowSamples"], 48);
         for (int ch = 0; ch < 5; ++ch)
         {
             expectWithinAbsoluteError ((float) (double) levels["rms"][ch], (ch + 1) * 0.1f, 0.000001f);
             expectEquals ((int) f.graph.findNode (rms)->outputValues[(size_t) ch].key, ch + 1);
+            expectEquals ((int) displayed[ch]["key"], ch + 1);
+            expectWithinAbsoluteError ((double) displayed[ch]["value"], (ch + 1) * 0.1, 0.000001);
         }
+        beginTest ("Disconnecting a Value input clears the displayed old results after graph rebuild");
+        f.model.removeConnection (valueConnectionId); f.rebuild(); f.process();
+        expectEquals (f.graph.findNode (display)->getAudioModuleStatus()["displayValues"].size(), 0);
 
         beginTest ("Mux handles fan-in on one port, gaps and 64-channel overflow explicitly");
         ModuleGraph mix;
@@ -122,9 +133,42 @@ public:
         expectEquals (f.graph.findNode (demux)->getOutputAudioChannels (2), 3);
         expectWithinAbsoluteError (f.graph.findNode (demux)->outputAudioBuffers[2].getSample (2, 0), 0.5f, 0.000001f);
 
-        testRms(); testEq();
+        testRms(); testEq(); testValueDisplay();
     }
 private:
+    void testValueDisplay()
+    {
+        beginTest ("Value display preserves arbitrary keys, quiet and negative numbers and ignores invalid payloads");
+        ValueDisplayNode node ("display"); node.prepare (48000, 24); node.resetBuffers (24);
+        const auto event = [&](uint32_t key, float value, int dataType = PAX_DATA_FLOAT) {
+            auto& input = node.inputValues[(size_t) node.inputValueCount++]; input = {};
+            input.key = key; input.value = value; input.dataType = (uint8_t) dataType;
+        };
+        event (1, 0.5f); event (0, 0.f); event (0xffffffffu, 1e-9f); event (7, -2.5f);
+        event (1, 0.25f); event (8, std::numeric_limits<float>::quiet_NaN());
+        event (9, std::numeric_limits<float>::infinity()); event (10, 1.f, PAX_DATA_STRING);
+        node.process (24);
+        const auto values = node.getAudioModuleStatus()["displayValues"];
+        expectEquals (values.size(), 4);
+        expectEquals ((int) values[0]["key"], 0);
+        expectWithinAbsoluteError ((double) values[1]["value"], 0.25, 1e-9);
+        expectWithinAbsoluteError ((double) values[2]["value"], -2.5, 1e-9);
+        expectEquals ((juce::int64) values[3]["key"], (juce::int64) 0xffffffffu);
+        expectWithinAbsoluteError ((double) values[3]["value"], 1e-9, 1e-15);
+
+        beginTest ("Display capacity is bounded and existing keys continue updating when full");
+        node.prepare (48000, 24); node.resetBuffers (24);
+        for (uint32_t key = 0; key < 65; ++key) event (key, (float) key);
+        node.process (24);
+        expectEquals (node.getAudioModuleStatus()["displayValues"].size(), 64);
+        expect ((bool) node.getAudioModuleStatus()["valueOverflow"]);
+        node.resetBuffers (24); event (63, 0.75f); node.process (24);
+        expectWithinAbsoluteError ((double) node.getAudioModuleStatus()["displayValues"][63]["value"], 0.75, 1e-9);
+        node.resetBuffers (24); node.process (24);
+        expectEquals (node.getAudioModuleStatus()["displayValues"].size(), 64);
+        node.disabled = true;
+        expectEquals (node.getAudioModuleStatus()["displayValues"].size(), 0);
+    }
     void testRms()
     {
         beginTest ("RMS measures an exact full-scale sine window across non-dividing frame boundaries");

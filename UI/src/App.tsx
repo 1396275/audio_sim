@@ -87,7 +87,7 @@ function rawToFlowNode(raw: RawNode, paxInfoMap?: Map<string, PaxInfo>): Node<No
   const isGhost          = !!raw.paxName && _paxListLoaded && !(paxInfoMap?.has(raw.paxName) ?? true);
   return {
     id:       raw.id,
-    type:     raw.nodeType >= 30 && raw.nodeType <= 33 && !raw.paxName ? 'audioModule'
+    type:     raw.nodeType >= 30 && raw.nodeType <= 34 && !raw.paxName ? 'audioModule'
             : isMidiMonitor    ? 'midiMonitor'
             : isAudioMonitor   ? 'audioMonitor'
             : isFrequencyAnalysis ? 'frequencyAnalysis'

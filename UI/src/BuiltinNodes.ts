@@ -24,6 +24,7 @@ export const BUILTIN_GROUPS: { label: string; accent: string; dim: string; nodes
   ] },
   { label: 'Measurement & Analysis', accent: 'var(--audio)', dim: 'var(--audio-dim)', nodes: [
     { type: 30, label: 'RMS', desc: 'Per-channel RMS, linear values and dBFS', icon: '√' },
+    { type: 34, label: 'Value Display', desc: 'Display numeric Value Out signals by channel/key', icon: '#' },
     { type: 6, label: 'Audio Monitor', desc: 'View selected audio channels', icon: '◎' },
     { type: 29, label: 'Frequency Analysis', desc: 'Welch PSD and multi-channel subplots', icon: '≋' },
   ] },

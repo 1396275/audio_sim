@@ -232,11 +232,14 @@ try {
       ports: [audioPort('test_demux', 'Audio In', 'input'), audioPort('test_demux', 'Audio Out', 'output'), audioPort('test_demux', 'Audio Out 2', 'output')] },
     { id: 'test_eq', label: 'Parametric EQ', nodeType: 33, x: 790, y: 40, settingsJson: '{}',
       ports: [audioPort('test_eq', 'Audio In', 'input'), audioPort('test_eq', 'Audio Out', 'output')] },
+    { id: 'test_display', label: 'Value Display', nodeType: 34, x: 420, y: 430, settingsJson: '{}',
+      ports: [audioPort('test_display', 'Value In', 'input', 'value')] },
   ];
+  const numericConnections = [{ id: 'rms_value_wire', sourceNodeId: 'test_rms', sourcePortId: 'test_rms_Value Out_out', targetNodeId: 'test_display', targetPortId: 'test_display_Value In_in' }];
   await evaluate(`window.__bridge.onPaxList(${JSON.stringify(JSON.stringify({ paxItems: [{name: 'Amp', nodeType: 2, audioInputs: 1, audioOutputs: 1, params: []}] }))});
-    window.__bridge.onGraphUpdate(${JSON.stringify(JSON.stringify({ ...graph, nodes: modules }))});`);
-  await waitFor('document.querySelectorAll("[data-audio-module]").length === 4');
-  for (const [category, names] of [['Channel Routing', ['Mux', 'Demux']], ['Measurement & Analysis', ['RMS', 'Frequency Analysis']], ['Filters & EQ', ['Parametric EQ']], ['Gain', ['Amp']]]) {
+    window.__bridge.onGraphUpdate(${JSON.stringify(JSON.stringify({ ...graph, nodes: modules, connections: numericConnections }))});`);
+  await waitFor('document.querySelectorAll("[data-audio-module]").length === 5');
+  for (const [category, names] of [['Channel Routing', ['Mux', 'Demux']], ['Measurement & Analysis', ['RMS', 'Value Display', 'Frequency Analysis']], ['Filters & EQ', ['Parametric EQ']], ['Gain', ['Amp']]]) {
     const contents = await evaluate(`(() => {
       const header = [...document.querySelectorAll('aside button')].find(e => e.textContent.includes(${JSON.stringify(category)}));
       return header?.parentElement.textContent ?? '';
@@ -250,6 +253,7 @@ try {
     moduleStatus('test_mux', { sampleRate: 48000, inputChannels: 5, inputWidths: [2, 3], outputWidths: [5], valid: true }),
     moduleStatus('test_demux', { sampleRate: 48000, inputChannels: 5, inputWidths: [5], outputWidths: [2, 3], requiredChannels: 5, valid: true }),
     moduleStatus('test_eq', { sampleRate: 48000, inputChannels: 5, inputWidths: [5], outputWidths: [5], response: [[5, 0], [1000, 6], [23520, 0]], bypass: false }),
+    moduleStatus('test_display', { sampleRate: 48000, inputChannels: 0, inputWidths: [], outputWidths: [], displayValues: [{key: 1, value: Math.SQRT1_2}, {key: 2, value: 0.00001}], valueOverflow: false }),
   ];
   await evaluate(`window.__bridge.onPortActivity(${JSON.stringify(JSON.stringify(statuses))})`);
   await waitFor(`document.querySelector('[data-audio-module="30"]').textContent.includes('-3.01')`);
@@ -269,6 +273,23 @@ try {
   assert.equal((await editModuleNumber(31, 0, 4)).portCount, 4);
   captured = await editModuleNumber(33, 2, -9);
   assert.equal(captured.bands[0].gainDb, -9, 'EQ gain must commit the actual edited band');
+  await waitFor(`document.querySelector('[data-display-key="2"]').textContent === '0.0000100000'`);
+  const chooseDisplayFormat = async label => {
+    await evaluate(`document.querySelector('[data-value-format] .nodrag > div').click()`);
+    await evaluate(`(() => {
+      const option = [...document.querySelectorAll('[data-value-format] .nodrag > div + div > div')].find(e => e.querySelector('span')?.textContent === ${JSON.stringify(label)});
+      if (!option) throw new Error('Missing value-display format'); option.click();
+    })()`);
+  };
+  await chooseDisplayFormat('Scientific');
+  await waitFor(`document.querySelector('[data-display-key="2"]').textContent === '1.00000e-5'`);
+  await chooseDisplayFormat('Amplitude dB');
+  await waitFor(`document.querySelector('[data-display-key="1"]').textContent === '-3.0103 dB'`);
+  await waitFor(`document.querySelector('[data-display-key="2"]').textContent === '-100 dB'`);
+  captured = await editModuleNumber(34, 0, 4);
+  assert.equal(captured.displayFormat, 'db'); assert.equal(captured.displayDigits, 4);
+  await waitFor(`document.querySelector('[data-display-key="1"]').textContent === '-3.01 dB'`);
+  modules[4].settingsJson = JSON.stringify(captured);
   await evaluate(`[...document.querySelectorAll('[data-audio-module="32"] button')].find(e => e.textContent.trim() === 'Split to mono').click()`);
   captured = await evaluate(`JSON.parse(window.testMessages.filter(m => m.type === 'commitSettingsChange').at(-1).settings)`);
   assert.deepEqual(captured.widths, [1, 1, 1, 1, 1]);
@@ -276,8 +297,13 @@ try {
   await evaluate(`window.__bridge.onPortActivity(${JSON.stringify(JSON.stringify(statuses))})`);
   await waitFor(`!!document.querySelector('[data-audio-module="32"] [role="alert"]')`);
   await screenshot('audio-modules-light.png');
+  await evaluate(`window.__bridge.onGraphUpdate(${JSON.stringify(JSON.stringify({ ...graph, nodes: modules, connections: numericConnections }))})`);
+  await waitFor(`document.querySelector('[data-value-format]').textContent.includes('Amplitude dB')`);
+  statuses[4].audioModule.displayValues = [];
+  await evaluate(`window.__bridge.onPortActivity(${JSON.stringify(JSON.stringify(statuses))})`);
+  await waitFor(`!document.querySelector('[data-display-key]') && document.querySelector('[data-audio-module="34"]').textContent.includes('Waiting for numeric values')`);
   assert.deepEqual(errors, [], 'UI must have no runtime exceptions');
-  console.log('PASS: module categories, RMS numeric precision, Mux ports, Demux partition controls, EQ response and edited parameters');
+  console.log('PASS: module categories, RMS numeric precision, Value Display formats and precision, display restoration and clearing, Mux ports, Demux controls, EQ response and parameters');
   console.log('PASS: live PSD, hold/replace/clear, subplots, 1/2/3/4/8-column grid geometry and cursor, per-channel holds, channel selection, save/reload, input shrink/disconnect, low-rate range, dark/light rendering');
   console.log(`Screenshots: ${output}`);
 } finally {

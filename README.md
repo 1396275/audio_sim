@@ -40,6 +40,7 @@ git log --oneline --decorate -10
 | Source > Audio File | 26 | 加载多通道音频文件 |
 | Source > Waveform Generator | 26 | 正弦波、方波、三角波、锯齿波、白噪声 / 粉红噪声 |
 | Measurement & Analysis > RMS | 30 | 每通道 RMS、线性值和 dBFS，以及数值输出 |
+| Measurement & Analysis > Value Display | 34 | 接收 Value Out，按通道/键显示数值 |
 | Channel Routing > Mux | 31 | 按输入口顺序拼接多通道向量 |
 | Channel Routing > Demux | 32 | 按输出口配置拆分连续通道 |
 | Filters & EQ > Parametric EQ | 33 | 五段参数均衡、频响、独立通道滤波 |
@@ -59,13 +60,14 @@ Monitor 环缓冲按实际路由输入通道准备并跨图重建复用，未接
 ### RMS、Mux/Demux 与 EQ
 
 - **RMS**：测量窗口 1–2000 ms，默认 100 ms；按完整、不重叠窗口计算各通道 `sqrt(mean(x²))`，显示线性 RMS 与 `20·log10(RMS)` dBFS，静音显示 −∞。窗口跨算法帧累计，不要求帧长整除窗口。启动或修改设置后等待完整窗口。Value Out 每帧输出各通道最近一次 RMS，`key=1,2,…` 对应通道号，数值采用线性 RMS；未接入或尚未形成完整窗口时为 0。
+- **Value Display**：连接 `RMS.Value Out → Value Display.Value In`，在独立模块中显示各通道 RMS；也可接收其他模块的通用浮点数值。按数值键排序，键 1–64 显示为 Ch 1–64，其余显示原始 Key。Number format 支持线性、科学计数法、幅值 dB（参考值为 1，RMS 幅值换算得到 dBFS），精度可设 1–10 位有效数字。显示最近收到的值，后续同键事件覆盖该值；多源同键也以最后收到的事件为准。最多保留 64 个不同键，超过时给出提示；非数值、NaN 和无穷事件忽略。显示格式随工程保存，断开连线后清除旧结果。
 - **Mux**：输入口数可设 1–64；每个口自动跟随上游的实际通道数，按 In 1、In 2、… 拼接到同一输出。未连接的口不占通道；同一个口接多个源仍先按通道混音。例如 2 通道与 3 通道合成为 5 通道。合计超过框架 64 通道上限时输出停用，节点显示提示，避免静默截断。
 - **Demux**：设置输出口数和各口通道数，按连续通道顺序拆分。例如输入 5 通道、输出宽度 `[2,3]` 时，Out 1 输出原 Ch 1–2，Out 2 输出 Ch 3–5。各输出宽度之和必须等于实际输入通道数；不匹配时输出停用并显示两端数量。Split to mono 一键按输入通道数拆成单通道输出。改变口数保留仍存在的连线，减少口数会移除被删端口的连线，支持撤销。
 - **Parametric EQ**：五段独立启用的 Bell、Low shelf、High shelf、High pass 或 Low pass；每段频率、Q（0.1–20）及适用的增益（−24～+24 dB）可调，另有 −24～+24 dB 输出增益、整机旁路和频响显示。参数应用到所有输入通道，但各通道保留独立滤波状态。频率限制为 5 Hz 至当前采样率的 0.49 倍；0 dB 默认直通。参数提交后生效，更新参数时滤波状态重新初始化。
 
 以上参数、端口布局及连线随工程保存，支持撤销/重做；构建及 DSP 回归使用内部仿真数据，不需要开启声卡。
 
-打开 `Run/Examples/Audio-Modules.patchy`，播放两个波形源，即可查看“2 通道 + 1 通道 → Mux → EQ → Demux”的示例；RMS 和 Frequency Analysis 从 EQ 输出分支测量。示例不使用声卡输出。
+打开 `Run/Examples/Audio-Modules.patchy`，播放两个波形源，即可查看“2 通道 + 1 通道 → Mux → EQ → Demux”的示例；RMS 和 Frequency Analysis 从 EQ 输出分支测量，RMS.Value Out 已接入 Value Display。示例不使用声卡输出。
 
 Preferences > Audio 中只设置 Sample rate 和 Buffer size（算法帧长），不再使用全局 Channels per port。采样率允许输入 1000–192000 Hz，含 1500、2000、8000、16000 等；帧长允许 16–4096 之间的整数，含 16、24、32、64 等，支持非 2 的幂次。
 
