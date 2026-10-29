@@ -4,28 +4,30 @@
 
 ## 版本管理
 
-本目录是独立 Git 仓库，主分支为 `main`。`v0.1.0` 标记 2026-10-26 的首次源码基线，包含音频仿真、多通道路由、Welch 频域分析和启动窗口主屏定位修复。该标签表示源码快照；现有测试记录和硬件验证限制见下文。
+本目录是独立 Git 仓库，`main` 保存稳定版本，`develop` 用于日常开发、修复和集成验证。日常提交与推送进入 `develop`，功能稳定并完成构建、测试后再将 `develop` 合并到 `main`。`v0.1.0` 标记 2026-10-26 的首次源码基线，包含音频仿真、多通道路由、Welch 频域分析和启动窗口主屏定位修复。该标签表示源码快照；现有测试记录和硬件验证限制见下文。
 
 源码、测试、构建脚本、`UI/package-lock.json` 和 `Run/Examples/` 示例纳入版本管理。`dependencies/`、`build/`、`UI/node_modules/`、`UI/dist/`、生成的 EXE/DLL 和日志由 `.gitignore` 排除；`.gitattributes` 统一文本换行。克隆源码后按“构建”一节恢复依赖并生成运行程序。依赖下载脚本中的 `pthreads4w` 当前仍使用上游 `cmake` 分支，系统工具链仍使用本机安装，因此此标签不承诺字节级可复现构建。
 
 在本目录查看状态和保存改动：
 
 ```powershell
+git switch develop
 git status
 git diff
 git add Source/StandaloneApp.cpp Tests/WindowPlacementTests.cpp
 git diff --cached
 git commit -m "fix: describe the change"
+git push origin develop
 git log --oneline --decorate -10
 ```
 
-开发新功能可先运行 `git switch -c feature/功能名`，完成验证并提交后切回 `main`，使用 `git merge feature/功能名` 合并。提交信息建议用 `feat:`、`fix:`、`docs:`、`build:`、`test:`、`chore:` 前缀。
+开发新功能可从最新的 `develop` 创建 `feature/功能名` 分支，完成验证后合并回 `develop`。稳定版本通过 `develop → main` 合并发布；不将日常开发提交直接推送到 `main`。新克隆的仓库可运行 `git switch --track origin/develop` 切换到开发分支。提交信息建议用 `feat:`、`fix:`、`docs:`、`build:`、`test:`、`chore:` 前缀。
 
 发布时使用 `v主版本.次版本.修订号`：兼容修复增加修订号，兼容功能增加次版本，不兼容变更增加主版本。先同步 `CMakeLists.txt` 中项目和 `juce_add_plugin` 的应用版本、补充变更说明并运行构建测试，再提交并创建附注标签，例如 `git tag -a v0.1.1 -m "AudioSim v0.1.1"`。`UI/package.json` 当前保留上游内部 UI 包版本，不作为应用发布版本。
 
 使用 `git revert 提交号` 撤销已经提交的修改并保留历史；使用 `git switch -c review/v0.1.0 v0.1.0` 在新分支查看或重建基线，切换前先提交或暂存手头改动。发布标签保留原指向。
 
-远程地址由仓库所有者提供后配置：`git remote add origin <仓库地址>`，再执行 `git push -u origin main` 和 `git push origin v0.1.0`。仅有本地提交无法在磁盘损坏后恢复，远程或独立备份用于灾难恢复。
+远程仓库为 `https://github.com/1396275/audio_sim.git`，本地 `develop` 跟踪 `origin/develop`。首次推送开发分支使用 `git push -u origin develop`，此后在 `develop` 上执行 `git push` 即可。正式版本标签在稳定版本合并到 `main` 后创建并推送；开发快照可使用 `snapshot-日期` 标签。仅有本地提交无法在磁盘损坏后恢复，远程或独立备份用于灾难恢复。
 
 ## 启动与使用
 
