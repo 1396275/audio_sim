@@ -363,6 +363,7 @@ if (PATCHY_BUILD_TESTS)
         Tests/PatchyTestRunner.cpp
         Tests/AudioRoutingIntegrationTests.cpp
         Tests/AudioModuleTests.cpp
+        Tests/AudioModuleTelemetryTests.cpp
         Tests/WelchSpectrumTests.cpp
         Tests/WelchChannelAnalysisTests.cpp
         Tests/PaxRoutingTests.cpp)

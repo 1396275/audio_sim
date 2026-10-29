@@ -1372,7 +1372,11 @@ public:
             else
                 portInUseChanged = portInUseReported.erase (node->id) > 0;
 
-            if (a.midiOutEvents > 0 || a.audioRmsL > 0.f || a.audioRmsR > 0.f
+            // Module snapshots are live UI state, including silence,
+            // collecting/disconnected RMS and an empty Value Display.
+            // Input-only observers have no audio output meter activity.
+            if (! a.audioModule.isVoid()
+                || a.midiOutEvents > 0 || a.audioRmsL > 0.f || a.audioRmsR > 0.f
                 || ! a.incomingNotes.empty() || ! a.paxReadOnlyValues.empty()
                 || ! a.genericValuePortValues.empty() || portInUseChanged
                 || bytesChanged
