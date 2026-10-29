@@ -280,6 +280,7 @@ export default function Sidebar() {
   const [wrapLib, setWrapLib] = useState<WrapLibraryItem[]>([]);
   useEffect(() => Bridge.onWrapLibrary(lib => setWrapLib(lib.items)), []);
   const hasPax = paxItems.length > 0;
+  const externalPaxItems = paxItems.filter(p => !BUILTIN_GROUPS.some(group => group.paxNames?.includes(p.name)));
 
   const [pinned, setPinned] = useState<boolean>(loadPinned);
   // Auto mode: starts OUT (v0.0.922) — a hidden sidebar at launch left only
@@ -399,22 +400,26 @@ export default function Sidebar() {
       {/* Built-in label */}
       <div style={{ padding: '8px 12px 0' }}>
         <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
-          Built-in
+          Modules
         </div>
       </div>
 
       {/* Built-in groups */}
-      {BUILTIN_GROUPS.map(group => (
+      {BUILTIN_GROUPS.filter(group => group.nodes.length || group.paxNames?.some(name => paxItems.some(p => p.name === name))).map(group => (
         <Section key={group.label} label={group.label} accent={group.accent}>
           {group.nodes.map(n => (
             <DragItem key={n.label} nodeType={n.type} label={n.label} desc={n.desc}
               accent={group.accent} dim={group.dim} icon={n.icon} initialSettings={n.initialSettings} />
           ))}
+          {group.paxNames?.map(name => paxItems.find(p => p.name === name)).filter((p): p is PaxInfo => !!p).map(p => (
+            <DragItem key={p.name} nodeType={p.nodeType} label={p.name} desc="Attenuate or amplify · −60 to +24 dB"
+              accent={group.accent} dim={group.dim} icon="⬡" paxName={p.name} paxInfo={p} />
+          ))}
         </Section>
       ))}
 
       {/* Pax */}
-      {hasPax && (
+      {externalPaxItems.length > 0 && (
         <>
           <div style={{ padding: '10px 12px 0', borderTop: '1px solid var(--border)', marginTop: 4 }}>
             <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
@@ -422,7 +427,7 @@ export default function Sidebar() {
             </div>
           </div>
           {PLUGIN_GROUPS.map(group => {
-            const items = paxItems.filter(p => detectPaxCategoryKey(paxInfoToPorts(p), p.colourCategory) === group.category);
+            const items = externalPaxItems.filter(p => detectPaxCategoryKey(paxInfoToPorts(p), p.colourCategory) === group.category);
             if (items.length === 0) return null;
             return (
               <Section key={group.label} label={group.label} accent={group.accent}>

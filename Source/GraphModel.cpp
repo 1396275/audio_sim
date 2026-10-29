@@ -1,4 +1,5 @@
 #include "GraphModel.h"
+#include "AudioModuleConfig.h"
 #include <unordered_set>
 #include <unordered_map>
 #include <algorithm>
@@ -107,6 +108,20 @@ std::vector<Port> GraphModel::portsForType (int t, const juce::String& nid,
     else if (t == 6 || t == 29)
     {
         mk ("Audio In",  PortType::Audio, PortDirection::Input);
+    }
+    else if (t == 30)
+    {
+        mk ("Audio In", PortType::Audio, PortDirection::Input);
+        mk ("Value Out", PortType::Value, PortDirection::Output);
+    }
+    else if (t == 31 || t == 32 || t == 33)
+    {
+        const int inputs = t == 31 ? juce::jlimit (1, 64, portSpec.audioIn > 0 ? portSpec.audioIn : 2) : 1;
+        const int outputs = t == 32 ? juce::jlimit (1, 64, portSpec.audioOut > 0 ? portSpec.audioOut : 2) : 1;
+        for (int i = 0; i < inputs; ++i)
+            mk ((juce::String ("Audio In") + (i ? " " + juce::String (i + 1) : "")).toRawUTF8(), PortType::Audio, PortDirection::Input);
+        for (int i = 0; i < outputs; ++i)
+            mk ((juce::String ("Audio Out") + (i ? " " + juce::String (i + 1) : "")).toRawUTF8(), PortType::Audio, PortDirection::Output);
     }
     else if (t == 7)
     {
@@ -333,6 +348,10 @@ static juce::String labelForType (int t, const juce::String& paxName)
         case 27: return "Matrix";
         case 28: return "MIDI Morpher";
         case 29: return "Frequency Analysis";
+        case 30: return "RMS";
+        case 31: return "Mux";
+        case 32: return "Demux";
+        case 33: return "Parametric EQ";
         default: return "Pax Node";
     }
 }
@@ -341,6 +360,23 @@ static juce::String labelForType (int t, const juce::String& paxName)
 void GraphModel::notifyChange()
 {
     if (notificationsSuspended) return;
+    // Normalise dynamic built-in ports after edits, loads, fragment imports
+    // and undo/redo. Existing port IDs remain stable when counts change.
+    for (auto& node : nodes)
+    {
+        if (node.paxName.isNotEmpty() || (node.nodeType != 31 && node.nodeType != 32)) continue;
+        const auto settings = juce::JSON::parse (node.settingsJson);
+        PaxPortSpec spec;
+        spec.audioIn = node.nodeType == 31 ? AudioSim::muxPortCount (settings) : 1;
+        spec.audioOut = node.nodeType == 32 ? (int) AudioSim::demuxWidths (settings).size() : 1;
+        node.ports = portsForType (node.nodeType, node.id, spec);
+        std::set<juce::String> valid;
+        for (const auto& port : node.ports) valid.insert (port.id);
+        std::erase_if (connections, [&](const Connection& c) {
+            return (c.sourceNodeId == node.id && ! valid.contains (c.sourcePortId))
+                || (c.targetNodeId == node.id && ! valid.contains (c.targetPortId));
+        });
+    }
     normalizeLegacyMonitorConnections();
     if (onChange) onChange();
 }
@@ -801,7 +837,13 @@ void GraphModel::renameNode (const juce::String& nodeId, const juce::String& new
 void GraphModel::setNodeSettings (const juce::String& nodeId, const juce::String& json)
 {
     for (auto& n : nodes)
-        if (n.id == nodeId) { n.settingsJson = json; return; }
+        if (n.id == nodeId)
+        {
+            if (n.settingsJson == json) return;
+            n.settingsJson = json;
+            if (n.paxName.isEmpty() && n.nodeType >= 30 && n.nodeType <= 33) notifyChange();
+            return;
+        }
 }
 
 void GraphModel::updateNodeAudioOutputCount (const juce::String& nodeId, int newAudioOut)

@@ -12,7 +12,7 @@ namespace AudioSim
     inline constexpr int maxBlockSize = 4096;
     inline constexpr double minSampleRate = 1000.0;
     inline constexpr double maxSampleRate = 192000.0;
-    inline constexpr std::array<int, 5> builtinNodeTypes { 3, 4, 6, 26, 29 };
+    inline constexpr std::array<int, 9> builtinNodeTypes { 3, 4, 6, 26, 29, 30, 31, 32, 33 };
 
     // All other rates are strictly internal simulation: no device discovery/open.
     constexpr bool isHardwareSampleRate (double rate)

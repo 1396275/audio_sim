@@ -611,6 +611,8 @@ void WebBridge::pushPortActivity()
              << Q << "genericValuePortValues" << Q << ":" << genericValueStr << ","
              << Q << "inChMask"  << Q << ":" << (int) a.inputChannelActivity  << ","
              << Q << "outChMask" << Q << ":" << (int) a.outputChannelActivity;
+        if (! a.audioModule.isVoid())
+            json << ",\"audioModule\":" << juce::JSON::toString (a.audioModule, true);
         if (a.isMorpher)   // v0.0.926 — last morph as a decimal string: 56 bits don't fit a JS number exactly
             json << "," << Q << "morph" << Q << ":{"
                  << Q << "m" << Q << ":" << a.morphMatched << ","

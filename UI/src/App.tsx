@@ -24,6 +24,7 @@ import '@xyflow/react/dist/style.css';
 import { Bridge, RecentFile, FileMissing, FileState, AudioSettings, GraphState, RawNode, RawConnection, RawPort, PortActivityEntry, PaxParamInfo, PaxInfo, FragmentData, UndoState, AudioPlayerStatus, RawWrap } from './Bridge';
 import { WrapNode, WrapFrame, WrapRail, WrapRouteEdge, WrapPort, WrapPax, WrapActions, FRAME_PAD, FRAME_HEAD, FRAME_PORT_TOP, FRAME_PORT_GAP } from './WrapNode';
 import GenericNode, { NodeData } from './GenericNode';
+import AudioModulesNode from './AudioModulesNode';
 import MidiMonitorNode,      { MidiMonitorNodeData }      from './MidiMonitorNode';
 import AudioMonitorNode,   { AudioMonitorNodeData }   from './AudioMonitorNode';
 import FrequencyAnalysisNode from './FrequencyAnalysisNode';
@@ -54,7 +55,7 @@ import { themeColor } from './Theme';
 
 // ── Node type registry ────────────────────────────────────────────────────────
 const edgeTypes = { wrapRoute: WrapRouteEdge };   // v0.0.934 — a wire drawn through open-wrap frame ports
-const nodeTypes = { custom: GenericNode, midiMonitor: MidiMonitorNode, audioMonitor: AudioMonitorNode, frequencyAnalysis: FrequencyAnalysisNode, audioPlayer: AudioPlayerNode, midiChMatrix: MidiChMatrixNode, midiMorpher: MidiMorpherNode, midiKeyboard: MidiKeyboardNode, spectrumyser: SpectrumyserNode, channelFilterPax: ChannelFilterPaxNode, envelope: EnvelopeNode, audioToDmx: AudioToDmxNode, audioPeakToOsc: AudioPeakToOscNode, dmxMonitor: DmxMonitorNode, dmxConsole: DmxConsoleNode, artNetMonitor: ArtNetMonitorNode, artNetConsole: ArtNetConsoleNode, oscMonitor: OscMonitorNode, udpMonitor: UdpMonitorNode, mqttMonitor: MqttMonitorNode, mqttConsole: MqttConsoleNode, wrap: WrapNode, wrapFrame: WrapFrame, wrapRail: WrapRail, ghost: GhostNode };
+const nodeTypes = { audioModule: AudioModulesNode, custom: GenericNode, midiMonitor: MidiMonitorNode, audioMonitor: AudioMonitorNode, frequencyAnalysis: FrequencyAnalysisNode, audioPlayer: AudioPlayerNode, midiChMatrix: MidiChMatrixNode, midiMorpher: MidiMorpherNode, midiKeyboard: MidiKeyboardNode, spectrumyser: SpectrumyserNode, channelFilterPax: ChannelFilterPaxNode, envelope: EnvelopeNode, audioToDmx: AudioToDmxNode, audioPeakToOsc: AudioPeakToOscNode, dmxMonitor: DmxMonitorNode, dmxConsole: DmxConsoleNode, artNetMonitor: ArtNetMonitorNode, artNetConsole: ArtNetConsoleNode, oscMonitor: OscMonitorNode, udpMonitor: UdpMonitorNode, mqttMonitor: MqttMonitorNode, mqttConsole: MqttConsoleNode, wrap: WrapNode, wrapFrame: WrapFrame, wrapRail: WrapRail, ghost: GhostNode };
 
 // ── Conversion helpers ────────────────────────────────────────────────────────
 // _paxInfoMap lives in NodeUtils.tsx (not declared here) — GenericNode.tsx
@@ -86,7 +87,8 @@ function rawToFlowNode(raw: RawNode, paxInfoMap?: Map<string, PaxInfo>): Node<No
   const isGhost          = !!raw.paxName && _paxListLoaded && !(paxInfoMap?.has(raw.paxName) ?? true);
   return {
     id:       raw.id,
-    type:     isMidiMonitor    ? 'midiMonitor'
+    type:     raw.nodeType >= 30 && raw.nodeType <= 33 && !raw.paxName ? 'audioModule'
+            : isMidiMonitor    ? 'midiMonitor'
             : isAudioMonitor   ? 'audioMonitor'
             : isFrequencyAnalysis ? 'frequencyAnalysis'
             : isMidiKeyboard   ? 'midiKeyboard'

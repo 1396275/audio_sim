@@ -362,6 +362,7 @@ if (PATCHY_BUILD_TESTS)
     add_executable (AudioRoutingTests
         Tests/PatchyTestRunner.cpp
         Tests/AudioRoutingIntegrationTests.cpp
+        Tests/AudioModuleTests.cpp
         Tests/WelchSpectrumTests.cpp
         Tests/WelchChannelAnalysisTests.cpp
         Tests/PaxRoutingTests.cpp)

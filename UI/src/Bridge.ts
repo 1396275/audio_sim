@@ -63,6 +63,7 @@ export interface RawConnection {
 
 // ── Port activity types ───────────────────────────────────────────────────────
 export interface PortActivityEntry {
+  audioModule?: AudioModuleStatus;
   id:      string;    // nodeId
   midi:    number;    // event count (0 = inactive)
   l:       number;    // audio RMS left  ×1000
@@ -85,6 +86,11 @@ export interface PortActivityEntry {
   // v0.0.929 — generic MIDI Learn: the event a node just captured (decimal
   // string, see Learn.ts decodeLearned), absent when none.
   learned?: string;
+}
+export interface AudioModuleStatus {
+  inputChannels: number; sampleRate: number; inputWidths: number[]; outputWidths: number[];
+  rms?: number[]; rmsReady?: boolean; windowSamples?: number;
+  valid?: boolean; requiredChannels?: number; response?: number[][]; bypass?: boolean;
 }
 type PortActivityCallback = (entries: PortActivityEntry[]) => void;
 const _portActivitySubscribers: PortActivityCallback[] = [];

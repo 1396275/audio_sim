@@ -5,6 +5,7 @@
 #include <span>
 #include <vector>
 #include <utility>
+#include <type_traits>
 
 namespace AudioSim
 {
@@ -12,6 +13,7 @@ struct AudioChannelRoute
 {
     std::size_t source = 0, destination = 0;
     int sourcePort = 0;
+    int destinationPort = 0;
 };
 
 struct NodeAudioChannelLayout
@@ -19,6 +21,7 @@ struct NodeAudioChannelLayout
     int inputChannels = 0;
     int bufferChannels = 1;
     std::vector<int> outputChannels;
+    std::vector<int> inputPortChannels;
 
     bool operator== (const NodeAudioChannelLayout&) const = default;
 };
@@ -49,15 +52,27 @@ AudioChannelLayoutResult resolveAudioChannelLayouts (std::size_t nodeCount,
         for (std::size_t index = 0; index < nodeCount; ++index)
         {
             int inputChannels = 0;
+            std::vector<int> inputPorts;
             for (const auto& route : routes)
             {
-                if (route.destination != index || route.source >= nodeCount || route.sourcePort < 0) continue;
+                if (route.destination != index || route.source >= nodeCount || route.sourcePort < 0
+                    || route.destinationPort < 0 || route.destinationPort >= maxAudioChannels) continue;
                 const auto& outputs = result.nodes[route.source].outputChannels;
                 if ((std::size_t) route.sourcePort < outputs.size())
-                    inputChannels = std::max (inputChannels, outputs[(std::size_t) route.sourcePort]);
+                {
+                    const auto port = (size_t) route.destinationPort;
+                    if (inputPorts.size() <= port) inputPorts.resize (port + 1);
+                    inputPorts[port] = std::max (inputPorts[port], outputs[(size_t) route.sourcePort]);
+                    inputChannels = std::max (inputChannels, inputPorts[port]);
+                }
             }
-            auto layout = resolve (index, inputChannels);
+            auto layout = [&] {
+                if constexpr (std::is_invocable_v<Resolve, size_t, int, std::span<const int>>)
+                    return resolve (index, inputChannels, std::span<const int> (inputPorts));
+                else return resolve (index, inputChannels);
+            }();
             layout.inputChannels = inputChannels;
+            layout.inputPortChannels = std::move (inputPorts);
             layout.bufferChannels = std::clamp (layout.bufferChannels, 1, maxAudioChannels);
             for (auto& width : layout.outputChannels)
                 width = std::clamp (width, 0, layout.bufferChannels);

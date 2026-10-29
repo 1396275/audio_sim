@@ -1056,6 +1056,7 @@ public:
 
             PortActivity a;
             a.nodeId        = node->id;
+            a.audioModule   = node->getAudioModuleStatus();
             a.midiOutEvents = node->drainMidiActivity();
             a.learned       = node->drainLearned();   // v0.0.929 — generic MIDI Learn
 

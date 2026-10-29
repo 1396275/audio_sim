@@ -220,7 +220,64 @@ try {
   await waitFor('document.querySelectorAll("canvas").length === 0');
   await click('Single channel');
   await sendSpectrum({ ...snapshot, sr: 1500, inputChannels: 0, averages: 0, decibels: '' });
+  // Verify the new audio modules against the same production bundle.
+  await call('Emulation.setDeviceMetricsOverride', { width: 1760, height: 1100, deviceScaleFactor: 1, mobile: false });
+  const audioPort = (id, label, direction, type = 'audio') => ({ id: `${id}_${label}_${direction === 'input' ? 'in' : 'out'}`, label, type, direction });
+  const modules = [
+    { id: 'test_rms', label: 'RMS', nodeType: 30, x: 50, y: 40, settingsJson: '{"windowMs":100}',
+      ports: [audioPort('test_rms', 'Audio In', 'input'), audioPort('test_rms', 'Value Out', 'output', 'value')] },
+    { id: 'test_mux', label: 'Mux', nodeType: 31, x: 420, y: 40, settingsJson: '{"portCount":2}',
+      ports: [audioPort('test_mux', 'Audio In', 'input'), audioPort('test_mux', 'Audio In 2', 'input'), audioPort('test_mux', 'Audio Out', 'output')] },
+    { id: 'test_demux', label: 'Demux', nodeType: 32, x: 50, y: 430, settingsJson: '{"widths":[2,3]}',
+      ports: [audioPort('test_demux', 'Audio In', 'input'), audioPort('test_demux', 'Audio Out', 'output'), audioPort('test_demux', 'Audio Out 2', 'output')] },
+    { id: 'test_eq', label: 'Parametric EQ', nodeType: 33, x: 790, y: 40, settingsJson: '{}',
+      ports: [audioPort('test_eq', 'Audio In', 'input'), audioPort('test_eq', 'Audio Out', 'output')] },
+  ];
+  await evaluate(`window.__bridge.onPaxList(${JSON.stringify(JSON.stringify({ paxItems: [{name: 'Amp', nodeType: 2, audioInputs: 1, audioOutputs: 1, params: []}] }))});
+    window.__bridge.onGraphUpdate(${JSON.stringify(JSON.stringify({ ...graph, nodes: modules }))});`);
+  await waitFor('document.querySelectorAll("[data-audio-module]").length === 4');
+  for (const [category, names] of [['Channel Routing', ['Mux', 'Demux']], ['Measurement & Analysis', ['RMS', 'Frequency Analysis']], ['Filters & EQ', ['Parametric EQ']], ['Gain', ['Amp']]]) {
+    const contents = await evaluate(`(() => {
+      const header = [...document.querySelectorAll('aside button')].find(e => e.textContent.includes(${JSON.stringify(category)}));
+      return header?.parentElement.textContent ?? '';
+    })()`);
+    for (const name of names) assert.ok(contents.includes(name), `${name} must be grouped under ${category}`);
+  }
+  const moduleStatus = (id, status) => ({ id, midi: 0, l: 0, r: 0, portRms: [], notes: '', bytes: 0,
+    isMk2: false, dmxValue: 0, paxReadOnly: [], genericValuePortValues: [], inChMask: 0, outChMask: 0, audioModule: status });
+  const statuses = [
+    moduleStatus('test_rms', { sampleRate: 48000, inputChannels: 2, inputWidths: [2], outputWidths: [], rms: [Math.SQRT1_2, 0.00001], rmsReady: true, windowSamples: 4800 }),
+    moduleStatus('test_mux', { sampleRate: 48000, inputChannels: 5, inputWidths: [2, 3], outputWidths: [5], valid: true }),
+    moduleStatus('test_demux', { sampleRate: 48000, inputChannels: 5, inputWidths: [5], outputWidths: [2, 3], requiredChannels: 5, valid: true }),
+    moduleStatus('test_eq', { sampleRate: 48000, inputChannels: 5, inputWidths: [5], outputWidths: [5], response: [[5, 0], [1000, 6], [23520, 0]], bypass: false }),
+  ];
+  await evaluate(`window.__bridge.onPortActivity(${JSON.stringify(JSON.stringify(statuses))})`);
+  await waitFor(`document.querySelector('[data-audio-module="30"]').textContent.includes('-3.01')`);
+  assert.ok(await evaluate(`document.querySelector('[data-audio-module="30"]').textContent.includes('-100.00')`), 'RMS must retain quiet-channel precision');
+  assert.ok(await evaluate(`document.querySelector('[data-audio-module="31"]').textContent.includes('5 ch')`));
+  assert.ok(await evaluate(`!!document.querySelector('svg[aria-label="EQ frequency response"] polyline')`));
+  const editModuleNumber = async (type, index, value) => {
+    await evaluate(`document.querySelectorAll('[data-audio-module="${type}"] span.nodrag[title^="Drag up/down"]')[${index}].dispatchEvent(new MouseEvent('dblclick', {bubbles: true}))`);
+    await waitFor(`!!document.querySelector('[data-audio-module="${type}"] input')`);
+    await evaluate(`(() => { const input = document.querySelector('[data-audio-module="${type}"] input'); input.focus(); input.select(); })()`);
+    await call('Input.insertText', { text: String(value) });
+    await call('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await waitFor(`!document.querySelector('[data-audio-module="${type}"] input')`);
+    return evaluate(`JSON.parse(window.testMessages.filter(m => m.type === 'commitSettingsChange').at(-1).settings)`);
+  };
+  assert.equal((await editModuleNumber(30, 0, 37)).windowMs, 37);
+  assert.equal((await editModuleNumber(31, 0, 4)).portCount, 4);
+  captured = await editModuleNumber(33, 2, -9);
+  assert.equal(captured.bands[0].gainDb, -9, 'EQ gain must commit the actual edited band');
+  await evaluate(`[...document.querySelectorAll('[data-audio-module="32"] button')].find(e => e.textContent.trim() === 'Split to mono').click()`);
+  captured = await evaluate(`JSON.parse(window.testMessages.filter(m => m.type === 'commitSettingsChange').at(-1).settings)`);
+  assert.deepEqual(captured.widths, [1, 1, 1, 1, 1]);
+  statuses[2].audioModule.valid = false; statuses[2].audioModule.requiredChannels = 2;
+  await evaluate(`window.__bridge.onPortActivity(${JSON.stringify(JSON.stringify(statuses))})`);
+  await waitFor(`!!document.querySelector('[data-audio-module="32"] [role="alert"]')`);
+  await screenshot('audio-modules-light.png');
   assert.deepEqual(errors, [], 'UI must have no runtime exceptions');
+  console.log('PASS: module categories, RMS numeric precision, Mux ports, Demux partition controls, EQ response and edited parameters');
   console.log('PASS: live PSD, hold/replace/clear, subplots, 1/2/3/4/8-column grid geometry and cursor, per-channel holds, channel selection, save/reload, input shrink/disconnect, low-rate range, dark/light rendering');
   console.log(`Screenshots: ${output}`);
 } finally {

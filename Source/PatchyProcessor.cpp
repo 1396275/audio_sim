@@ -1,4 +1,5 @@
 #include "PatchyProcessor.h"
+#include "AudioModuleConfig.h"
 #include "DiagLog.h"   // timestamped lifecycle / host-idle driver log lines (v0.0.919)
 #include "PatchyEditor.h"
 #include "AudioDeviceNodes.h"
@@ -1013,6 +1014,13 @@ void PatchyProcessor::setStateInformation (const void* data, int sizeInBytes)
                     break;
                 }
             }
+        }
+        if (paxName.isEmpty())
+        {
+            const int type = (int) nd->getProperty ("nodeType");
+            const auto settings = juce::JSON::parse (nd->getProperty ("settingsJson").toString());
+            if (type == 31) portSpec.audioIn = AudioSim::muxPortCount (settings);
+            if (type == 32) portSpec.audioOut = (int) AudioSim::demuxWidths (settings).size();
         }
         auto& restoredNode = graphModel.restoreNode (
             nd->getProperty ("id").toString(),

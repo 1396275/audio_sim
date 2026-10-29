@@ -1,0 +1,22 @@
+{
+  "nodes": [
+    {"id":"mod_source_a","label":"Source","nodeType":26,"paxName":"","customName":"500 Hz · stereo","settingsJson":"{\"mode\":\"sine\",\"sineFrequency\":500,\"level\":0.2,\"outputChannels\":2}","x":30,"y":70},
+    {"id":"mod_source_b","label":"Source","nodeType":26,"paxName":"","customName":"1 kHz · mono","settingsJson":"{\"mode\":\"sine\",\"sineFrequency\":1000,\"level\":0.1,\"outputChannels\":1}","x":30,"y":450},
+    {"id":"mod_mux","label":"Mux","nodeType":31,"paxName":"","settingsJson":"{\"portCount\":2}","x":490,"y":100},
+    {"id":"mod_eq","label":"Parametric EQ","nodeType":33,"paxName":"","settingsJson":"{\"bands\":[{\"type\":\"lowShelf\",\"frequency\":100,\"gainDb\":0},{\"type\":\"peak\",\"frequency\":400,\"gainDb\":0},{\"type\":\"peak\",\"frequency\":1000,\"gainDb\":-6,\"q\":1},{\"type\":\"peak\",\"frequency\":4000,\"gainDb\":0},{\"type\":\"highShelf\",\"frequency\":10000,\"gainDb\":0}]}","x":900,"y":80},
+    {"id":"mod_demux","label":"Demux","nodeType":32,"paxName":"","settingsJson":"{\"widths\":[2,1]}","x":1500,"y":70},
+    {"id":"mod_rms","label":"RMS","nodeType":30,"paxName":"","settingsJson":"{\"windowMs\":100}","x":1500,"y":530},
+    {"id":"mod_monitor","label":"Audio Monitor","nodeType":6,"paxName":"","settingsJson":"{\"layout\":\"stacked\"}","x":1920,"y":70},
+    {"id":"mod_frequency","label":"Frequency Analysis","nodeType":29,"paxName":"","settingsJson":"{\"layout\":\"stacked\",\"plotsPerRow\":3,\"fftSize\":2048,\"window\":\"hann\",\"averages\":8,\"freqMin\":20,\"freqMax\":5000,\"scale\":\"log\"}","x":1920,"y":470}
+  ],
+  "connections": [
+    {"id":"mod_c1","sourceNodeId":"mod_source_a","sourcePortId":"mod_source_a_Audio Out_out","targetNodeId":"mod_mux","targetPortId":"mod_mux_Audio In_in"},
+    {"id":"mod_c2","sourceNodeId":"mod_source_b","sourcePortId":"mod_source_b_Audio Out_out","targetNodeId":"mod_mux","targetPortId":"mod_mux_Audio In 2_in"},
+    {"id":"mod_c3","sourceNodeId":"mod_mux","sourcePortId":"mod_mux_Audio Out_out","targetNodeId":"mod_eq","targetPortId":"mod_eq_Audio In_in"},
+    {"id":"mod_c4","sourceNodeId":"mod_eq","sourcePortId":"mod_eq_Audio Out_out","targetNodeId":"mod_demux","targetPortId":"mod_demux_Audio In_in"},
+    {"id":"mod_c5","sourceNodeId":"mod_eq","sourcePortId":"mod_eq_Audio Out_out","targetNodeId":"mod_rms","targetPortId":"mod_rms_Audio In_in"},
+    {"id":"mod_c6","sourceNodeId":"mod_demux","sourcePortId":"mod_demux_Audio Out_out","targetNodeId":"mod_monitor","targetPortId":"mod_monitor_Audio In_in"},
+    {"id":"mod_c7","sourceNodeId":"mod_eq","sourcePortId":"mod_eq_Audio Out_out","targetNodeId":"mod_frequency","targetPortId":"mod_frequency_Audio In_in"}
+  ],
+  "wraps": [], "viewportX":0, "viewportY":0, "viewportZoom":0.45
+}

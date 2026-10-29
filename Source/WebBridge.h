@@ -117,6 +117,7 @@ struct PortActivity
     // generic value output. Persists between writes, same "current value"
     // (not "did it just change") reasoning as dmxValue above.
     std::vector<float> genericValuePortValues;
+    juce::var audioModule;
     // Channel-flash feature, 2026-09-20 — one bit per channel (1-16),
     // MidiChMatrixNode only, empty (0) for every other node. Mirrors the
     // node-level midiOutEvents flash above, but at channel granularity —

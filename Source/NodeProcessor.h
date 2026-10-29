@@ -2,6 +2,7 @@
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_core/juce_core.h>
 #include <unordered_map>
+#include <vector>
 #include "../Pax/PaxAPI.h"
 #include "AudioSimConfig.h"
 
@@ -85,6 +86,10 @@ public:
     // Physical buffers may be larger than the signal connected to a port.
     virtual int getOutputAudioChannels (int = 0) const { return audioChannelCount; }
     int connectedInputAudioChannels = 0;
+    // Prepared on the message thread. Unlike connectedInputAudioChannels,
+    // these widths distinguish the separate vector inputs of a Mux.
+    std::vector<int> inputPortAudioChannels;
+    virtual juce::var getAudioModuleStatus() const { return {}; }
 
     //─────────────────────────────────────────────────────────────────────────
     virtual void prepare (double sampleRate, int maxBlockSize)

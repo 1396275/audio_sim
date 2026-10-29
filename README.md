@@ -29,7 +29,7 @@ git log --oneline --decorate -10
 
 ## 启动与使用
 
-双击 `Start-AudioSim.cmd`，运行 `Run/AudioSim.exe`。Built-in 仅提供以下节点，上游编号保持不变：
+双击 `Start-AudioSim.cmd`，运行 `Run/AudioSim.exe`。左侧按 Audio I/O、Sources、Channel Routing、Measurement & Analysis、Filters & EQ、Gain 分类；Amp 归入 Gain，其余第三方 DLL 保留独立插件分类。已有节点编号保持不变：
 
 | 节点 | 类型编号 | 用途 |
 | --- | --- | --- |
@@ -39,6 +39,10 @@ git log --oneline --decorate -10
 | Frequency Analysis | 29 | Welch 功率谱密度、窗函数 / FFT 长度、谱线保持、频率范围 |
 | Source > Audio File | 26 | 加载多通道音频文件 |
 | Source > Waveform Generator | 26 | 正弦波、方波、三角波、锯齿波、白噪声 / 粉红噪声 |
+| Measurement & Analysis > RMS | 30 | 每通道 RMS、线性值和 dBFS，以及数值输出 |
+| Channel Routing > Mux | 31 | 按输入口顺序拼接多通道向量 |
+| Channel Routing > Demux | 32 | 按输出口配置拆分连续通道 |
+| Filters & EQ > Parametric EQ | 33 | 五段参数均衡、频响、独立通道滤波 |
 
 启动窗口始终位于系统主显示器：保留主屏内的上次位置，旧位置在副屏或屏幕外时回到主屏居中，并按当前工作区缩小过大的窗口，避开任务栏和原生标题栏。位置在窗口显示前恢复。
 
@@ -51,6 +55,17 @@ Spectrumyser、Splitter、Level 已从添加列表和默认运行包移除；构
 Monitor 环缓冲按实际路由输入通道准备并跨图重建复用，未接线时不分配环缓冲；声卡 FIFO 仅在实际打开设备后创建，重建直接接管现有队列。Monitor 仅在收到新快照或显示设置变化时重绘。`AudioSim.log` 中的 `UI timing` 记录原生 UI 初始化、添加节点和图重建耗时，便于继续定位响应问题。
 
 ## 仿真参数与声卡接入
+
+### RMS、Mux/Demux 与 EQ
+
+- **RMS**：测量窗口 1–2000 ms，默认 100 ms；按完整、不重叠窗口计算各通道 `sqrt(mean(x²))`，显示线性 RMS 与 `20·log10(RMS)` dBFS，静音显示 −∞。窗口跨算法帧累计，不要求帧长整除窗口。启动或修改设置后等待完整窗口。Value Out 每帧输出各通道最近一次 RMS，`key=1,2,…` 对应通道号，数值采用线性 RMS；未接入或尚未形成完整窗口时为 0。
+- **Mux**：输入口数可设 1–64；每个口自动跟随上游的实际通道数，按 In 1、In 2、… 拼接到同一输出。未连接的口不占通道；同一个口接多个源仍先按通道混音。例如 2 通道与 3 通道合成为 5 通道。合计超过框架 64 通道上限时输出停用，节点显示提示，避免静默截断。
+- **Demux**：设置输出口数和各口通道数，按连续通道顺序拆分。例如输入 5 通道、输出宽度 `[2,3]` 时，Out 1 输出原 Ch 1–2，Out 2 输出 Ch 3–5。各输出宽度之和必须等于实际输入通道数；不匹配时输出停用并显示两端数量。Split to mono 一键按输入通道数拆成单通道输出。改变口数保留仍存在的连线，减少口数会移除被删端口的连线，支持撤销。
+- **Parametric EQ**：五段独立启用的 Bell、Low shelf、High shelf、High pass 或 Low pass；每段频率、Q（0.1–20）及适用的增益（−24～+24 dB）可调，另有 −24～+24 dB 输出增益、整机旁路和频响显示。参数应用到所有输入通道，但各通道保留独立滤波状态。频率限制为 5 Hz 至当前采样率的 0.49 倍；0 dB 默认直通。参数提交后生效，更新参数时滤波状态重新初始化。
+
+以上参数、端口布局及连线随工程保存，支持撤销/重做；构建及 DSP 回归使用内部仿真数据，不需要开启声卡。
+
+打开 `Run/Examples/Audio-Modules.patchy`，播放两个波形源，即可查看“2 通道 + 1 通道 → Mux → EQ → Demux”的示例；RMS 和 Frequency Analysis 从 EQ 输出分支测量。示例不使用声卡输出。
 
 Preferences > Audio 中只设置 Sample rate 和 Buffer size（算法帧长），不再使用全局 Channels per port。采样率允许输入 1000–192000 Hz，含 1500、2000、8000、16000 等；帧长允许 16–4096 之间的整数，含 16、24、32、64 等，支持非 2 的幂次。
 
@@ -73,7 +88,7 @@ Monitor 根据其输入连接的实际信号通道显示；它只有输入，不
 
 ## 频域分析
 
-从 Built-in > Audio 添加 **Frequency Analysis**，将需要观察的源或算法输出分支连接到其 Audio In。也可打开 `Run/Examples/Welch-Analysis.patchy`，点击源节点的播放按钮，观察 1 kHz 信号。
+从 Measurement & Analysis 添加 **Frequency Analysis**，将需要观察的源或算法输出分支连接到其 Audio In。也可打开 `Run/Examples/Welch-Analysis.patchy`，点击源节点的播放按钮，观察 1 kHz 信号。
 
 - **Window**：Hann、Hamming、Blackman、Blackman-Harris、Flat Top、Rectangular。
 - **FFT length**：256、512、1024、2048、4096、8192、16384；频率间隔为采样率 / FFT 长度，与仿真帧长独立。
@@ -105,6 +120,7 @@ pwsh -NoProfile -File .\tools\Build-AudioSim.ps1
 | `Source/AudioSimConfig.h` | 程序标识、允许启用的内置节点编号 |
 | `UI/src/BuiltinNodes.ts` | Built-in 音频节点目录 |
 | `Source/ProcessingGraph.cpp` | 音频图调度与节点实例化 |
+| `Source/AudioModules.h`、`UI/src/AudioModulesNode.tsx` | RMS、Mux/Demux、参数 EQ 的处理和界面 |
 | `Source/GraphModel.*` | 拓扑、连接、参数、序列化与撤销 |
 | `Source/WebBridge*`、`UI/src/Bridge.ts` | C++ / React 消息交互 |
 | `Pax/PaxAPI.h` | 算法 DLL 的 C ABI 接口，保留 API v4 |

@@ -18,6 +18,7 @@
 #include <unordered_set>
 #include <algorithm>
 #include "AudioChannelLayout.h"
+#include "AudioModules.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // rebuild — called on message thread after graph edit
@@ -121,6 +122,10 @@ void ProcessingGraph::rebuild (const GraphModel& model, PaxRegistry* reg,
                 case 26: proc = std::make_unique<AudioPlayerNode>     (id, getAudioPlayerState ? getAudioPlayerState(id) : nullptr); break;
                 case 27: proc = std::make_unique<MidiChMatrixNode>    (id); break;
                 case 28: proc = std::make_unique<MidiMorpherNode>     (id); break;   // v0.0.925
+                case 30: proc = std::make_unique<RmsNode> (id); break;
+                case 31: proc = std::make_unique<MuxNode> (id); break;
+                case 32: proc = std::make_unique<DemuxNode> (id); break;
+                case 33: proc = std::make_unique<EqualizerNode> (id); break;
                 default:
                     juce::Logger::writeToLog ("ProcessingGraph: unknown built-in type " + juce::String (type));
                     break;
@@ -130,6 +135,8 @@ void ProcessingGraph::rebuild (const GraphModel& model, PaxRegistry* reg,
         if (proc != nullptr)
         {
             proc->disabled = (bool) nd->getProperty ("disabled");
+            if (auto* module = dynamic_cast<ConfiguredAudioNode*> (proc.get()))
+                module->configure (juce::JSON::parse (nd->getProperty ("settingsJson").toString()));
 
             // Restore Pax parameters from settingsJson so a graph rebuild
             // (e.g. dropping a node or adding a connection) doesn't reset sliders
@@ -315,7 +322,7 @@ void ProcessingGraph::prepare (double sampleRate, int maxBlockSize, int hostChan
         if (edge.sourceAudioPort < 0 || edge.sourceNode == nullptr) continue;
         const auto destination = nodeMap.find (edge.dstNodeId);
         if (destination == nodeMap.end()) continue;
-        audioRoutes.push_back ({ indices.at (edge.sourceNode), indices.at (destination->second), edge.sourceAudioPort });
+        audioRoutes.push_back ({ indices.at (edge.sourceNode), indices.at (destination->second), edge.sourceAudioPort, edge.destinationAudioPort });
     }
     const auto routedWidth = [&](NodeProcessor* node, int input)
     {
@@ -324,10 +331,11 @@ void ProcessingGraph::prepare (double sampleRate, int maxBlockSize, int hostChan
         return input;
     };
     const auto layout = AudioSim::resolveAudioChannelLayouts (sortedNodes.size(), audioRoutes,
-        [&](size_t index, int input)
+        [&](size_t index, int input, std::span<const int> inputPorts)
         {
             auto* node = sortedNodes[index];
             input = routedWidth (node, input);
+            node->inputPortAudioChannels.assign (inputPorts.begin(), inputPorts.end());
             node->connectedInputAudioChannels = input;
             const int capacity = juce::jlimit (1, AudioSim::maxAudioChannels, node->resolveAudioChannelCount (input));
             node->setAudioChannelCount (capacity);
@@ -344,6 +352,7 @@ void ProcessingGraph::prepare (double sampleRate, int maxBlockSize, int hostChan
     {
         auto* node = sortedNodes[i];
         node->connectedInputAudioChannels = routedWidth (node, layout.nodes[i].inputChannels);
+        node->inputPortAudioChannels = layout.nodes[i].inputPortChannels;
         node->setAudioChannelCount (layout.nodes[i].bufferChannels);
         node->prepare (sampleRate, maxBlockSize);
     }
